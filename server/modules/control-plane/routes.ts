@@ -13,7 +13,9 @@ import {
 } from '../../lib/providerRails';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { Prisma } from '../../generated/prisma/client';
+import type { UserRole } from '../../generated/prisma/enums';
 import { lockClinicAccessMutation } from '../../lib/clinicAccessSafety';
+import { ROLE_ENUM_TO_NAME, resolvePermissions } from '../../lib/permissions';
 
 // Re-exported from its new home so the money-integrity suite keeps its import
 // path: the rule ("only a credentialed adapter counts as configured") did not
@@ -21,7 +23,12 @@ import { lockClinicAccessMutation } from '../../lib/clinicAccessSafety';
 export { insuranceRailCapability };
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
+const clinicScopedRoles = new Set(['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING']);
 const uuid = z.string().uuid();
+const auditDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}, 'Invalid calendar date');
 
 const rolePermissionMatrix: Array<{ role: string; scope: string; modules: string[]; risk: 'low' | 'medium' | 'high' }> = [
   {
@@ -102,6 +109,26 @@ function sameDayRange(now = new Date()) {
   return { start, end };
 }
 
+function auditDateBoundary(value: string, endOfDay: boolean) {
+  const date = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) throw new Error('invalid_audit_date');
+  if (endOfDay) date.setUTCDate(date.getUTCDate() + 1);
+  return date;
+}
+
+function auditEventResult(action: string, metadata: unknown): 'success' | 'failed' {
+  const normalized = action.toLowerCase();
+  if (normalized.includes('.failed') || normalized.includes('.denied') || normalized.includes('.error')) return 'failed';
+  if (metadata && typeof metadata === 'object') {
+    const value = String((metadata as { result?: unknown; status?: unknown; outcome?: unknown }).result
+      ?? (metadata as { status?: unknown }).status
+      ?? (metadata as { outcome?: unknown }).outcome
+      ?? '').toLowerCase();
+    if (['failed', 'failure', 'error', 'denied', 'rejected'].includes(value)) return 'failed';
+  }
+  return 'success';
+}
+
 
 async function loadUsers(tenantId: string) {
   const users = await db.user.findMany({
@@ -115,6 +142,8 @@ async function loadUsers(tenantId: string) {
       active: true,
       branchId: true,
       lastLoginAt: true,
+      refreshTokenHash: true,
+      refreshTokenExpiresAt: true,
       createdAt: true,
       updatedAt: true,
       branch: { select: { id: true, name: true, location: true } },
@@ -134,7 +163,7 @@ async function loadUsers(tenantId: string) {
     lastLoginAt: user.lastLoginAt?.toISOString() ?? null,
     createdAt: user.createdAt.toISOString(),
     updatedAt: user.updatedAt.toISOString(),
-    sessionActive: Boolean(user.lastLoginAt && user.active),
+    sessionActive: Boolean(user.active && user.refreshTokenHash && user.refreshTokenExpiresAt && user.refreshTokenExpiresAt > new Date()),
     accessBranches: user.clinicAccesses.map(access => ({
       id: access.branch.id,
       name: access.branch.name,
@@ -276,9 +305,9 @@ function buildSecurityPosture(_tenantId: string, integrationRows: Array<{ health
     auth: Boolean(env.JWT_SECRET && env.JWT_REFRESH_SECRET),
     https: env.NODE_ENV === 'production',
     secrets: Boolean(env.JWT_SECRET && env.JWT_REFRESH_SECRET),
-    integrations: liveIntegrations + sandboxIntegrations + mockIntegrations,
-    insurance: integrationRows.some(row => row.category === 'Insurance') ? 1 : 0,
-    payments: paymentRows.length,
+    integrations: integrationRows.filter(row => row.configured && row.mode === 'live' && row.health === 'healthy').length,
+    insurance: integrationRows.filter(row => row.category === 'Insurance' && row.configured && row.mode === 'live' && row.health === 'healthy').length,
+    payments: paymentRows.filter(row => row.configured && row.mode === 'live').length,
     rbac: true,
     audit: auditCount > 0,
   });
@@ -304,6 +333,9 @@ function buildSecurityPosture(_tenantId: string, integrationRows: Array<{ health
     alerts: securityAlerts,
     riskLabel,
     readinessScore,
+    scoreLabel: 'Configured control inventory',
+    scoreLimitations: 'Only live, configured, healthy provider connections count. Mock and sandbox catalogue entries do not count as operational readiness.',
+    providerModes: { live: liveIntegrations, sandbox: sandboxIntegrations, mock: mockIntegrations },
   };
 }
 
@@ -424,7 +456,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     // tenant-wide access to all branches while the console displayed
     // "No access configured". Removing all access is a deactivation, not a
     // grant, so refuse it here and make the admin say what they mean.
-    if (requestedBranchIds.length === 0) {
+    if (clinicScopedRoles.has(body.role) && requestedBranchIds.length === 0) {
       throw app.httpErrors.badRequest('Select at least one clinic. To remove this user\u2019s access entirely, deactivate the account instead.');
     }
     if (body.primaryBranchId && !requestedBranchIds.includes(body.primaryBranchId)) {
@@ -531,8 +563,11 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     }
     await runWithTenantContext(request.auth.tenantId, async tx => {
       await lockClinicAccessMutation(tx, request.auth.tenantId);
-      const existing = await tx.user.findFirst({ where: { id, tenantId: request.auth.tenantId }, select: { id: true } });
+      const existing = await tx.user.findFirst({ where: { id, tenantId: request.auth.tenantId }, select: { id: true, role: true } });
       if (!existing) throw app.httpErrors.notFound('User not found');
+      if (clinicScopedRoles.has(existing.role) && requestedBranchIds.length === 0) {
+        throw app.httpErrors.badRequest('Select at least one clinic. To remove this user\u2019s access entirely, deactivate the account instead.');
+      }
       const validBranches = await tx.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } });
       if (validBranches.length !== requestedBranchIds.length) throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
       await replaceClinicAccess(tx, request.auth.tenantId, id, requestedBranchIds, body.primaryBranchId);
@@ -580,32 +615,51 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const roles = await db.roleDefinition.findMany({ where: { tenantId: request.auth.tenantId }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }] });
     const users = await db.user.groupBy({ by: ['role'], where: { tenantId: request.auth.tenantId }, _count: { _all: true } });
     const counts = new Map(users.map(row => [row.role, row._count._all]));
+    const definitionsByName = new Map(roles.map(role => [role.name, role]));
+    const builtInRoles = await Promise.all(rolePermissionMatrix.map(async permission => {
+      const role = permission.role as UserRole;
+      const override = definitionsByName.get(ROLE_ENUM_TO_NAME[role]);
+      return {
+        id: permission.role,
+        name: permission.role,
+        enumValue: permission.role,
+        description: controlPlaneRoles[permission.role]?.scope ?? 'Assigned access',
+        accent: permission.risk === 'high' ? 'red' : permission.risk === 'medium' ? 'amber' : 'blue',
+        userCount: counts.get(role) ?? 0,
+        moduleAccess: permission.modules,
+        clinicScope: permission.scope,
+        risk: permission.risk,
+        assignable: true,
+        source: 'built-in',
+        effectivePermissions: [...await resolvePermissions(request.auth.tenantId, role)].sort(),
+        permissionSource: override && Array.isArray(override.permissions) ? 'tenant-override' : 'built-in-default',
+      };
+    }));
     return {
       roles: [
-        ...rolePermissionMatrix.map(permission => ({
-          id: permission.role,
-          name: permission.role,
-          enumValue: permission.role,
-          description: controlPlaneRoles[permission.role]?.scope ?? 'Assigned access',
-          accent: permission.risk === 'high' ? 'red' : permission.risk === 'medium' ? 'amber' : 'blue',
-          userCount: counts.get(permission.role as never) ?? 0,
-          moduleAccess: permission.modules,
-          clinicScope: permission.scope,
-          risk: permission.risk,
-        })),
+        ...builtInRoles,
         ...roles.map(role => ({
           id: role.id,
           name: role.name,
-          enumValue: role.name.toUpperCase().replace(/\s+/g, '_'),
+          enumValue: role.id,
           description: role.description,
           accent: role.accent,
-          userCount: counts.get(role.name.toUpperCase().replace(/\s+/g, '_') as never) ?? 0,
-          moduleAccess: controlPlaneRoles.OWNER.modules,
-          clinicScope: 'Tenant-wide',
-          risk: 'low' as const,
+          userCount: 0,
+          moduleAccess: [],
+          clinicScope: 'Tenant-defined permission record',
+          risk: 'medium' as const,
+          assignable: false,
+          source: 'tenant-defined',
         })),
       ],
-      permissionMatrix: rolePermissionMatrix,
+      permissionMatrix: builtInRoles.map(role => ({
+        role: role.enumValue,
+        scope: role.clinicScope,
+        modules: role.moduleAccess,
+        risk: role.risk,
+        effectivePermissions: role.effectivePermissions,
+        permissionSource: role.permissionSource,
+      })),
       moduleSummary: [
         { module: 'Command Center', permissions: ['view_dashboard', 'view_opportunities'] },
         { module: 'Growth', permissions: ['view_crm', 'manage_crm', 'view_campaigns', 'manage_campaigns', 'launch_campaigns'] },
@@ -622,32 +676,66 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       include: {
         branches: { select: { id: true, name: true, location: true, active: true } },
         integrations: { select: { id: true, key: true, status: true, lastSyncAt: true } },
-        revenueProtectionAlerts: { select: { id: true, severity: true, status: true } },
+        revenueProtectionAlerts: { where: { status: { in: ['open', 'new', 'active', 'pending'] } }, select: { id: true, severity: true, status: true } },
       },
     });
     return { tenants: tenant ? [tenant] : [] };
   });
 
   app.get('/clinics', { preHandler: ownerAdminRoles }, async request => {
-    const clinics = await db.branch.findMany({
-      where: { tenantId: request.auth.tenantId },
-      orderBy: { name: 'asc' },
-      select: {
-        id: true,
-        name: true,
-        location: true,
-        active: true,
-        users: { select: { id: true } },
-        integrationRunLogs: { select: { id: true, status: true, createdAt: true } },
-        revenueProtectionAlerts: { select: { id: true, severity: true, status: true } },
-      },
+    const now = new Date();
+    const [clinics, appointmentCounts, scheduleCounts, receptionistCounts, campaignCounts] = await Promise.all([
+      db.branch.findMany({
+        where: { tenantId: request.auth.tenantId },
+        orderBy: { name: 'asc' },
+        select: {
+          id: true,
+          name: true,
+          location: true,
+          active: true,
+          users: { select: { id: true, active: true } },
+          userClinicAccesses: { select: { user: { select: { id: true, active: true } } } },
+          integrationRunLogs: { select: { id: true, status: true, createdAt: true } },
+          revenueProtectionAlerts: {
+            where: { status: { in: ['open', 'new', 'active', 'pending'] } },
+            select: { id: true, severity: true, status: true },
+          },
+        },
+      }),
+      db.appointment.groupBy({ by: ['branchId'], where: { tenantId: request.auth.tenantId, startsAt: { gte: now }, deletedAt: null, status: { notIn: ['CANCELED', 'COMPLETED', 'NO_SHOW'] } }, _count: { _all: true } }),
+      db.providerAvailability.groupBy({ by: ['branchId'], where: { tenantId: request.auth.tenantId, active: true }, _count: { _all: true } }),
+      db.receptionistLocation.groupBy({ by: ['branchId'], where: { tenantId: request.auth.tenantId, active: true, branchId: { not: null } }, _count: { _all: true } }),
+      db.campaign.groupBy({ by: ['branchId'], where: { tenantId: request.auth.tenantId, branchId: { not: null }, archivedAt: null, status: { in: ['ACTIVE', 'SCHEDULED', 'APPROVAL_REQUIRED'] } }, _count: { _all: true } }),
+    ]);
+    const countMap = (rows: Array<{ branchId: string | null; _count: { _all: number } }>) => new Map(rows.filter(row => row.branchId).map(row => [row.branchId as string, row._count._all]));
+    const futureAppointmentsByClinic = countMap(appointmentCounts);
+    const activeSchedulesByClinic = countMap(scheduleCounts);
+    const receptionistLocationsByClinic = countMap(receptionistCounts);
+    const activeCampaignsByClinic = countMap(campaignCounts);
+    return clinics.map(clinic => {
+      const assignedUsers = new Map([
+        ...clinic.users.map(user => [user.id, user] as const),
+        ...clinic.userClinicAccesses.map(access => [access.user.id, access.user] as const),
+      ]);
+      const futureAppointmentCount = futureAppointmentsByClinic.get(clinic.id) ?? 0;
+      const activeProviderScheduleCount = activeSchedulesByClinic.get(clinic.id) ?? 0;
+      const activeReceptionistLocationCount = receptionistLocationsByClinic.get(clinic.id) ?? 0;
+      const activeCampaignCount = activeCampaignsByClinic.get(clinic.id) ?? 0;
+      return {
+        ...clinic,
+        users: undefined,
+        userClinicAccesses: undefined,
+        userCount: assignedUsers.size,
+        activeAssignedUserCount: [...assignedUsers.values()].filter(user => user.active).length,
+        integrationCount: clinic.integrationRunLogs.length,
+        openRevenueAlerts: clinic.revenueProtectionAlerts.length,
+        futureAppointmentCount,
+        activeProviderScheduleCount,
+        activeReceptionistLocationCount,
+        activeCampaignCount,
+        operationalDependencyCount: futureAppointmentCount + activeProviderScheduleCount + activeReceptionistLocationCount + activeCampaignCount,
+      };
     });
-    return clinics.map(clinic => ({
-      ...clinic,
-      userCount: clinic.users.length,
-      integrationCount: clinic.integrationRunLogs.length,
-      securityAlerts: clinic.revenueProtectionAlerts.length,
-    }));
   });
 
   app.patch('/clinics/:id/status', { preHandler: ownerAdminRoles }, async (request, reply) => {
@@ -658,8 +746,18 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       const clinic = await tx.branch.findFirst({ where: { id, tenantId: request.auth.tenantId } });
       if (!clinic) throw app.httpErrors.notFound('Clinic not found');
       if (!active) {
-        const assignedActiveUsers = await tx.user.count({ where: { tenantId: request.auth.tenantId, active: true, OR: [{ branchId: id }, { clinicAccesses: { some: { branchId: id } } }] } });
+        const [assignedActiveUsers, futureAppointments, activeProviderSchedules, activeReceptionistLocations, activeCampaigns] = await Promise.all([
+          tx.user.count({ where: { tenantId: request.auth.tenantId, active: true, OR: [{ branchId: id }, { clinicAccesses: { some: { branchId: id } } }] } }),
+          tx.appointment.count({ where: { tenantId: request.auth.tenantId, branchId: id, startsAt: { gte: new Date() }, deletedAt: null, status: { notIn: ['CANCELED', 'COMPLETED', 'NO_SHOW'] } } }),
+          tx.providerAvailability.count({ where: { tenantId: request.auth.tenantId, branchId: id, active: true } }),
+          tx.receptionistLocation.count({ where: { tenantId: request.auth.tenantId, branchId: id, active: true } }),
+          tx.campaign.count({ where: { tenantId: request.auth.tenantId, branchId: id, archivedAt: null, status: { in: ['ACTIVE', 'SCHEDULED', 'APPROVAL_REQUIRED'] } } }),
+        ]);
         if (assignedActiveUsers > 0) throw app.httpErrors.conflict('Reassign or deactivate active clinic users before deactivating this clinic');
+        const operationalDependencies = futureAppointments + activeProviderSchedules + activeReceptionistLocations + activeCampaigns;
+        if (operationalDependencies > 0) {
+          throw app.httpErrors.conflict(`Resolve clinic operations before deactivation: ${futureAppointments} future appointments, ${activeProviderSchedules} active provider schedules, ${activeReceptionistLocations} receptionist locations, ${activeCampaigns} active campaigns`);
+        }
       }
       const branch = await tx.branch.update({ where: { id }, data: { active } });
       await tx.auditEvent.create({ data: {
@@ -678,8 +776,8 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       userId: uuid.optional(),
       module: z.string().trim().optional(),
       action: z.string().trim().optional(),
-      from: z.string().trim().optional(),
-      to: z.string().trim().optional(),
+      from: auditDate.optional(),
+      to: auditDate.optional(),
       result: z.enum(['success', 'failed', 'all']).default('all'),
     }).parse(request.query);
 
@@ -691,8 +789,8 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
         ...(query.action ? { action: query.action } : {}),
         ...(query.from || query.to ? {
           occurredAt: {
-            ...(query.from ? { gte: new Date(query.from) } : {}),
-            ...(query.to ? { lte: new Date(query.to) } : {}),
+            ...(query.from ? { gte: auditDateBoundary(query.from, false) } : {}),
+            ...(query.to ? { lt: auditDateBoundary(query.to, true) } : {}),
           },
         } : {}),
       },
@@ -709,7 +807,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       role: event.actorUser?.role ?? null,
       tenantId: request.auth.tenantId,
       clinicId: null,
-      result: event.action.includes('failed') ? 'failed' : 'success',
+      result: auditEventResult(event.action, event.metadata),
       ipAddress: event.ipAddress,
       userAgent: event.userAgent,
       details: event.metadata ?? null,
@@ -722,8 +820,8 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       userId: uuid.optional(),
       module: z.string().trim().optional(),
       action: z.string().trim().optional(),
-      from: z.string().trim().optional(),
-      to: z.string().trim().optional(),
+      from: auditDate.optional(),
+      to: auditDate.optional(),
     }).parse(request.query);
     const logs = await db.auditEvent.findMany({
       where: {
@@ -733,8 +831,8 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
         ...(query.action ? { action: query.action } : {}),
         ...(query.from || query.to ? {
           occurredAt: {
-            ...(query.from ? { gte: new Date(query.from) } : {}),
-            ...(query.to ? { lte: new Date(query.to) } : {}),
+            ...(query.from ? { gte: auditDateBoundary(query.from, false) } : {}),
+            ...(query.to ? { lt: auditDateBoundary(query.to, true) } : {}),
           },
         } : {}),
       },
@@ -755,7 +853,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
         event.action,
         event.resource,
         event.resourceId ?? '',
-        event.action.includes('failed') ? 'failed' : 'success',
+        auditEventResult(event.action, event.metadata),
         event.metadata ?? '',
       ]),
     ];

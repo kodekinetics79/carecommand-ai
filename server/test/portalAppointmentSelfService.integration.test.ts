@@ -36,14 +36,14 @@ function nextMondayISO(): string {
 const MONDAY = nextMondayISO();
 const at = (hhmm: string) => new Date(`${MONDAY}T${hhmm}:00.000Z`);
 
-async function makeTenant() {
+async function makeTenant(timezone = 'UTC') {
   const id = randomUUID();
   await db.tenant.create({ data: { id, name: `ss-${id.slice(0, 6)}`, slug: `ss-${id.slice(0, 8)}` } });
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
   await recomputeEntitlements(id, db); // enables patient_crm (portal feature gate)
-  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x', timezone: 'UTC' } });
+  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x', timezone } });
   const provUser = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@ss.test`, displayName: 'Dr Who' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care', rating: 4.8, reviewCount: 12 } });
   // Mon 09:00–12:00, 30-min slots
@@ -76,6 +76,40 @@ afterAll(async () => {
 });
 
 describe('portal self-service — patient cancels/reschedules only their own appointment', () => {
+  it('returns the canonical provider id and patient-safe provider name for slot-based rescheduling', async () => {
+    const t = await makeTenant();
+    const appt = await makeAppt(t, t.patientId, at('09:00'));
+
+    const res = await app.inject({ method: 'GET', url: '/v1/portal/appointments', headers: phdr(t) });
+    expect(res.statusCode, res.body).toBe(200);
+    const returned = res.json().upcoming.find((row: { id: string }) => row.id === appt.id);
+    expect(returned).toMatchObject({
+      providerProfileId: t.providerId,
+      providerName: 'Dr Who',
+    });
+    expect(returned).not.toHaveProperty('providerRef');
+    expect(returned).not.toHaveProperty('provider');
+  });
+
+  it('returns the authoritative non-UTC clinic timezone on appointment and scheduling contracts', async () => {
+    const t = await makeTenant('America/New_York');
+    const appt = await makeAppt(t, t.patientId, at('09:00'));
+
+    const appointments = await app.inject({ method: 'GET', url: '/v1/portal/appointments', headers: phdr(t) });
+    expect(appointments.statusCode, appointments.body).toBe(200);
+    expect(appointments.json().upcoming.find((row: { id: string }) => row.id === appt.id)).toMatchObject({
+      branchName: 'b', clinicTimezone: 'America/New_York',
+    });
+
+    const providers = await app.inject({ method: 'GET', url: '/v1/portal/booking/providers', headers: phdr(t) });
+    expect(providers.statusCode, providers.body).toBe(200);
+    expect(providers.json()[0]).toMatchObject({ branchName: 'b', clinicTimezone: 'America/New_York' });
+
+    const slots = await app.inject({ method: 'GET', url: `/v1/portal/booking/providers/${t.providerId}/slots?date=${MONDAY}&durationMin=30`, headers: phdr(t) });
+    expect(slots.statusCode, slots.body).toBe(200);
+    expect(slots.json()).toMatchObject({ branchName: 'b', clinicTimezone: 'America/New_York' });
+  });
+
   it('cancels the session patient\'s own appointment and writes a critical audit', async () => {
     const t = await makeTenant();
     const appt = await makeAppt(t, t.patientId, at('09:00'));

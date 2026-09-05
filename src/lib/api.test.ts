@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, apiRequest } from './api';
+import { ApiError, apiRequest, publicApiRequest } from './api';
 
 // A live token by default, so the request goes straight out instead of trying
 // to refresh. The session-expiry block below takes the token away on purpose.
@@ -12,7 +12,12 @@ const session = vi.hoisted(() => {
       this.status = status;
     }
   }
-  return { AuthRequestError, token: { value: 'test-access-token' as string | null }, refreshSession: vi.fn() };
+  return {
+    AuthRequestError,
+    token: { value: 'test-access-token' as string | null },
+    selectedClinic: { value: null as string | null },
+    refreshSession: vi.fn(),
+  };
 });
 
 vi.mock('./session', () => ({
@@ -21,6 +26,7 @@ vi.mock('./session', () => ({
   refreshSession: session.refreshSession,
   clearSession: vi.fn(),
   setAccessTokenOnly: vi.fn(),
+  getSelectedClinicId: () => session.selectedClinic.value,
 }));
 
 const PLAIN_403_SENTENCE = 'You do not have access to this. Ask a clinic owner or administrator if you need it.';
@@ -57,7 +63,54 @@ async function failureFrom(status: number, body: unknown): Promise<ApiError> {
 afterEach(() => {
   vi.unstubAllGlobals();
   session.token.value = 'test-access-token';
+  session.selectedClinic.value = null;
   session.refreshSession.mockReset();
+});
+
+describe('apiRequest clinic authority header', () => {
+  const receptionistClinicId = '7862b0fe-3a38-413d-8177-58b7f422880c';
+  const branchId = '14bc9c9d-aab8-4f22-a057-1344f10c76c9';
+
+  function successfulFetch() {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      void input;
+      void init;
+      return new Response('{}', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('does not mistake a receptionist clinic id for an authorized Branch id', async () => {
+    const fetchMock = successfulFetch();
+
+    await apiRequest(`/v1/receptionist/call-logs?clinicId=${receptionistClinicId}`);
+
+    const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
+    expect(headers.has('X-CareCommand-Clinic-Id')).toBe(false);
+  });
+
+  it('uses an explicit branchId as the authorized Branch scope', async () => {
+    const fetchMock = successfulFetch();
+
+    await apiRequest(`/v1/appointments?branchId=${branchId}`);
+
+    const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
+    expect(headers.get('X-CareCommand-Clinic-Id')).toBe(branchId);
+  });
+
+  it('uses the visible global clinic selection when no branchId is explicit', async () => {
+    session.selectedClinic.value = branchId;
+    const fetchMock = successfulFetch();
+
+    await apiRequest(`/v1/receptionist/call-logs?clinicId=${receptionistClinicId}`);
+
+    const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
+    expect(headers.get('X-CareCommand-Clinic-Id')).toBe(branchId);
+  });
 });
 
 describe('apiRequest 403 handling', () => {
@@ -161,5 +214,37 @@ describe('apiRequest when the session cannot be rebuilt', () => {
 
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).status).toBe(401);
+  });
+});
+
+describe('public capability-token requests', () => {
+  it('never resolves or attaches the staff session and omits ambient credentials', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: 'link_issued' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(publicApiRequest('/v1/intake/public/synthetic-token')).resolves.toEqual({ status: 'link_issued' });
+
+    expect(session.refreshSession).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/v1/intake/public/synthetic-token'),
+      expect.objectContaining({ credentials: 'omit', headers: {} }),
+    );
+    const headers = fetchMock.mock.calls[0]?.[1]?.headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
+    expect(headers['X-CareCommand-Clinic-Id']).toBeUndefined();
+  });
+
+  it('preserves a public endpoint error without trying a staff refresh', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: 'invalid_intake_token', message: 'This intake link is invalid or has expired.',
+    }), { status: 404, headers: { 'Content-Type': 'application/json' } })));
+
+    await expect(publicApiRequest('/v1/intake/public/expired')).rejects.toMatchObject({
+      status: 404, code: 'invalid_intake_token', message: 'This intake link is invalid or has expired.',
+    });
+    expect(session.refreshSession).not.toHaveBeenCalled();
   });
 });

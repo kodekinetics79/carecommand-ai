@@ -112,7 +112,8 @@ export type ComplianceJobName =
   | 'vendor-review-reminder'
   | 'security-scan-placeholder'
   | 'receptionist-confirmation-dispatch'
-  | 'receptionist-agent-reverify';
+  | 'receptionist-agent-reverify'
+  | 'receptionist-artifact-retention-purge';
 
 export type ScheduledTickData = { _otel?: TraceCarrier };
 export type ScheduledQueueData = ScheduledTickData | TenantJobEnvelope;
@@ -146,6 +147,9 @@ const COMPLIANCE_SCHEDULES: Array<{ id: string; name: ComplianceJobName; pattern
   // them closed. Deliberately off the confirmation minute: it reads provider
   // state and must not queue behind per-minute dispatch work.
   { id: 'receptionist-agent-reverify', name: 'receptionist-agent-reverify', pattern: '7 * * * *' },
+  // Daily at 03:20 — clears expired local recording/transcript artifacts and
+  // requests provider deletion when no artifact or legal hold remains.
+  { id: 'receptionist-artifact-retention-purge', name: 'receptionist-artifact-retention-purge', pattern: '20 3 * * *' },
 ];
 
 export async function registerComplianceSchedules() {

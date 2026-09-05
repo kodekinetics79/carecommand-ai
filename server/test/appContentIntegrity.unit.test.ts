@@ -80,12 +80,15 @@ describe('general app content integrity', () => {
     // whose results were switched on per panel became one resource hook per
     // feed. The guarantee is now stronger — there is no shared await left for a
     // single failing module to poison — so assert it at the new seam.
-    const feeds = dashboard.match(/useResource</g) ?? [];
-    expect(feeds.length).toBeGreaterThanOrEqual(5);
+    const feeds = dashboard.match(/useResource(?:<|\()/g) ?? [];
+    expect(feeds.length).toBeGreaterThanOrEqual(4);
 
-    // Every panel is bound to its own state, never to one page-wide result.
-    const boundStates = new Set(dashboard.match(/state=\{(\w+)\.state\}/g) ?? []);
-    expect(boundStates.size).toBeGreaterThanOrEqual(5);
+    // Every feed has its own resource state, never one page-wide result. The
+    // Operational Briefing renders these states directly instead of passing
+    // them through the older ResourceSection component.
+    for (const resource of ['summary', 'branches', 'actions', 'capabilities']) {
+      expect(dashboard).toContain(`${resource}.state`);
+    }
 
     // No panel may be gated behind another panel's request settling, and no
     // single message may stand in for the whole page.
@@ -128,7 +131,8 @@ describe('general app content integrity', () => {
 
     expect(patients).toContain('title="Patients"');
     expect(patients).not.toMatch(/Customer|customer/);
-    expect(staff).toContain("confirm the patient's identity");
+    expect(staff).toContain('caller waiting on a human');
+    expect(staff).toContain('canReadCallArtifacts');
     expect(providers).toContain('repeat patient rates');
     expect(portal).toContain('Patient portal · clinic-managed workspace');
     expect(portal).not.toContain('Secure patient portal');
@@ -174,11 +178,11 @@ describe('general app content integrity', () => {
 
     expect(page).toContain('Role-based access · recorded account activity');
     expect(page).toContain('Remember email on this device');
-    // Production mints no reset token and sends no mail, so the screen states
-    // the recovery that actually exists instead of a self-service promise.
-    expect(page).toContain('Ask a clinic administrator to set a new password for you from Control Plane → Users.');
-    expect(page).not.toContain('We’ve sent you a reset link');
-    expect(page).toContain('Generate local reset token');
+    expect(page).toContain('Forgot password?');
+    expect(page).toContain('Email me a reset link');
+    expect(page).toContain('Clinic workspace (optional)');
+    expect(page).not.toContain('Generate local reset token');
+    expect(page).not.toContain('Paste the reset token');
     expect(page).not.toContain('audit-ready');
     expect(page).not.toContain('Answers calls & books 24/7');
     expect(page).not.toContain('Finds & recovers lost revenue');

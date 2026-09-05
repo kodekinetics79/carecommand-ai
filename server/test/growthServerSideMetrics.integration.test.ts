@@ -64,8 +64,9 @@ async function makeTenant(): Promise<Fixture> {
     });
     users[role] = user.id;
   }
-  // `request.auth.branchId` comes from the User row, not the token, so a
-  // branch-restricted caller has to be a branch-restricted user.
+  // The admin remains tenant-wide until a request explicitly selects a clinic.
+  // Its legacy branchId is retained here only as fixture context; the trusted
+  // clinic-selection header below is what narrows the reporting request.
   const branchAdminA = await db.user.create({
     data: {
       tenantId: id, role: 'ADMIN', active: true, branchId: branchA.id,
@@ -79,9 +80,10 @@ const headers = (t: Fixture, role: Role = 'ADMIN') => ({
   authorization: `Bearer ${app.jwt.sign({ userId: t.users[role], tenantId: t.id, role, type: 'access' })}`,
 });
 
-/** A caller whose User row pins them to Branch A. */
+/** A tenant-wide admin explicitly operating in Branch A. */
 const branchHeaders = (t: Fixture) => ({
   authorization: `Bearer ${app.jwt.sign({ userId: t.branchAdminA, tenantId: t.id, role: 'ADMIN', type: 'access' })}`,
+  'x-carecommand-clinic-id': t.branchA,
 });
 
 const get = (t: Fixture, url: string, role: Role = 'ADMIN') =>

@@ -1,5 +1,5 @@
 import { env } from '../config/env';
-import { providerConfig } from './providerCredentials';
+import { providerConfig, providerConfigured } from './providerCredentials';
 import { db } from './db';
 import {
   channelStatus, hasAffirmativeNonVoiceOutreachAuthority, isSuppressed,
@@ -80,21 +80,51 @@ async function sendTwilio(toNumber: string, body: string): Promise<SendResult> {
   }
 }
 
-async function sendEmailHttp(to: string, subject: string, body: string): Promise<SendResult> {
-  // Generic HTTP email API path (only used when EMAIL_HTTP_API_URL is configured).
+async function sendEmailHttp(to: string, subject: string, body: string, idempotencyKey?: string, timeoutMs = 8000): Promise<SendResult> {
   try {
     const { values } = providerConfig('email');
+    const adapter = values.provider ?? env.EMAIL_HTTP_PROVIDER;
+    const from = values.fromAddress ?? env.EMAIL_FROM_ADDRESS;
+    const providerBody = adapter === 'sendgrid'
+      ? { personalizations: [{ to: [{ email: to }] }], from: { email: from }, subject, content: [{ type: 'text/plain', value: body }] }
+      : { to, from, subject, text: body };
     const res = await fetchWithTimeout(values.apiUrl ?? env.EMAIL_HTTP_API_URL!, {
-      method: 'POST', headers: { Authorization: `Bearer ${values.apiKey ?? env.EMAIL_HTTP_API_KEY ?? ''}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to, from: values.fromAddress ?? env.EMAIL_FROM_ADDRESS, subject, text: body }),
-    });
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${values.apiKey ?? env.EMAIL_HTTP_API_KEY ?? ''}`,
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
+      body: JSON.stringify(providerBody),
+    }, timeoutMs);
     const payload = await res.json().catch(() => null) as { id?: string; messageId?: string; message?: string } | null;
-    const id = payload?.id ?? payload?.messageId;
-    if (!res.ok || !id) return { ok: false, status: 'failed', mode: 'live', failureReason: payload?.message ?? `email_error_${res.status}` };
+    const id = adapter === 'sendgrid' ? res.headers.get('x-message-id') ?? 'sendgrid-accepted' : payload?.id ?? payload?.messageId;
+    const accepted = adapter === 'sendgrid' ? res.status === 202 : res.ok && Boolean(id);
+    if (!accepted || !id) return { ok: false, status: 'failed', mode: 'live', failureReason: payload?.message ?? `email_error_${res.status}` };
     return { ok: true, status: 'sent', providerMessageId: id, mode: 'live' };
   } catch (error) {
     return { ok: false, status: 'failed', mode: 'live', failureReason: `transport_ambiguous:${error instanceof Error ? error.message : 'email_request_failed'}` };
   }
+}
+
+/**
+ * Send a transactional authentication email.
+ *
+ * Password recovery is not marketing and must not be blocked by outreach
+ * consent or campaign suppression. Keeping this narrow function beside the
+ * provider adapter makes that bypass explicit while still enforcing the same
+ * configured-provider and destination validation used by all email delivery.
+ */
+export async function sendAuthenticationEmail(to: string, subject: string, body: string, idempotencyKey: string): Promise<SendResult> {
+  if (!providerConfigured('email')) {
+    return { ok: false, status: 'setup_required', mode: 'setup_required', failureReason: 'email_provider_not_configured' };
+  }
+  if (!isValidEmail(to)) {
+    return { ok: false, status: 'failed', mode: 'live', failureReason: 'invalid_destination' };
+  }
+  // Keep the public recovery endpoint's response window bounded so provider
+  // latency cannot become a practical account-existence oracle.
+  return sendEmailHttp(to.trim().toLowerCase(), subject, body, idempotencyKey, 2500);
 }
 
 // Send one message. `idempotencyKey` makes the dev-mock id deterministic so a
@@ -258,7 +288,7 @@ async function sendToConfiguredProvider(
     return sendTwilio(to, body);
   }
   if (channel === 'email') {
-    if (!env.EMAIL_HTTP_API_URL) return { ok: false, status: 'pending', mode: 'configured_pending_provider' };
+    if (!providerConfig('email').values.apiUrl) return { ok: false, status: 'pending', mode: 'configured_pending_provider' };
     if (!isValidEmail(destination)) return { ok: false, status: 'failed', mode: 'live', failureReason: 'invalid_destination' };
     return sendEmailHttp(destination.trim(), subject, body);
   }

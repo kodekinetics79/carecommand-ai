@@ -15,8 +15,8 @@ import type { SmartSegment } from '../../lib/crmService';
  *     sentinel that silently failed every upper bound.
  */
 export default function SmartSegmentCard({
-  segment, recoverablePercent, onCreateCampaign,
-}: { segment: SmartSegment; recoverablePercent: number; onCreateCampaign: (s: SmartSegment) => void }) {
+  segment, recoverablePercent, onCreateCampaign, canCreateCampaign = true,
+}: { segment: SmartSegment; recoverablePercent: number; onCreateCampaign: (s: SmartSegment) => void; canCreateCampaign?: boolean }) {
   const s = segment;
   const excluded = !s.criteria.includeNeverVisited
     && (s.criteria.minInactiveDays !== null || s.criteria.maxInactiveDays !== null)
@@ -62,10 +62,10 @@ export default function SmartSegmentCard({
 
       <div className="flex items-center justify-between gap-2 mt-3">
         <span className="text-[11px] font-semibold leading-snug text-amber-v">Consent, suppression, and purpose-specific authority are all checked in the governed campaign workflow before anything is sent.</span>
-        <button type="button" onClick={() => onCreateCampaign(s)}
+        {canCreateCampaign && <button type="button" onClick={() => onCreateCampaign(s)}
           className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 transition">
           <Megaphone className="w-3.5 h-3.5" aria-hidden="true" /> Create campaign
-        </button>
+        </button>}
       </div>
     </div>
   );

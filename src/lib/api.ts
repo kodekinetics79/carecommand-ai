@@ -1,4 +1,4 @@
-import { AuthRequestError, clearSession, getAccessToken, refreshSession, setAccessTokenOnly } from './session';
+import { AuthRequestError, clearSession, getAccessToken, getSelectedClinicId, refreshSession, setAccessTokenOnly } from './session';
 
 // Error thrown for a non-OK API response. Carries the HTTP status and, when the
 // server sent a JSON body, its `message`/`error` so callers can branch on a 409
@@ -43,6 +43,33 @@ function sessionExpired(error: unknown): boolean {
 }
 
 const SESSION_EXPIRED_MESSAGE = 'Session expired. Please sign in again.';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Every operational request carries one explicit core scheduling-location
+ * scope. Existing `branchId` selectors remain authoritative; otherwise the
+ * global clinic switcher is used. Do not infer this header from a generic
+ * `clinicId`: receptionist clinics are separate configuration records whose
+ * UUIDs are not Branch UUIDs. Treating one as the other made a valid tenant
+ * owner look assigned to an inactive clinic and blocked the entire front desk.
+ * The server validates the resulting Branch id against UserClinicAccess, so
+ * this header can narrow authority but can never grant it.
+ */
+function requestClinicId(path: string, init?: RequestInit) {
+  const url = new URL(path, 'http://carecommand.local');
+  const fromQuery = url.searchParams.get('branchId');
+  if (fromQuery && UUID_RE.test(fromQuery)) return fromQuery;
+  if (typeof init?.body === 'string') {
+    try {
+      const body = JSON.parse(init.body) as { branchId?: unknown };
+      const fromBody = typeof body.branchId === 'string' ? body.branchId : null;
+      if (fromBody && UUID_RE.test(fromBody)) return fromBody;
+    } catch {
+      // Non-JSON bodies retain the global selection below.
+    }
+  }
+  return getSelectedClinicId();
+}
 
 async function resolveAccessToken() {
   const accessToken = getAccessToken();
@@ -63,12 +90,14 @@ async function resolveAccessToken() {
 
 async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh = true): Promise<T> {
   const token = await resolveAccessToken();
+  const clinicId = requestClinicId(path, init);
   const response = await fetch(`${apiBaseUrl}${path}`, {
     ...init,
     credentials: 'include',
     headers: {
       ...(init?.body != null ? { 'Content-Type': 'application/json' } : {}),
       Authorization: `Bearer ${token}`,
+      ...(clinicId ? { 'X-CareCommand-Clinic-Id': clinicId } : {}),
       ...init?.headers,
     },
   });
@@ -145,6 +174,40 @@ export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T
   return rawApiRequest<T>(path, init);
 }
 
+/**
+ * Tokenized patient/public endpoints must never inherit the staff session.
+ *
+ * Besides making a fresh intake link unusable in a signed-out browser,
+ * routing these calls through apiRequest() attached an Authorization header,
+ * the selected clinic scope, and refresh cookies to a capability-token flow.
+ * Public endpoints authenticate the unguessable, expiring URL token itself;
+ * keep that boundary independent and omit ambient credentials entirely.
+ */
+export async function publicApiRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
+    ...init,
+    credentials: 'omit',
+    headers: {
+      ...(init?.body != null ? { 'Content-Type': 'application/json' } : {}),
+      ...init?.headers,
+    },
+  });
+
+  if (!response.ok) {
+    let message = humanApiMessage(response.status);
+    let code: string | undefined;
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (typeof body?.error === 'string') code = body.error;
+    else if (typeof body?.code === 'string') code = body.code;
+    if (typeof body?.message === 'string') message = body.message;
+    throw new ApiError(response.status, message, code, body ?? undefined);
+  }
+  if (response.status === 204 || response.headers.get('content-length') === '0') {
+    return undefined as T;
+  }
+  return response.json() as Promise<T>;
+}
+
 export async function apiHealth() {
   const response = await fetch(`${apiBaseUrl}/health/ready`);
   return response.ok;
@@ -152,9 +215,10 @@ export async function apiHealth() {
 
 export async function downloadCsv(path: string, filename: string) {
   const token = await resolveAccessToken();
+  const clinicId = requestClinicId(path);
   const response = await fetch(`${apiBaseUrl}${path}`, {
     credentials: 'include',
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${token}`, ...(clinicId ? { 'X-CareCommand-Clinic-Id': clinicId } : {}) },
   });
   if (!response.ok) throw new Error(`Export failed (${response.status})`);
   const blob = await response.blob();

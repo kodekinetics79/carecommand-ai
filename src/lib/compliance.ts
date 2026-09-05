@@ -31,6 +31,11 @@ export const CONTROL_STATUS_BADGE: Record<ControlStatus, string> = {
 };
 
 export interface Dashboard {
+  generatedAt: string;
+  readinessAvailable: boolean;
+  controlCount: number;
+  eligibleControlCount: number;
+  evidenceLinkedControlCount: number;
   overallReadinessScore: number;
   frameworks: Array<{ key: string; name: string; score: number }>;
   soc2ReadinessPct: number;
@@ -44,6 +49,18 @@ export interface Dashboard {
   securityIncidents: { total: number; open: number; resolved: number };
   backupStatus: { integrated: boolean; status: string; lastRunAt: string | null };
   mfaStatus: { integrated: boolean; enforced: boolean; adoptionPct: number; note: string };
+}
+
+export interface BuyerProof {
+  generatedAt: string;
+  tenantName: string;
+  dataClassification: 'aggregate_only';
+  controlStatus: { available: boolean; completionPct: number; eligibleControls: number; evidenceBackedControls: number };
+  accessProtection: { mfaEnforced: boolean; adoptionPct: number };
+  recoveryEvidence: { latestStatus: string; latestRunAt: string | null; latestVerified: boolean };
+  accountability: { auditEventsLast30Days: number };
+  openGaps: { risks: number; incidents: number; notImplementedControls: number; controlsWithoutCurrentApprovedEvidence: number };
+  limitations: string[];
 }
 
 export interface Control {
@@ -139,6 +156,12 @@ export interface AuditLogEntry {
   metadata: unknown;
 }
 
+export interface AuditLogResponse {
+  total: number;
+  limit: number;
+  items: AuditLogEntry[];
+}
+
 export interface SecurityPolicy {
   id?: string;
   requireMfa: boolean;
@@ -179,6 +202,7 @@ export const REPORT_LABELS: Record<ReportKey, string> = {
 };
 
 export const complianceApi = {
+  buyerProof: () => apiRequest<BuyerProof>(`${base}/buyer-proof`),
   dashboard: () => apiRequest<Dashboard>(`${base}/dashboard`),
 
   listControls: () => apiRequest<Control[]>(`${base}/controls`),
@@ -204,8 +228,8 @@ export const complianceApi = {
   updateIncident: (id: string, body: Record<string, unknown>) => apiRequest<Incident>(`${base}/incidents/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
 
   auditLogs: (params: Record<string, string>) => {
-    const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v)).toString();
-    return apiRequest<AuditLogEntry[]>(`${base}/audit-logs${qs ? `?${qs}` : ''}`);
+    const qs = new URLSearchParams([...Object.entries(params).filter(([, v]) => v), ['limit', '100']]).toString();
+    return apiRequest<AuditLogResponse>(`${base}/audit-logs?${qs}`);
   },
 
   getSecurityPolicy: () => apiRequest<SecurityPolicy>(`${base}/security-policy`),

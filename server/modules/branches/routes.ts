@@ -21,10 +21,17 @@ export const branchRoutes: FastifyPluginAsync = async app => {
   app.get('/', async request => {
     const query = paginationSchema.parse(request.query);
     const scope = branchScope(request);
+    const assignedBranchIds = request.auth.branchIds;
     const rows = await db.branch.findMany({
-      // Branch-scoped actors may only list their assigned Branch. Other models
-      // expose this relationship as `branchId`; on Branch itself the key is `id`.
-      where: { tenantId: request.auth.tenantId, ...(scope.branchId ? { id: scope.branchId } : {}) },
+      // The branch directory is also the clinic switcher's source. Shared
+      // operational users must see every assigned clinic here, while all other
+      // data routes remain narrowed to the explicitly selected clinic.
+      where: {
+        tenantId: request.auth.tenantId,
+        ...(assignedBranchIds.length > 0
+          ? { id: { in: assignedBranchIds } }
+          : scope.branchId ? { id: scope.branchId } : {}),
+      },
       orderBy: { id: 'asc' },
       cursor: query.cursor ? { id: query.cursor } : undefined,
       skip: query.cursor ? 1 : 0,

@@ -1,11 +1,15 @@
 const apiBaseUrl = import.meta.env.VITE_API_URL ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
 
 export const authEventName = 'carecommand-auth-change';
+export const clinicSelectionEventName = 'carecommand-clinic-change';
 
 let accessTokenMemory: string | null = null;
 let csrfTokenMemory: string | null = null;
 let refreshInFlight: Promise<AuthSessionResponse> | null = null;
+let selectedClinicMemory: string | null = null;
 const csrfCookieName = 'cc_csrf';
+const clinicSelectionStorageKey = 'carecommand-active-clinic';
+interface StoredClinicSelection { tenantId?: string; clinicId?: string }
 
 /**
  * An auth endpoint answered, and refused.
@@ -34,6 +38,7 @@ export interface SessionUser {
   role: string;
   branchId?: string | null;
   branch?: { id: string; name: string; location: string } | null;
+  clinicAccesses?: Array<{ id: string; name: string; location: string; isPrimary: boolean }>;
   tenant: { id: string; name: string; slug: string };
   active: boolean;
   /** Server-resolved grants, including tenant RoleDefinition overrides. */
@@ -51,13 +56,16 @@ export interface AuthMeResponse {
   access: {
     tenantId: string;
     branchId?: string | null;
+    branchIds?: string[];
     role: string;
     permissions: string[];
   };
 }
 
-function dispatchAuthChange() {
-  window.dispatchEvent(new Event(authEventName));
+export type AuthChangeState = 'available' | 'cleared';
+
+function dispatchAuthChange(state: AuthChangeState) {
+  window.dispatchEvent(new CustomEvent<{ state: AuthChangeState }>(authEventName, { detail: { state } }));
 }
 
 function readCookie(name: string) {
@@ -71,15 +79,58 @@ export function getAccessToken() {
 export function clearSession(notify = true) {
   accessTokenMemory = null;
   csrfTokenMemory = null;
+  selectedClinicMemory = null;
+  if (typeof window !== 'undefined') window.localStorage?.removeItem(clinicSelectionStorageKey);
   if (notify) {
-    dispatchAuthChange();
+    dispatchAuthChange('cleared');
+  }
+}
+
+function restoreClinicSelection(user: SessionUser) {
+  let stored: StoredClinicSelection | null;
+  try {
+    stored = JSON.parse(window.localStorage.getItem(clinicSelectionStorageKey) ?? 'null') as StoredClinicSelection | null;
+  } catch {
+    stored = null;
+  }
+  const operationalRole = ['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING'].includes(user.role);
+  // OWNER and ADMIN sessions are tenant-wide unless the user deliberately
+  // narrows a visible request. Never resurrect an invisible clinic header from
+  // a prior account/session: that made network pages silently omit clinics
+  // while still labelling themselves network-wide.
+  if (!operationalRole) {
+    selectedClinicMemory = null;
+    window.localStorage?.removeItem(clinicSelectionStorageKey);
+    return;
+  }
+  const assignedIds = user.clinicAccesses?.map(clinic => clinic.id) ?? [];
+  const storedAllowed = stored?.tenantId === user.tenant.id
+    && typeof stored.clinicId === 'string'
+    && assignedIds.includes(stored.clinicId);
+  selectedClinicMemory = storedAllowed ? stored!.clinicId! : user.branchId ?? assignedIds[0] ?? null;
+  if (selectedClinicMemory) {
+    window.localStorage.setItem(clinicSelectionStorageKey, JSON.stringify({ tenantId: user.tenant.id, clinicId: selectedClinicMemory }));
   }
 }
 
 function setSessionTokens(session: AuthSessionResponse) {
   accessTokenMemory = session.accessToken;
   csrfTokenMemory = session.csrfToken;
-  dispatchAuthChange();
+  restoreClinicSelection(session.user);
+  dispatchAuthChange('available');
+}
+
+export function getSelectedClinicId() {
+  return selectedClinicMemory;
+}
+
+export function selectClinic(tenantId: string, clinicId: string) {
+  selectedClinicMemory = clinicId;
+  window.localStorage.setItem(clinicSelectionStorageKey, JSON.stringify({ tenantId, clinicId }));
+  // The access token intentionally lives only in memory. A hard reload would
+  // throw it away and bounce the user to sign-in, so clinic changes remount
+  // protected page content inside the current authenticated tab instead.
+  window.dispatchEvent(new CustomEvent(clinicSelectionEventName, { detail: { tenantId, clinicId } }));
 }
 
 async function bootstrapCsrfToken(): Promise<string> {
@@ -177,8 +228,8 @@ export async function mfaVerifyWithToken(mfaToken: string, code: string): Promis
   return res.user;
 }
 
-export async function requestPasswordReset(email: string) {
-  return authRequest<{ message: string; resetAvailable?: boolean; devToken?: string; emailDelivered?: boolean }>('/v1/auth/password-reset/request', { email });
+export async function requestPasswordReset(email: string, tenantSlug?: string) {
+  return authRequest<{ message: string; devToken?: string }>('/v1/auth/password-reset/request', { email, ...(tenantSlug ? { tenantSlug } : {}) });
 }
 
 export async function confirmPasswordReset(token: string, newPassword: string) {
@@ -218,5 +269,5 @@ export async function logout() {
 
 export function setAccessTokenOnly(token: string) {
   accessTokenMemory = token;
-  dispatchAuthChange();
+  dispatchAuthChange('available');
 }

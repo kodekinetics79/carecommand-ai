@@ -33,19 +33,28 @@ export type Permission =
   | 'appointment:read'
   | 'appointment:write'
   | 'billing:read'
+  | 'billing:write'
   | 'campaign:read'
+  | 'campaign:manage'
   | 'crm:read'
+  | 'crm:write'
   | 'integrations:read'
   | 'intake:read'
+  | 'intake:write'
   | 'inventory:read'
+  | 'inventory:write'
+  | 'inventory:manage'
   | 'operations:read'
   | 'partner-report:read'
+  | 'partner-report:review'
   | 'patient:read'
+  | 'patient:write'
   | 'receptionist:booking-review'
   | 'receptionist:call-artifacts:read'
   | 'receptionist:manage'
   | 'receptionist:read'
   | 'revenue:read'
+  | 'settings:write'
   | 'staff:read'
   | 'staff:task-status'
   | 'staff:write';
@@ -72,6 +81,13 @@ const CAMPAIGN_WORKSPACE_GRANTS = ['campaign:read', 'crm:read'] as const;
 // The Front Desk board reads the AI's call evidence AND the staff task queue
 // those calls create; the two are guarded by different grants. See '/front-desk'.
 const FRONT_DESK_BOARD_GRANTS = ['receptionist:call-artifacts:read', 'staff:read'] as const;
+// Communications combines CRM messages with receptionist call artifacts.
+// Requiring both read grants prevents a half-loaded page and keeps call PHI
+// unavailable to CRM-only roles such as Analyst.
+const COMMUNICATIONS_GRANTS = ['crm:read', 'receptionist:call-artifacts:read'] as const;
+// Insights combines reputation cases with competitor records. Both feeds are
+// required for every total and priority claim on the page.
+const INSIGHTS_GRANTS = ['operations:read', 'crm:read'] as const;
 // The advisory brief names patients AND talks about their money, so its route
 // requires both grants. See '/advisory'.
 const ADVISORY_BRIEF_GRANTS = ['patient:read', 'revenue:read'] as const;
@@ -117,8 +133,11 @@ export const ROUTES = {
   // the calls beside them loaded: exactly the half-page this registry exists to
   // stop. FRONT_DESK holds both and is unaffected.
   '/front-desk': { label: 'Front Desk', permission: FRONT_DESK_BOARD_GRANTS },
-  // GET /v1/conversations — requirePermission('crm:read')
-  '/ai-receptionist': { label: 'AI Receptionist', permission: 'crm:read' },
+  // GET /v1/conversations requires crm:read; canonical call evidence requires
+  // receptionist:call-artifacts:read. Mutations remain gated in-page by
+  // crm:write, so read-only custom roles can inspect without being offered a
+  // submission control.
+  '/ai-receptionist': { label: 'AI Receptionist', permission: COMMUNICATIONS_GRANTS },
   // GET /v1/receptionist/clinics, /campaigns — receptionist:manage today. The
   // read gate (`receptionist:read`, phase2-contracts §9) opens the Studio
   // read-only once the Studio hides its mutation controls; until then a
@@ -144,7 +163,7 @@ export const ROUTES = {
   // GET /v1/reviews, /v1/reputation — requirePermission('crm:read')
   '/reviews': { label: 'Reviews', permission: 'crm:read' },
   // GET /v1/competitors/radar — requirePermission('operations:read')
-  '/clinic-radar': { label: 'ClinicRadar', permission: 'operations:read' },
+  '/clinic-radar': { label: 'Insights', permission: INSIGHTS_GRANTS },
   '/benchmarking': { label: 'Multi-Clinic Benchmarking', permission: 'operations:read' },
 
   // GET /v1/revenue-snapshots — requirePermission('revenue:read')
@@ -159,7 +178,7 @@ export const ROUTES = {
   '/doctor-workspace': { label: 'Provider Performance', permission: 'staff:read' },
 
   // /v1/monitoring/* — module preHandler requireRoles(OWNER, ADMIN, MANAGER, PROVIDER)
-  '/monitoring': { label: 'Remote Monitoring', roles: CLINICAL_LEADERSHIP },
+  '/monitoring': { label: 'Connected Care', roles: CLINICAL_LEADERSHIP },
   // POST/PATCH/DELETE /v1/monitoring/rules — requireRoles(OWNER, ADMIN, MANAGER)
   '/alert-thresholds': { label: 'Alert Thresholds', roles: CLINICAL_LEADERSHIP },
   // GET /v1/devices/overview — entitlement only (device_integration).
@@ -186,7 +205,7 @@ export const ROUTES = {
   '/subscription': { label: 'Subscription' },
   // GET /v1/settings/roles, /notification-templates — authenticated only. Also
   // the account page every user reaches from their own avatar.
-  '/settings': { label: 'Settings' },
+  '/settings': { label: 'Administration' },
 
   // Routed but not in the sidebar; still deep-linkable.
   // GET /v1/inventory — requirePermission('inventory:read')

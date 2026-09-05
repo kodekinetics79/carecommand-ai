@@ -43,6 +43,7 @@ export interface AppointmentVerificationQueueRow {
   id: string;
   branchId: string;
   branchName: string;
+  clinicTimezone: string;
   patientId: string;
   patientName: string;
   appointmentTime: string;
@@ -375,6 +376,7 @@ export async function fetchAppointmentVerificationQueue(
   window?: { from: Date; to: Date },
 ) {
   const params = new URLSearchParams();
+  params.set('limit', '100');
   if (branchId) params.set('branchId', branchId);
   // The clinic day the desk is working. Sent as instants because only the
   // client knows the clinic's timezone; without it the server falls back to
@@ -384,7 +386,7 @@ export async function fetchAppointmentVerificationQueue(
     params.set('to', window.to.toISOString());
   }
   const suffix = params.toString() ? `?${params.toString()}` : '';
-  return apiRequest<{ appointments: AppointmentVerificationQueueRow[] }>(`/v1/revenue-protection/appointment-queue${suffix}`);
+  return apiRequest<{ appointments: AppointmentVerificationQueueRow[]; truncated?: boolean }>(`/v1/revenue-protection/appointment-queue${suffix}`);
 }
 
 export async function fetchEligibilityHistory(patientId: string, branchId?: string) {

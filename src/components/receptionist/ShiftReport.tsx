@@ -51,13 +51,15 @@ function Metric({ label, value, definition, tone = 'plain' }: {
   );
 }
 
-export function ShiftReport({ kpis, state, failure, summary, timezone, onRetry }: {
+export function ShiftReport({ kpis, state, failure, refreshFailure, summary, timezone, clinicName, onRetry }: {
   kpis: OverviewKpis | null;
   state: LoadState;
   failure: ResourceFailure | null;
+  refreshFailure: ResourceFailure | null;
   /** The live queue, for "what is still open" — the same summary every other surface reads. */
   summary: TaskSummary | null;
   timezone: string;
+  clinicName: string;
   onRetry: () => void;
 }) {
   const definitions = kpis?.definitions ?? ({} as Record<string, string>);
@@ -74,6 +76,7 @@ export function ShiftReport({ kpis, state, failure, summary, timezone, onRetry }
           <p className="text-[11px] text-t3">
             What the AI handled, what is still open, and what needs a human — for the handover.
           </p>
+          <p className="mt-1 text-[10px] font-semibold text-t2">Call KPIs: {clinicName} · Open task signals: network-wide</p>
         </div>
         {state === 'ready' && kpis && (
           <p className="text-[10px] text-t3">
@@ -97,6 +100,12 @@ export function ShiftReport({ kpis, state, failure, summary, timezone, onRetry }
         </div>
       )}
 
+      {state === 'ready' && refreshFailure && (
+        <p role="status" className="rounded-lg border border-amber-v/40 bg-[var(--amber-soft)] px-3 py-2 text-[11px] font-semibold text-t2">
+          The latest call-KPI refresh failed ({refreshFailure.message}). This report keeps the last successfully loaded clinic values visible and marks them as potentially out of date.
+        </p>
+      )}
+
       {state === 'ready' && kpis && (
         <>
           <div>
@@ -115,9 +124,9 @@ export function ShiftReport({ kpis, state, failure, summary, timezone, onRetry }
             <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-t3">What is still open</p>
             <div className="grid gap-2 grid-cols-2 lg:grid-cols-3">
               <Metric
-                label="Callers waiting on a person"
+                label="Network callers waiting on a person"
                 value={stillOpen === null ? KPI_UNAVAILABLE : String(stillOpen)}
-                definition="Open receptionist tasks that are not emergencies, from the live queue."
+                definition="Network-wide open receptionist tasks that are not emergencies, from the live queue."
               />
               <Metric label="Booking requests to review" value={formatKpiCount(kpis.counts.pendingRequests)} />
               <Metric label="Open handoffs" value={formatKpiCount(kpis.counts.openHandoffs)} />
@@ -128,15 +137,15 @@ export function ShiftReport({ kpis, state, failure, summary, timezone, onRetry }
             <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-t3">What needs a human now</p>
             <div className="grid gap-2 grid-cols-2 lg:grid-cols-3">
               <Metric
-                label="Emergencies open"
+                label="Network emergencies open"
                 value={emergenciesOpen === null ? KPI_UNAVAILABLE : String(emergenciesOpen)}
-                definition="Nobody may close these but a person."
+                definition="Network-wide. Nobody may close these but a person."
                 tone={emergenciesOpen ? 'attention' : 'plain'}
               />
               <Metric
-                label="Service status alerts"
+                label="Network service status alerts"
                 value={deploymentOpen === null ? KPI_UNAVAILABLE : String(deploymentOpen)}
-                definition="Open deployment-attention tasks. Any number above zero means the line may not be answering."
+                definition="Network-wide deployment-attention tasks. Any number above zero means a line may not be answering."
                 tone={deploymentOpen ? 'attention' : 'plain'}
               />
               <Metric label="Opted out on a call" value={formatKpiCount(kpis.counts.optedOut)} />
@@ -144,8 +153,8 @@ export function ShiftReport({ kpis, state, failure, summary, timezone, onRetry }
           </div>
 
           <p className="text-[10px] leading-relaxed text-t3">
-            Every figure above is computed from stored call records for this period in {timezone}, with its definition
-            printed beside it. A rate whose denominator was empty reads “{KPI_UNAVAILABLE}” — it is never shown as 0.
+            Call KPIs are computed from stored records for {clinicName} in {timezone}; network task signals come from the
+            tenant-wide live queue. A rate whose denominator was empty reads “{KPI_UNAVAILABLE}” — it is never shown as 0.
           </p>
         </>
       )}

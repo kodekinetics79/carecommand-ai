@@ -100,7 +100,6 @@ export default function AdvisoryRoom() {
     if (!question.trim() || question === 'What should I focus on first today?') {
       setQuestion(sample);
     }
-    void handleAsk(advisorType, sample);
   }
 
   const currentAnswer = activeAnswer ?? selectedAdvisorData;
@@ -122,7 +121,7 @@ export default function AdvisoryRoom() {
 
       <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
         <div className="space-y-4">
-          <BentoCard title="Your Advisory Team" subtitle="Choose the advisor that should answer first">
+          <BentoCard title="Your Advisory Team" subtitle="Choose an advisor to inspect its rule-based briefing; Ask Advisor runs the configured model">
             {briefError && (
               <div className="mb-4 rounded-xl border border-[var(--red-soft)] bg-[var(--red-soft)] px-3 py-2 text-xs text-red-v">
                 {briefError}

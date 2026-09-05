@@ -7,6 +7,7 @@ import {
   type PilotImportPreset,
   type PilotImportPreview,
   type PilotStatusShareCreated,
+  type PilotStatusShare,
   type TenantSummary,
 } from '../lib/platformAdmin';
 
@@ -90,6 +91,7 @@ export default function PlatformPilot() {
   const [shareLabel, setShareLabel] = useState('Pilot status');
   const [shareDays, setShareDays] = useState(14);
   const [shareResult, setShareResult] = useState<PilotStatusShareCreated | null>(null);
+  const [shares, setShares] = useState<PilotStatusShare[]>([]);
 
   useEffect(() => {
     let active = true;
@@ -154,6 +156,15 @@ export default function PlatformPilot() {
     return () => { active = false; };
   }, [selectedTenantId, entityType]);
 
+  useEffect(() => {
+    if (!selectedTenantId) return;
+    let active = true;
+    void platformAdmin.listPilotStatusShares(selectedTenantId)
+      .then(rows => { if (active) setShares(rows); })
+      .catch(() => { if (active) setShares([]); });
+    return () => { active = false; };
+  }, [selectedTenantId]);
+
   async function reloadTenants(nextTenantId?: string) {
     const rows = await platformAdmin.tenants();
     setTenants(rows);
@@ -164,6 +175,7 @@ export default function PlatformPilot() {
     setMapping({});
     setImportResult(null);
     setShareResult(null);
+    setShares([]);
     setSelectedPresetId('');
     setPresetName('');
     setPresetDefault(true);
@@ -297,6 +309,7 @@ export default function PlatformPilot() {
     try {
       const created = await platformAdmin.createPilotStatusShare(selectedTenantId, { label: shareLabel.trim() || undefined, expiresInDays: shareDays });
       setShareResult(created);
+      setShares(await platformAdmin.listPilotStatusShares(selectedTenantId));
       setImportResult(`Created share link for ${created.clinicName}.`);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create share link');
@@ -307,8 +320,27 @@ export default function PlatformPilot() {
 
   async function copyShareUrl() {
     if (!shareResult?.url) return;
-    await navigator.clipboard.writeText(shareResult.url);
-    setImportResult('Pilot share link copied.');
+    try {
+      await navigator.clipboard.writeText(shareResult.url);
+      setImportResult('Pilot share link copied.');
+    } catch {
+      setError('The browser could not copy the link. Select the displayed URL and copy it manually.');
+    }
+  }
+
+  async function revokeShareLink(shareId: string) {
+    if (!selectedTenantId) return;
+    setBusy('commit'); setError(null);
+    try {
+      await platformAdmin.revokePilotStatusShare(selectedTenantId, shareId);
+      setShares(await platformAdmin.listPilotStatusShares(selectedTenantId));
+      if (shareResult?.id === shareId) setShareResult(null);
+      setImportResult('Pilot status link revoked. It can no longer be opened.');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to revoke pilot status link');
+    } finally {
+      setBusy(null);
+    }
   }
 
   const canImport = !!selectedTenantId && !!csvText.trim() && !!preview && preview.summary.invalid === 0;
@@ -396,6 +428,7 @@ export default function PlatformPilot() {
                 setMapping({});
                 setImportResult(null);
                 setShareResult(null);
+                setShares([]);
                 setSelectedPresetId('');
                 setPresetName('');
                 setPresetDefault(true);
@@ -673,6 +706,20 @@ export default function PlatformPilot() {
                     <Copy className="w-3.5 h-3.5" /> Copy
                   </button>
                 </div>
+              </div>
+            )}
+            {shares.length > 0 && (
+              <div className="mt-3 space-y-2">
+                <p className="text-[11px] font-bold uppercase tracking-wide text-t3">Issued links</p>
+                {shares.map(share => (
+                  <div key={share.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2">
+                    <div>
+                      <p className="text-sm font-semibold text-t1">{share.label ?? 'Untitled pilot status'}</p>
+                      <p className="text-[11px] text-t3">{share.active ? `Active until ${new Date(share.expiresAt).toLocaleString()}` : 'Expired or revoked'}{share.lastViewedAt ? ` · last opened ${new Date(share.lastViewedAt).toLocaleString()}` : ' · not opened'}</p>
+                    </div>
+                    {share.active && <button type="button" disabled={busy === 'commit'} onClick={() => void revokeShareLink(share.id)} className="rounded-lg border border-red-v/30 px-2.5 py-1.5 text-[11px] font-semibold text-red-v hover:bg-red-v/5 disabled:opacity-40">Revoke link</button>}
+                  </div>
+                ))}
               </div>
             )}
           </div>

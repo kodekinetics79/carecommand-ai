@@ -13,6 +13,7 @@ import { lockClinicAccessMutation } from './clinicAccessSafety';
 // ===========================================================================
 
 const isAdminRole = (role: string) => role === 'OWNER' || role === 'ADMIN';
+const requiresClinicAssignment = (role: string) => role === 'MANAGER' || role === 'PROVIDER' || role === 'FRONT_DESK' || role === 'BILLING';
 
 async function activeAdminCount(tenantId: string, excludeUserId?: string) {
   return db.user.count({
@@ -113,6 +114,12 @@ export async function setUserActiveSafely(request: FastifyRequest, targetId: str
       where: { id: target.id },
       data: { active, ...(active ? {} : { refreshTokenHash: null, refreshTokenExpiresAt: null }) },
     });
+    if (!active) {
+      await tx.passwordResetToken.updateMany({
+        where: { tenantId: request.auth.tenantId, userId: target.id, usedAt: null },
+        data: { usedAt: new Date() },
+      });
+    }
     await tx.auditEvent.create({ data: auditData(request, action, target.id, { active }) });
     return { kind: 'updated' as const, updated };
   });
@@ -126,6 +133,7 @@ export async function setUserActiveSafely(request: FastifyRequest, targetId: str
 export async function setUserRoleSafely(request: FastifyRequest, targetId: string, role: UserRole, action: string) {
   const result = await runWithTenantContext(request.auth.tenantId, async tx => {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`tenant.admin.guard:${request.auth.tenantId}`}::text, 0))::text AS locked`;
+    await lockClinicAccessMutation(tx, request.auth.tenantId);
     const target = await tx.user.findFirst({ where: { id: targetId, tenantId: request.auth.tenantId } });
     if (!target) return { kind: 'not_found' as const };
     const demotingFromAdmin = isAdminRole(target.role) && !isAdminRole(role);
@@ -140,6 +148,15 @@ export async function setUserRoleSafely(request: FastifyRequest, targetId: strin
         return { kind: 'blocked' as const, message: 'This is the last active administrator. Assign another OWNER or ADMIN before changing this role.' };
       }
     }
+    if (requiresClinicAssignment(role)) {
+      const activeAssignments = await tx.userClinicAccess.count({
+        where: { tenantId: request.auth.tenantId, userId: target.id, branch: { active: true } },
+      });
+      if (activeAssignments === 0) {
+        await tx.auditEvent.create({ data: auditData(request, 'admin.roleSafety.blocked', target.id, { operation: 'roleChange', reason: 'missing_clinic_scope', fromRole: target.role, attemptedRole: role }) });
+        return { kind: 'blocked' as const, message: 'Assign at least one active clinic before changing this account to an operational role.' };
+      }
+    }
     const updated = await tx.user.update({ where: { id: target.id }, data: { role } });
     await tx.auditEvent.create({ data: auditData(request, action, target.id, { fromRole: target.role, toRole: role }) });
     return { kind: 'updated' as const, updated };
@@ -152,10 +169,9 @@ export async function setUserRoleSafely(request: FastifyRequest, targetId: strin
 /**
  * Serialize an administrator-set password with the revocations it must carry.
  *
- * No password-reset delivery adapter is integrated, so recovery for a
- * locked-out user is an OWNER/ADMIN setting a temporary password and handing it
- * over directly — the same way a password is set at user creation. The reset is
- * only honest if the old credential material stops working with it, so the
+ * Administrators retain an assisted-recovery fallback in addition to the
+ * tenant user's emailed reset link. The reset is only honest if the old
+ * credential material stops working with it, so the
  * outstanding reset tokens, the refresh token, and (via the
  * `controlPlane.session.revoked` receipt the auth plugin reads as the
  * revocation epoch) already-issued access tokens are all invalidated in the

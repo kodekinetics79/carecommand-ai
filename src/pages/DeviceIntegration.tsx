@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import {
   Cpu, Plus, Wifi, WifiOff, AlertTriangle, Clock, Activity, FlaskConical,
   MonitorSmartphone, ScanLine, Radio, Watch, Plug, RefreshCw, ChevronRight, Filter,
+  ShieldCheck, Settings2, CircleCheck, CircleDashed,
 } from 'lucide-react';
 import type { ElementType } from 'react';
 import StatCard from '../components/ui/StatCard';
@@ -10,6 +11,7 @@ import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import DeviceDetailDrawer from '../components/devices/DeviceDetailDrawer';
 import { apiRequest } from '../lib/api';
 import { useApiData } from '../hooks/useApiData';
+import { useSession } from '../hooks/useSession';
 
 interface Device {
   id: string; name: string; deviceType: string; vendor: string | null; model: string | null;
@@ -31,6 +33,14 @@ interface DeviceOverview {
   summary: { total: number; reporting: number; stale: number; neverReported: number; error: number };
   devices: Device[];
   branches: Branch[];
+}
+
+interface DeviceProvider {
+  key: string; displayName: string; category: string; supportsSandbox: boolean; supportsWebhook: boolean; note: string;
+  configFields: Array<{ key: string; label: string; secret: boolean; required: boolean }>;
+  status: string; mode: 'sandbox' | 'production'; configured: boolean; webhookConfigured: boolean;
+  lastHealthCheckAt: string | null; lastHealthStatus: string | null; healthMessage: string | null; lastSyncAt: string | null;
+  healthVerdictStale: boolean | null; healthVerdictTtlHours: number;
 }
 
 const fallback: DeviceOverview = { summary: { total: 0, reporting: 0, stale: 0, neverReported: 0, error: 0 }, devices: [], branches: [] };
@@ -70,7 +80,9 @@ function relTime(iso: string | null): string {
 const emptyForm = { name: '', deviceType: 'vitals_monitor', vendor: '', model: '', serialNumber: '', connectionType: 'network', branchId: '', location: '' };
 
 export default function DeviceIntegration() {
+  const { user } = useSession();
   const { data, loading, error, reload } = useApiData<DeviceOverview>('/v1/devices/overview', fallback);
+  const { data: providers, loading: providersLoading, error: providersError, reload: reloadProviders } = useApiData<DeviceProvider[]>('/v1/devices/providers', []);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [busy, setBusy] = useState<string | null>(null);
@@ -80,6 +92,14 @@ export default function DeviceIntegration() {
   const [fStatus, setFStatus] = useState('all');
   const [fType, setFType] = useState('all');
   const [fVendor, setFVendor] = useState('all');
+  const [openProvider, setOpenProvider] = useState<string | null>(null);
+  const [providerMode, setProviderMode] = useState<'sandbox' | 'production'>('sandbox');
+  const [providerConfig, setProviderConfig] = useState<Record<string, string>>({});
+  const [providerBusy, setProviderBusy] = useState<string | null>(null);
+  const [providerError, setProviderError] = useState<string | null>(null);
+  const [providerNotice, setProviderNotice] = useState<string | null>(null);
+
+  const canManage = ['OWNER', 'ADMIN', 'MANAGER'].includes(user?.role ?? '');
 
   const s = data.summary;
   const vendors = useMemo(() => [...new Set(data.devices.map(d => d.vendor).filter((v): v is string => !!v))].sort(), [data.devices]);
@@ -113,6 +133,53 @@ export default function DeviceIntegration() {
     }
   }
 
+  function beginProviderSetup(provider: DeviceProvider) {
+    setOpenProvider(current => current === provider.key ? null : provider.key);
+    setProviderMode(provider.mode);
+    setProviderConfig({});
+    setProviderError(null);
+    setProviderNotice(null);
+  }
+
+  async function saveProvider(provider: DeviceProvider) {
+    const missing = provider.configFields.filter(field => field.required && !providerConfig[field.key]?.trim());
+    if (missing.length) {
+      setProviderError(`Enter ${missing.map(field => field.label).join(', ')}.`);
+      return;
+    }
+    setProviderBusy(provider.key);
+    setProviderError(null);
+    setProviderNotice(null);
+    try {
+      await apiRequest(`/v1/devices/providers/${provider.key}/configure`, {
+        method: 'POST', body: JSON.stringify({ mode: providerMode, config: providerConfig }),
+      });
+      await reloadProviders();
+      setOpenProvider(null);
+      setProviderConfig({});
+      setProviderNotice(`${provider.displayName} ${providerMode} setup saved. Signed intake is ready for enrollment; vendor reachability is still unverified.`);
+    } catch (err) {
+      setProviderError(err instanceof Error ? err.message : 'Provider setup could not be saved.');
+    } finally {
+      setProviderBusy(null);
+    }
+  }
+
+  async function checkProvider(provider: DeviceProvider) {
+    setProviderBusy(`health:${provider.key}`);
+    setProviderError(null);
+    setProviderNotice(null);
+    try {
+      const result = await apiRequest<{ lastHealthStatus: string; healthMessage: string }>(`/v1/devices/providers/${provider.key}/health-check`, { method: 'POST' });
+      await reloadProviders();
+      setProviderNotice(result.healthMessage);
+    } catch (err) {
+      setProviderError(err instanceof Error ? err.message : 'Stored setup check failed.');
+    } finally {
+      setProviderBusy(null);
+    }
+  }
+
   return (
     <div className="space-y-4 pb-6">
       {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
@@ -122,9 +189,11 @@ export default function DeviceIntegration() {
           <button type="button" onClick={() => void reload()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
             <RefreshCw className="w-3.5 h-3.5 text-t3" /> Refresh
           </button>
-          <button type="button" onClick={() => setShowForm(v => !v)} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
-            <Plus className="w-4 h-4" /> Register device
-          </button>
+          {canManage && (
+            <button type="button" onClick={() => setShowForm(v => !v)} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
+              <Plus className="w-4 h-4" /> Register device
+            </button>
+          )}
         </div>
       </div>
 
@@ -147,8 +216,88 @@ export default function DeviceIntegration() {
         </div>
       )}
 
+      {!canManage && (
+        <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3 text-[12px] text-t2">
+          Read-only device registry. An owner, administrator, or practice manager configures providers and registers devices.
+        </div>
+      )}
+
+      <BentoCard title="Provider connections" subtitle="Secure the intake path before enrolling a patient or device">
+        <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-[12px] text-t2">
+          <ShieldCheck className="h-4 w-4 text-indigo" />
+          <span><strong className="text-t1">Activation path:</strong> save sandbox credentials and signing secret → register device → enroll patient → verify signed readings and alerts.</span>
+        </div>
+        {providersError && (
+          <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] px-3 py-2 text-[12px] text-amber-v">
+            <span>Provider setup is unavailable: {providersError}</span>
+            <button type="button" onClick={() => void reloadProviders()} className="font-semibold underline">Retry</button>
+          </div>
+        )}
+        {providerError && <p role="alert" className="mb-3 rounded-lg bg-[var(--red-soft)] px-3 py-2 text-[12px] text-red-v">{providerError}</p>}
+        {providerNotice && <p role="status" className="mb-3 rounded-lg bg-[var(--emerald-soft)] px-3 py-2 text-[12px] text-emerald-v">{providerNotice}</p>}
+        {providersLoading && providers.length === 0 ? (
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{Array.from({ length: 6 }).map((_, i) => <div key={i} className="skeleton-line h-28 rounded-lg" />)}</div>
+        ) : (
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {providers.map(provider => {
+              const isManual = provider.category === 'MANUAL';
+              const signedReady = provider.configured && provider.webhookConfigured;
+              const stateLabel = isManual ? 'Local fallback' : signedReady ? 'Signed intake ready' : provider.configured ? 'Webhook incomplete' : 'Not configured';
+              const StateIcon = isManual || signedReady ? CircleCheck : CircleDashed;
+              return (
+                <div key={provider.key} className={`rounded-xl border p-3 ${signedReady ? 'border-emerald-300 bg-[var(--emerald-soft)]' : 'border-[var(--b1)] bg-[var(--s1)]'}`}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <p className="text-[13px] font-bold text-t1">{provider.displayName}</p>
+                      <p className="mt-0.5 text-[11px] text-t3">{provider.category.replace('_', ' ')} · {provider.mode}</p>
+                    </div>
+                    <span className={`badge inline-flex items-center gap-1 ${signedReady ? 'badge-emerald' : ''}`}><StateIcon className="h-3 w-3" />{stateLabel}</span>
+                  </div>
+                  <p className="mt-2 min-h-8 text-[11px] leading-4 text-t2">{provider.note}</p>
+                  {provider.healthMessage && <p className="mt-2 text-[11px] text-t3">Stored setup check: {provider.healthMessage}</p>}
+                  {canManage && !isManual && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button type="button" onClick={() => beginProviderSetup(provider)} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t1 hover:bg-[var(--s2)]">
+                        <Settings2 className="h-3.5 w-3.5" /> {provider.configured ? 'Replace setup' : 'Configure'}
+                      </button>
+                      {provider.configured && (
+                        <button type="button" disabled={providerBusy === `health:${provider.key}`} onClick={() => void checkProvider(provider)} className="rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50">
+                          {providerBusy === `health:${provider.key}` ? 'Checking…' : 'Check stored setup'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {canManage && openProvider === provider.key && (
+                    <div className="mt-3 space-y-2 border-t border-[var(--b1)] pt-3">
+                      <Field label="Mode">
+                        <select aria-label={`${provider.displayName} mode`} value={providerMode} onChange={event => setProviderMode(event.target.value as 'sandbox' | 'production')} className={inputCls}>
+                          {provider.supportsSandbox && <option value="sandbox">Sandbox</option>}
+                          <option value="production">Production</option>
+                        </select>
+                      </Field>
+                      {provider.configFields.map(field => (
+                        <Field key={field.key} label={field.label}>
+                          <input aria-label={`${provider.displayName} ${field.label}`} type={field.secret ? 'password' : 'text'} autoComplete="off" value={providerConfig[field.key] ?? ''}
+                            onChange={event => setProviderConfig(current => ({ ...current, [field.key]: event.target.value }))}
+                            placeholder={field.required ? 'Required' : 'Optional'} className={inputCls} />
+                        </Field>
+                      ))}
+                      <p className="text-[11px] leading-4 text-t3">Secrets are encrypted at rest and never returned. Saving proves only local setup and signed-webhook readiness; it does not claim the vendor is reachable.</p>
+                      <div className="flex gap-2">
+                        <button type="button" disabled={providerBusy === provider.key} onClick={() => void saveProvider(provider)} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50">{providerBusy === provider.key ? 'Saving…' : 'Save setup'}</button>
+                        <button type="button" onClick={() => setOpenProvider(null)} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2">Cancel</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </BentoCard>
+
       {/* Register form */}
-      {showForm && (
+      {canManage && showForm && (
         <div className="rounded-xl border border-[var(--b2)] bg-[var(--s2)] p-4 space-y-3">
           <p className="text-[13px] font-bold text-t1 inline-flex items-center gap-1.5"><Plug className="w-4 h-4 text-indigo" /> Register a new device</p>
           {formError && <p className="text-[12px] text-red-v">{formError}</p>}

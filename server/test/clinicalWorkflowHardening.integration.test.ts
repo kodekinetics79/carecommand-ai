@@ -17,6 +17,7 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
 const { readingTrendMap } = await import('../modules/monitoring/routes');
+const { zonedParts, zonedTimeToInstant } = await import('../lib/connectedCare/rpmPeriod');
 const { insuranceCardState } = await import('../modules/portal/routes');
 const { issuePortalSession } = await import('../lib/portalAuth');
 
@@ -47,6 +48,7 @@ async function fixture() {
 
 const staff = (t: Awaited<ReturnType<typeof fixture>>) => ({
   authorization: `Bearer ${app.jwt.sign({ tenantId: t.tenantId, userId: t.admin.id, role: 'ADMIN', type: 'access' })}`,
+  'x-carecommand-clinic-id': t.branchA.id,
   'x-forwarded-for': `198.51.100.${Math.floor(Math.random() * 200) + 1}`,
 });
 const reviewStaff = (t: Awaited<ReturnType<typeof fixture>>) => ({
@@ -167,7 +169,7 @@ describe('clinical workflow integrity', () => {
     } });
     expect(crossBranch.statusCode).toBe(403);
 
-    const today = new Date(); today.setHours(8, 0, 0, 0);
+    const today = new Date();
     await Promise.all([
       db.morningBriefingSignal.create({ data: { tenantId: t.tenantId, branchId: t.branchA.id, patientId: t.patientA.id, signalType: 'review', title: 'A-only', forDate: today } }),
       db.morningBriefingSignal.create({ data: { tenantId: t.tenantId, branchId: t.branchB.id, patientId: t.patientB.id, signalType: 'review', title: 'B-secret', forDate: today } }),
@@ -181,6 +183,65 @@ describe('clinical workflow integrity', () => {
     expect(briefing.ai).toBeNull();
     expect(overview.notifications.map((n: { patientName: string | null }) => n.patientName)).toContain('Alice A');
     expect(overview.notifications.map((n: { patientName: string | null }) => n.patientName)).not.toContain('Bob B');
+  });
+
+  it('lets a tenant owner deliberately narrow every Connected Care read without permitting cross-tenant or cross-branch scope', async () => {
+    const t = await fixture();
+    const other = await fixture();
+    await db.branch.update({ where: { id: t.branchA.id }, data: { timezone: 'America/Los_Angeles' } });
+    const localParts = zonedParts(new Date(), 'America/Los_Angeles');
+    const localDayStart = zonedTimeToInstant(localParts.year, localParts.month, localParts.day, 0, 0, 0, 'America/Los_Angeles');
+    const today = new Date();
+    const [readingA, readingB] = await Promise.all([
+      db.deviceReading.create({ data: { tenantId: t.tenantId, branchId: t.branchA.id, patientId: t.patientA.id, readingType: 'glucose', value: '310', numericValue: 310, capturedAt: new Date() } }),
+      db.deviceReading.create({ data: { tenantId: t.tenantId, branchId: t.branchB.id, patientId: t.patientB.id, readingType: 'glucose', value: '305', numericValue: 305, capturedAt: new Date() } }),
+    ]);
+    await Promise.all([
+      // This is after New York/server midnight but before the clinic's Los
+      // Angeles midnight. It must not inflate "Readings Today" for branch A.
+      db.deviceReading.create({ data: { tenantId: t.tenantId, branchId: t.branchA.id, patientId: t.patientA.id, readingType: 'glucose', value: '120', numericValue: 120, capturedAt: new Date(localDayStart.getTime() - 60_000) } }),
+      db.readingAlert.create({ data: { tenantId: t.tenantId, branchId: t.branchA.id, patientId: t.patientA.id, readingId: readingA.id, severity: 'critical', severityRank: 4, alertType: 'abnormal_reading', status: 'open', generatedReason: 'A-only alert' } }),
+      db.readingAlert.create({ data: { tenantId: t.tenantId, branchId: t.branchB.id, patientId: t.patientB.id, readingId: readingB.id, severity: 'critical', severityRank: 4, alertType: 'abnormal_reading', status: 'open', generatedReason: 'B-secret alert' } }),
+      db.morningBriefingSignal.create({ data: { tenantId: t.tenantId, branchId: t.branchA.id, patientId: t.patientA.id, signalType: 'review', title: 'A scoped signal', forDate: today } }),
+      db.morningBriefingSignal.create({ data: { tenantId: t.tenantId, branchId: t.branchA.id, patientId: t.patientA.id, signalType: 'review', title: 'Previous LA clinic day', forDate: new Date(localDayStart.getTime() - 60_000) } }),
+      db.morningBriefingSignal.create({ data: { tenantId: t.tenantId, branchId: t.branchB.id, patientId: t.patientB.id, signalType: 'review', title: 'B scoped signal', forDate: today } }),
+      db.notificationEvent.create({ data: { tenantId: t.tenantId, patientId: t.patientA.id, recipientType: 'nurse', recipientLabel: 'A scoped queue', channel: 'in_app', status: 'sent' } }),
+      db.notificationEvent.create({ data: { tenantId: t.tenantId, patientId: t.patientB.id, recipientType: 'nurse', recipientLabel: 'B scoped queue', channel: 'in_app', status: 'sent' } }),
+    ]);
+
+    const scopedUrl = (path: string) => `/v1/monitoring/${path}?branchId=${t.branchA.id}`;
+    const headers = { ...reviewStaff(t), 'x-carecommand-clinic-id': t.branchA.id };
+    const [overview, alerts, atRisk, briefing] = await Promise.all([
+      app.inject({ method: 'GET', url: scopedUrl('overview'), headers }),
+      app.inject({ method: 'GET', url: scopedUrl('alerts'), headers }),
+      app.inject({ method: 'GET', url: scopedUrl('patients-at-risk'), headers }),
+      app.inject({ method: 'GET', url: scopedUrl('morning-briefing'), headers }),
+    ]);
+    expect([overview.statusCode, alerts.statusCode, atRisk.statusCode, briefing.statusCode]).toEqual([200, 200, 200, 200]);
+    expect(overview.json().recentReadings.map((row: { patientName: string }) => row.patientName)).toContain('Alice A');
+    expect(overview.json().recentReadings.map((row: { patientName: string }) => row.patientName)).not.toContain('Bob B');
+    expect(overview.json().notifications.map((row: { patientName: string | null }) => row.patientName)).toContain('Alice A');
+    expect(overview.json().notifications.map((row: { patientName: string | null }) => row.patientName)).not.toContain('Bob B');
+    expect(overview.json().summary.readingsToday).toBe(1);
+    expect(overview.json().summary.dayDefinition).toBe('America/Los_Angeles local day');
+    expect(alerts.json().items.map((row: { patientName: string }) => row.patientName)).toEqual(['Alice A']);
+    expect(atRisk.json().map((row: { patientName: string }) => row.patientName)).toEqual(['Alice A']);
+    expect(briefing.json().signals.map((row: { title: string }) => row.title)).toContain('A scoped signal');
+    expect(briefing.json().signals.map((row: { title: string }) => row.title)).not.toContain('Previous LA clinic day');
+    expect(briefing.json().signals.map((row: { title: string }) => row.title)).not.toContain('B scoped signal');
+    expect(briefing.json().ai).toBeNull();
+
+    const foreign = await app.inject({ method: 'GET', url: `/v1/monitoring/overview?branchId=${other.branchA.id}`, headers });
+    const branchEscape = await app.inject({ method: 'GET', url: `/v1/monitoring/overview?branchId=${t.branchB.id}`, headers: staff(t) });
+    expect(foreign.statusCode).toBe(403);
+    expect(branchEscape.statusCode).toBe(403);
+
+    const providerB = await db.user.create({ data: { tenantId: t.tenantId, branchId: t.branchB.id, email: `provider-b-${t.tenantId}@test.invalid`, displayName: 'Branch B Provider', role: 'PROVIDER' } });
+    const alertA = await db.readingAlert.findFirstOrThrow({ where: { tenantId: t.tenantId, branchId: t.branchA.id, generatedReason: 'A-only alert' } });
+    const wrongClinicAssignment = await app.inject({ method: 'PATCH', url: `/v1/monitoring/alerts/${alertA.id}/assign`, headers, payload: { assignedToUserId: providerB.id } });
+    const tenantWideAssignment = await app.inject({ method: 'PATCH', url: `/v1/monitoring/alerts/${alertA.id}/assign`, headers, payload: { assignedToUserId: t.portalReviewer.id } });
+    expect(wrongClinicAssignment.statusCode).toBe(400);
+    expect(tenantWideAssignment.statusCode).toBe(200);
   });
 
   it('does not count ordinary valid readings as abnormal risk and computes trend direction chronologically', async () => {

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 import {
   Users, Layers3, Workflow,
   Search, Sparkles, Zap, Flame, ChevronUp, ChevronDown, AlertTriangle,
@@ -35,6 +37,10 @@ const LOAD_ERROR = 'Your CRM data did not load. The pipeline, consent and value 
 
 export default function CRM() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const canWrite = hasPermission(user, 'crm:write');
+  const canManageCampaigns = hasPermission(user, 'campaign:manage');
+  const visibleTabs = canWrite ? TABS : TABS.filter(item => item.key !== 'automation');
   const [tab, setTab] = useState<TabKey>('command');
   const [metrics, setMetrics] = useState<CommandMetrics | null>(null);
   const [pipeline, setPipeline] = useState<CrmPipeline | null>(null);
@@ -117,7 +123,10 @@ export default function CRM() {
   const CTA_LABEL: Record<string, string> = { send_booking_link: 'Send booking link', send_deposit_link: 'Send deposit link', send_intake_form: 'Send intake form', send_follow_up: 'Send follow-up', confirm_visit: 'Confirm visit' };
 
   async function onAction(lead: CrmLead, cta: CtaId) {
-    if (cta === 'call_now') { if (lead.phone) window.location.assign(`tel:${lead.phone}`); return; }
+    if (cta === 'call_now') {
+      navigate('/receptionist-studio?tab=outbound', { state: { source: 'CRM', leadId: lead.id, contextLabel: lead.name } });
+      return;
+    }
     if (cta === 'mark_retained') { await crmService.setStage(lead.id, 'retained'); await reload(); return; }
     if (cta === 'mark_lost') { setReasonModal(lead); return; }
     if (cta === 'launch_winback' || cta === 'recover_lost') { navigate('/campaigner'); return; }
@@ -145,14 +154,14 @@ export default function CRM() {
       {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-[13px] text-t3">Patient growth, retention &amp; revenue recovery</p>
-        <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
+        {canManageCampaigns && <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
           <Sparkles className="w-4 h-4" /> Create Campaign Draft
-        </button>
+        </button>}
       </div>
 
       <div className="overflow-x-auto">
         <ModuleTabs
-          tabs={TABS.map(item => ({ id: item.key, label: item.label }))}
+          tabs={visibleTabs.map(item => ({ id: item.key, label: item.label }))}
           activeTab={tab}
           onChange={id => setTab(id as TabKey)}
           ariaLabel="CRM sections"
@@ -204,7 +213,7 @@ export default function CRM() {
                       <p className="text-[13px] font-bold text-t1 truncate">{l.name} <span className="text-t3 font-normal">· {l.service}</span></p>
                       <p className="text-[11px] text-t3">{formatCurrency(l.estimatedValue)} · {l.source} · {l.ageDays}d</p>
                     </button>
-                    {l.nextBestAction && (
+                    {canWrite && l.nextBestAction && (
                       <button type="button" onClick={() => onAction(l, l.nextBestAction!.cta)} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 shrink-0"><Zap className="w-3 h-3" /> {l.nextBestAction.label.slice(0, 22)}</button>
                     )}
                   </div>
@@ -215,7 +224,7 @@ export default function CRM() {
 
         {tab === 'pipeline' && (
           <BentoCard title="Patient Growth Pipeline" subtitle="New Inquiry → Contacted → Booked → Visited → Follow-up → Retained">
-            <PipelineBoard pipeline={pipeline} {...handlers} />
+            <PipelineBoard pipeline={pipeline} canAct={canWrite} {...handlers} />
           </BentoCard>
         )}
 
@@ -286,11 +295,11 @@ export default function CRM() {
               ? segments.segments.length === 0
                 ? <EmptyStatePremium icon={<Layers3 className="w-5 h-5" />} title="No patient groups configured" description="The segment list loaded and this workspace has no candidate groups set up, so there is nothing to count patients against yet." />
                 : <EmptyStatePremium icon={<Layers3 className="w-5 h-5" />} title="No patient matches a group yet" description={`All ${segments.segments.length} configured group${segments.segments.length === 1 ? '' : 's'} came back with no matching patient in this workspace. A group fills up as patients pass its inactivity window or their recorded churn risk rises.`} />
-              : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{activeSegments.map(s => <SmartSegmentCard key={s.key} segment={s} recoverablePercent={segments.policy.recoverableLtvPercent} onCreateCampaign={() => navigate('/campaigner')} />)}</div>}
+              : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{activeSegments.map(s => <SmartSegmentCard key={s.key} segment={s} recoverablePercent={segments.policy.recoverableLtvPercent} canCreateCampaign={canManageCampaigns} onCreateCampaign={() => navigate('/campaigner')} />)}</div>}
           </div>
         )}
 
-        {tab === 'automation' && (
+        {tab === 'automation' && canWrite && (
           <BentoCard title="Automation Rules" subtitle="Trigger → action rules for patient growth" headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-violet-v"><Workflow className="w-3.5 h-3.5" /> Configured rules</span>}>
             <AutomationRulesPanel onNavigate={navigate} />
           </BentoCard>
@@ -299,7 +308,7 @@ export default function CRM() {
 
       {/* Drawers */}
       {scoreLead && <LeadScoreExplanationDrawer lead={scoreLead} onClose={() => setScoreLead(null)} />}
-      {profile && <PatientGrowthDrawer lead={profile.lead} patient={profile.patient} onClose={() => setProfile(null)} onNavigate={(r) => { setProfile(null); navigate(r); }} />}
+      {profile && <PatientGrowthDrawer lead={profile.lead} patient={profile.patient} canCreateCampaign={canManageCampaigns} onClose={() => setProfile(null)} onNavigate={(r) => { setProfile(null); navigate(r); }} />}
 
       {/* Modals */}
       {reasonModal && (

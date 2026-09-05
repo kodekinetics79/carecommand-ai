@@ -8,6 +8,26 @@ vi.mock('../lib/api', async () => {
   const actual = await vi.importActual<typeof import('../lib/api')>('../lib/api');
   return { ...actual, apiRequest: apiRequestMock };
 });
+vi.mock('../hooks/useSession', () => ({
+  useSession: () => ({
+    user: {
+      id: 'user-1', email: 'manager@test.local', displayName: 'Manager', role: 'MANAGER', active: true,
+      tenant: { id: 'tenant-1', name: 'Test Clinic', slug: 'test-clinic' },
+      effectivePermissions: ['crm:read', 'crm:write', 'campaign:manage'],
+    },
+    loading: false,
+  }),
+}));
+vi.mock('../hooks/useSession', () => ({
+  useSession: () => ({
+    user: {
+      id: 'user-1', email: 'manager@test.local', displayName: 'Manager', role: 'MANAGER', active: true,
+      tenant: { id: 'tenant-1', name: 'Test Clinic', slug: 'test-clinic' },
+      effectivePermissions: ['crm:read', 'crm:write', 'campaign:manage'],
+    },
+    loading: false,
+  }),
+}));
 
 import CRM from './CRM';
 

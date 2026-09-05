@@ -15,7 +15,9 @@ vi.mock('../workers/queues', () => ({
 
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
-const { generatePasswordHash } = await import('../lib/security');
+const { generatePasswordHash, hashResetToken } = await import('../lib/security');
+const { env } = await import('../config/env');
+const { __setProviderSnapshotForTests } = await import('../lib/providerCredentials');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -29,6 +31,7 @@ async function makeTenantWithUsers() {
   const tag = tenantId.slice(0, 8);
   await db.tenant.create({ data: { id: tenantId, name: `Recovery ${tag}`, slug: `recovery-${tag}` } });
   createdTenantIds.push(tenantId);
+  await db.branch.create({ data: { tenantId, name: 'Recovery test clinic', location: 'Synthetic' } });
   const admin = await db.user.create({
     data: {
       tenantId,
@@ -73,7 +76,7 @@ function resetPassword(authorization: string, userId: string, password: string) 
 
 function outstandingResetToken(tenantId: string, userId: string) {
   return db.passwordResetToken.create({
-    data: { tenantId, userId, tokenHash: `outstanding-${randomUUID()}`, expiresAt: new Date(Date.now() + 3_600_000) },
+    data: { tenantId, userId, tokenHash: `outstanding-${randomUUID()}`, activatedAt: new Date(), expiresAt: new Date(Date.now() + 3_600_000) },
   });
 }
 
@@ -210,4 +213,103 @@ describe('self-service password change', () => {
     expect((await changePassword(undefined, STAFF_PASSWORD, REPLACEMENT_PASSWORD)).statusCode).toBe(401);
     expect((await login(staff.email, STAFF_PASSWORD)).statusCode).toBe(200);
   });
+});
+
+describe('tenant forgot-password recovery', () => {
+  it('uses the workspace selector to disambiguate one email across tenants', async () => {
+    const first = await makeTenantWithUsers();
+    const second = await makeTenantWithUsers();
+    await db.user.update({ where: { id: second.staff.id }, data: { email: first.staff.email } });
+
+    const ambiguous = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: first.staff.email } });
+    expect(ambiguous.statusCode).toBe(200);
+    expect(ambiguous.json().devToken).toBeUndefined();
+
+    const scoped = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: first.staff.email, tenantSlug: second.tenantId ? `recovery-${second.tenantId.slice(0, 8)}` : '' } });
+    expect(scoped.statusCode).toBe(200);
+    expect(scoped.json().devToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(await db.passwordResetToken.count({ where: { userId: first.staff.id } })).toBe(0);
+    expect(await db.passwordResetToken.count({ where: { userId: second.staff.id, activatedAt: { not: null }, usedAt: null } })).toBe(1);
+  });
+
+  it('serializes concurrent requests so at most one usable credential is issued', async () => {
+    const { tenantId, staff } = await makeTenantWithUsers();
+    const [first, second] = await Promise.all([
+      app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: staff.email } }),
+      app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: staff.email } }),
+    ]);
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect([first.json().devToken, second.json().devToken].filter(Boolean)).toHaveLength(1);
+    expect(await db.passwordResetToken.count({ where: { tenantId, userId: staff.id, activatedAt: { not: null }, usedAt: null } })).toBe(1);
+  });
+
+  it('does not revive a reset link after deactivation and reactivation', async () => {
+    const { admin, staff } = await makeTenantWithUsers();
+    const requested = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: staff.email } });
+    const token = requested.json().devToken as string;
+    expect(token).toBeTruthy();
+    const authorization = await accessToken(admin.email, ADMIN_PASSWORD);
+
+    expect((await app.inject({ method: 'PATCH', url: `/v1/control-plane/users/${staff.id}/status`, headers: { authorization }, payload: { active: false } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'PATCH', url: `/v1/control-plane/users/${staff.id}/status`, headers: { authorization }, payload: { active: true } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: '/v1/auth/password-reset/confirm', payload: { token, newPassword: REPLACEMENT_PASSWORD } })).statusCode).toBe(400);
+  });
+
+  it('activates only a provider-accepted production link and keeps the public response generic', async () => {
+    const { staff } = await makeTenantWithUsers();
+    const originalEnv = { NODE_ENV: env.NODE_ENV, PUBLIC_APP_URL: env.PUBLIC_APP_URL };
+    let deliveredToken = '';
+    try {
+      Object.assign(env, { NODE_ENV: 'production', PUBLIC_APP_URL: 'https://carecommand.example.com' });
+      __setProviderSnapshotForTests({
+        email: { provider: 'generic', apiUrl: 'https://mail.example.test/send', apiKey: 'test-key', fromAddress: 'security@carecommand.example.com' },
+      });
+      vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (_url, init) => {
+        const payload = JSON.parse(String(init?.body)) as { text: string };
+        deliveredToken = /#reset=([A-Za-z0-9_-]{43})/.exec(payload.text)?.[1] ?? '';
+        return new Response(JSON.stringify({ id: 'provider-message-1' }), { status: 202, headers: { 'content-type': 'application/json' } });
+      }));
+
+      const known = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: staff.email } });
+      const unknown = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: `unknown-${randomUUID()}@recovery.test` } });
+      expect(known.statusCode).toBe(200);
+      expect(known.json()).toEqual(unknown.json());
+      expect(known.body).not.toContain('devToken');
+      expect(known.body).not.toContain(deliveredToken);
+      expect(deliveredToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect((await app.inject({ method: 'POST', url: '/v1/auth/password-reset/confirm', payload: { token: deliveredToken, newPassword: REPLACEMENT_PASSWORD } })).statusCode).toBe(200);
+    } finally {
+      Object.assign(env, originalEnv);
+      __setProviderSnapshotForTests({});
+      vi.unstubAllGlobals();
+    }
+  }, 15_000);
+
+  it('keeps an older delivered link usable when replacement delivery fails', async () => {
+    const { tenantId, staff } = await makeTenantWithUsers();
+    const oldRawToken = 'z'.repeat(43);
+    await db.passwordResetToken.create({ data: {
+      tenantId, userId: staff.id, tokenHash: hashResetToken(oldRawToken), activatedAt: new Date(Date.now() - 300_000),
+      createdAt: new Date(Date.now() - 300_000), expiresAt: new Date(Date.now() + 600_000),
+    } });
+    const originalEnv = { NODE_ENV: env.NODE_ENV, PUBLIC_APP_URL: env.PUBLIC_APP_URL };
+    try {
+      Object.assign(env, { NODE_ENV: 'production', PUBLIC_APP_URL: 'https://carecommand.example.com' });
+      __setProviderSnapshotForTests({
+        email: { provider: 'generic', apiUrl: 'https://mail.example.test/send', apiKey: 'test-key', fromAddress: 'security@carecommand.example.com' },
+      });
+      vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ message: 'synthetic outage' }), { status: 503, headers: { 'content-type': 'application/json' } })));
+
+      const response = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: staff.email } });
+      expect(response.statusCode).toBe(200);
+      expect(response.body).not.toContain('devToken');
+      expect(await db.passwordResetToken.count({ where: { userId: staff.id, activatedAt: null } })).toBe(0);
+      expect((await app.inject({ method: 'POST', url: '/v1/auth/password-reset/confirm', payload: { token: oldRawToken, newPassword: REPLACEMENT_PASSWORD } })).statusCode).toBe(200);
+    } finally {
+      Object.assign(env, originalEnv);
+      __setProviderSnapshotForTests({});
+      vi.unstubAllGlobals();
+    }
+  }, 10_000);
 });

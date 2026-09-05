@@ -73,9 +73,14 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
         status: query.status,
         startsAt: query.from || query.to ? { gte: query.from, lte: query.to } : undefined,
       },
-      // Include the patient's name (only firstName/lastName — no extra PHI) so the
-      // client can show the real customer instead of a hardcoded placeholder.
-      include: { patient: { select: { firstName: true, lastName: true } } },
+      // Include only the labels the schedule needs. A canonical appointment
+      // stores a ProviderProfile UUID; sending that UUID as `providerRef` made
+      // the customer-facing timeline print an internal identifier instead of
+      // the clinician's name.
+      include: {
+        patient: { select: { firstName: true, lastName: true } },
+        providerProfile: { select: { user: { select: { displayName: true } } } },
+      },
       orderBy: { id: 'asc' },
       cursor: query.cursor ? { id: query.cursor } : undefined,
       skip: query.cursor ? 1 : 0,
@@ -86,7 +91,15 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, page.data.map(a => a.id));
     // HIPAA access accounting for a PHI list read (id-only, no PHI in the log).
     await audit(request, { action: 'appointment.list', resource: 'appointment', metadata: { count: page.data.length } });
-    return { ...page, data: page.data.map(({ patient, ...a }) => ({ ...a, patientName: `${patient.firstName} ${patient.lastName}`.trim(), payment: summaries.get(a.id) ?? null })) };
+    return {
+      ...page,
+      data: page.data.map(({ patient, providerProfile, ...a }) => ({
+        ...a,
+        patientName: `${patient.firstName} ${patient.lastName}`.trim(),
+        providerName: providerProfile?.user.displayName ?? null,
+        payment: summaries.get(a.id) ?? null,
+      })),
+    };
   });
 
   // ----- Single-appointment detail read (PHI: patient identity) --------------
@@ -96,6 +109,7 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
       include: {
         patient: { select: { id: true, firstName: true, lastName: true } },
+        providerProfile: { select: { user: { select: { displayName: true } } } },
         // Append-only note history (C4). The scalar `notes` string is untouched.
         noteEntries: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], select: appointmentNoteSelect },
       },
@@ -105,7 +119,8 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     // Audit only an actual disclosure (a 404 above discloses nothing). Id-only.
     await audit(request, { action: 'appointment.read', resource: 'appointment', resourceId: appointment.id });
     const patientName = appointment.patient ? `${appointment.patient.firstName} ${appointment.patient.lastName}`.trim() : null;
-    return { ...appointment, patientName, payment: summaries.get(appointment.id) ?? null };
+    const providerName = appointment.providerProfile?.user.displayName ?? null;
+    return { ...appointment, patientName, providerName, payment: summaries.get(appointment.id) ?? null };
   });
 
   // ----- Append a note (immutable history; never edits the scalar `notes`) ---

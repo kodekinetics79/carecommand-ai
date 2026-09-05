@@ -20,6 +20,7 @@
   "rewrites": [
     { "source": "/v1/:path*", "destination": "/api" },
     { "source": "/health/:path*", "destination": "/api" },
+    { "source": "/metrics", "destination": "/api" },
     { "source": "/(.*)", "destination": "/" }
   ]
 }

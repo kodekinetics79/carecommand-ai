@@ -226,9 +226,14 @@ describe('patient portal self-signup (mobile, Option A)', () => {
     const request = await db.portalAccessRequest.findFirstOrThrow({ where: { tenantId: c2.id, email: 'review-c2@nobody.test' } });
 
     const frontDesk = await db.user.create({ data: { tenantId: c1.id, role: 'FRONT_DESK', branchId: c1.branchId, active: true, email: `fd-${c1.id.slice(0, 8)}@test.example`, displayName: 'Front Desk' } });
-    const branchAdmin = await db.user.create({ data: { tenantId: c1.id, role: 'ADMIN', branchId: c1.branchId, active: true, email: `admin-${c1.id.slice(0, 8)}@test.example`, displayName: 'Branch Admin' } });
+    const legacyLinkedAdmin = await db.user.create({ data: { tenantId: c1.id, role: 'ADMIN', branchId: c1.branchId, active: true, email: `admin-${c1.id.slice(0, 8)}@test.example`, displayName: 'Tenant Admin' } });
     expect((await app.inject({ method: 'GET', url: '/v1/portal-admin/access-requests', headers: staff(c1.id, frontDesk.id, 'FRONT_DESK') })).statusCode).toBe(403);
-    expect((await app.inject({ method: 'GET', url: '/v1/portal-admin/access-requests', headers: staff(c1.id, branchAdmin.id, 'ADMIN') })).statusCode).toBe(403);
+    // OWNER/ADMIN identities are tenant-wide. A populated legacy primary
+    // branch must not silently downgrade an ADMIN, but tenant isolation still
+    // keeps the other tenant's request out of this response.
+    const adminQueue = await app.inject({ method: 'GET', url: '/v1/portal-admin/access-requests', headers: staff(c1.id, legacyLinkedAdmin.id, 'ADMIN') });
+    expect(adminQueue.statusCode).toBe(200);
+    expect((adminQueue.json() as Array<{ id: string }>).some(row => row.id === request.id)).toBe(false);
 
     const crossTenant = await app.inject({ method: 'POST', url: `/v1/portal-admin/access-requests/${request.id}/approve`, headers: staff(c1.id, c1.adminId), payload: { patientId: c1.patientId, authority: 'self', authorityConfirmed: true } });
     expect(crossTenant.statusCode).toBe(404);

@@ -79,7 +79,10 @@ async function loadContext(request: FastifyRequest, clinicId?: string, range?: A
       select: { id: true, branchId: true, firstName: true, lastName: true, lifecycleStage: true, churnRisk: true, lifetimeValue: true, outstandingBalance: true, lastVisitAt: true, nextVisitAt: true, tags: true },
     }),
     db.campaign.findMany({
-      where: { tenantId: request.auth.tenantId, ...(dateWhere ? { createdAt: dateWhere } : {}) },
+      // Campaign scope is part of dispatch authority. Advisory must read the
+      // same branch-bound portfolio or its recommendations and revenue figures
+      // disclose another clinic's activity to a restricted operator.
+      where: { tenantId: request.auth.tenantId, ...branchWhere, ...(dateWhere ? { createdAt: dateWhere } : {}) },
       orderBy: { updatedAt: 'desc' },
       take: 20,
       select: { id: true, name: true, status: true, audienceSize: true, sent: true, opened: true, booked: true, revenue: true, aiGenerated: true },

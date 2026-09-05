@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
-import { Star, CheckCircle2, Sparkles, ArrowRight, TrendingUp, MessageSquare, ShieldCheck, BellRing, Inbox } from 'lucide-react';
+import { Star, CheckCircle2, Sparkles, TrendingUp, MessageSquare, ShieldCheck, BellRing, Inbox } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -11,6 +11,8 @@ import { LOADING_STATE, receivedData, type ResourceState } from '../lib/resource
 import { fetchList, mapProviderProfile, mapReview, type ApiProviderProfile, type ApiReview, type ReviewRow } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 import { formatRatingThreshold, growthPolicyProvenance, loadGrowthPolicy, type GrowthPolicy } from '../lib/growthPolicy';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 
 interface ApiReputationCase {
   id: string;
@@ -133,6 +135,8 @@ function ratingBandClass(average: number, policy: GrowthPolicy): string {
 
 export default function Reviews() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const canRespond = hasPermission(user, 'crm:write');
   const reviews = useResource<ReviewRow[]>(loadReviews);
   const branches = useResource<BranchOption[]>(loadBranches);
   const providers = useResource<ReturnType<typeof mapProviderProfile>[]>(loadProviders);
@@ -142,6 +146,7 @@ export default function Reviews() {
   const policy = useResource<GrowthPolicy>(loadGrowthPolicy);
 
   const [respondingId, setRespondingId] = useState<string | null>(null);
+  const [selectedBranchId, setSelectedBranchId] = useState('all');
   const [editorId, setEditorId] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   // Page-level rather than per-row: recording a response reloads the feed, so a
@@ -183,8 +188,8 @@ export default function Reviews() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Reviews & Referrals"
-        subtitle="Read what patients said, record your reply, and set up review and referral campaigns."
+        title="Reviews"
+        subtitle="Read stored patient feedback, record a staff response, and prepare governed review-request campaigns."
         // "N need review" is a safety claim about open cases, so it waits for
         // the reputation response instead of counting an unanswered request.
         badge={
@@ -285,9 +290,13 @@ export default function Reviews() {
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         <div className="space-y-4">
           <BentoCard title="Review feed">
-            <p className="mb-3 text-[13px] leading-relaxed text-t2">
-              The {REVIEW_PAGE_SIZE} most recent reviews stored in this workspace. Every figure on this page is counted over this set.
-            </p>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-[13px] leading-relaxed text-t2">The {REVIEW_PAGE_SIZE} most recent reviews stored in this workspace. Page figures remain network-wide; the filter below narrows the feed.</p>
+              <select aria-label="Review clinic filter" value={selectedBranchId} onChange={event => setSelectedBranchId(event.target.value)} className="rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-xs font-semibold text-t1">
+                <option value="all">All clinics</option>
+                {(receivedData(branches.state) ?? []).map(branch => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
+              </select>
+            </div>
             <ResourceSection
               label="Review feed"
               state={reviews.state}
@@ -301,9 +310,17 @@ export default function Reviews() {
                 cta: { label: 'Review campaign setup', onClick: () => navigate('/campaigner') },
               }}
             >
-              {rows => (
+              {rows => {
+                const filteredRows = rows.filter(review => selectedBranchId === 'all' || review.branchId === selectedBranchId);
+                return (
                 <div className="space-y-3">
-                  {rows.map((r) => {
+                  {filteredRows.length === 0 && selectedBranchId !== 'all' && (
+                    <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-6 text-center">
+                      <p className="text-sm font-semibold text-t1">No reviews in the selected clinic</p>
+                      <p className="mt-1 text-xs text-t3">The network-wide feed loaded, but none of these {REVIEW_PAGE_SIZE} recent records belong to this clinic.</p>
+                    </div>
+                  )}
+                  {filteredRows.map((r) => {
                     const draft = drafts[r.id] ?? '';
                     const prefilled = !r.responded && !!r.storedResponse;
                     const rating = r.rating;
@@ -321,6 +338,7 @@ export default function Reviews() {
                                 row says so rather than showing a placeholder
                                 styled like a real name. */}
                             <p className="text-xs font-semibold text-t3">No reviewer name on this record</p>
+                            <p className="text-[10px] font-semibold text-t2">{(receivedData(branches.state) ?? []).find(branch => branch.id === r.branchId)?.name ?? 'Clinic not resolved'}</p>
                             <div className="flex items-center gap-1">
                               {rating == null
                                 ? <span className="text-[10px] font-semibold text-t3">Rating not recorded</span>
@@ -350,6 +368,8 @@ export default function Reviews() {
 
                       {r.responded ? (
                         <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-v"><CheckCircle2 className="w-3 h-3" /> Responded</span>
+                      ) : !canRespond ? (
+                        <span className="text-[10px] font-semibold text-t3">Read-only access · a CRM editor must record the response</span>
                       ) : editorId === r.id ? (
                         <div className="space-y-2">
                           <label htmlFor={`review-response-${r.id}`} className="block text-[10px] font-bold uppercase tracking-widest text-t3">
@@ -398,7 +418,8 @@ export default function Reviews() {
                     );
                   })}
                 </div>
-              )}
+                );
+              }}
             </ResourceSection>
           </BentoCard>
         </div>
@@ -626,12 +647,8 @@ export default function Reviews() {
           </BentoCard>
 
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Referral campaigns</p>
-            <p className="text-sm font-bold text-t1 mb-1">Set up a governed referral workflow</p>
-            <p className="text-xs leading-relaxed text-t2 mb-3">Open campaign setup to choose the audience and message, and to clear the consent and approval requirements. This page reports no referral results, and infers none.</p>
-            <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
-              <ArrowRight className="w-3.5 h-3.5" /> Review campaign setup
-            </button>
+            <p className="text-sm font-bold text-t1 mb-1">Referral workflow not available</p>
+            <p className="text-xs leading-relaxed text-t2">CareCommand does not currently create, route, or attribute patient referrals. Use the clinic’s approved referral process; this workspace will not imply that a campaign is a referral workflow.</p>
           </div>
         </div>
       </div>

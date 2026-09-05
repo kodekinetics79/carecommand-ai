@@ -73,7 +73,11 @@ async function seed(): Promise<Fixture> {
   const users = {} as Record<Role, string>;
   for (const role of ['OWNER', 'BILLING', 'ANALYST', 'AUDITOR', 'MANAGER'] as Role[]) {
     const user = await db.user.create({
-      data: { tenantId, role, active: true, email: `${role}-${tenantId.slice(0, 8)}@attr.test`, displayName: role },
+      data: {
+        tenantId, role, active: true,
+        branchId: role === 'BILLING' || role === 'MANAGER' ? branchA.id : undefined,
+        email: `${role}-${tenantId.slice(0, 8)}@attr.test`, displayName: role,
+      },
     });
     users[role] = user.id;
   }
@@ -92,8 +96,11 @@ async function seed(): Promise<Fixture> {
       select: { id: true },
     });
 
-  const marketing = await makeCampaign('Reactivation', 'inactive_patient_reactivation', 'inactive_patients', null);
-  const payment = await makeCampaign('Failed payment recovery', 'failed_payment_recovery', 'failed_payment_recovery', null);
+  // Keep the two campaign classes in Branch A so this suite isolates class
+  // authority. Tenant-wide NULL campaigns are intentionally invisible to the
+  // now clinic-scoped BILLING role and are covered by separate scope tests.
+  const marketing = await makeCampaign('Reactivation', 'inactive_patient_reactivation', 'inactive_patients', branchA.id);
+  const payment = await makeCampaign('Failed payment recovery', 'failed_payment_recovery', 'failed_payment_recovery', branchA.id);
   const branchScoped = await makeCampaign('Branch B only', 'inactive_patient_reactivation', 'inactive_patients', branchB.id);
 
   const patient = async (label: string, branchId: string) => db.patient.create({

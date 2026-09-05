@@ -84,7 +84,7 @@ async function appointment(tenantId: string, branchId: string, name: string, sta
 async function queue(headers: Record<string, string>, params = '') {
   const res = await app.inject({ method: 'GET', url: `/v1/revenue-protection/appointment-queue${params}`, headers });
   expect(res.statusCode).toBe(200);
-  return (res.json() as { appointments: Array<{ appointmentId?: string; id?: string }> }).appointments;
+  return (res.json() as { appointments: Array<{ appointmentId?: string; id?: string; clinicTimezone?: string }> }).appointments;
 }
 
 describe('insurance verification queue scope', () => {
@@ -130,5 +130,15 @@ describe('insurance verification queue scope', () => {
     // The caller owns the timezone; the route must respect the window it sends
     // rather than substituting a guess.
     expect(ids).toEqual([inDay.id]);
+  }, 90_000);
+
+  it('returns the clinic timezone with every appointment so the browser does not guess', async () => {
+    const { tenantId, branch, headers } = await clinic();
+    await db.branch.update({ where: { id: branch.id }, data: { timezone: 'America/Los_Angeles' } });
+    await appointment(tenantId, branch.id, 'Timezone', 'CONFIRMED', new Date(Date.now() + 3_600_000));
+
+    const rows = await queue(headers);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.clinicTimezone).toBe('America/Los_Angeles');
   }, 90_000);
 });

@@ -72,6 +72,8 @@ export interface Patient {
 
 export interface Appointment {
   id: string;
+  /** Exact stored instant. Clinic-local date/time must be derived from this. */
+  startsAt: string;
   patientId: string;
   patientName: string;
   doctorId: string;
@@ -329,6 +331,8 @@ export interface AdminRole {
   userCount: number;
   moduleAccess: string[];
   clinicScope: string;
+  assignable?: boolean;
+  source?: 'built-in' | 'tenant-defined';
 }
 
 export interface AdminAuditEvent {
@@ -380,6 +384,9 @@ export interface SecurityPosture {
   environmentMode?: string;
   riskLabel?: string;
   readinessScore?: number;
+  scoreLabel?: string;
+  scoreLimitations?: string;
+  providerModes?: { live: number; sandbox: number; mock: number };
   auditEventCount: number;
   loginEventCount: number;
   integrations: Array<{

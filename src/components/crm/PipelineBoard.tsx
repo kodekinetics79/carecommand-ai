@@ -37,7 +37,7 @@ export interface PipelineHandlers {
   onAction: (l: CrmLead, cta: CtaId) => void;
 }
 
-export function PipelineLeadCard({ lead, ...h }: { lead: CrmLead } & PipelineHandlers) {
+export function PipelineLeadCard({ lead, canAct = true, ...h }: { lead: CrmLead; canAct?: boolean } & PipelineHandlers) {
   const risk = riskBadge(lead);
   const action = lead.nextBestAction;
   const CtaIcon = action ? CTA_ICON[action.cta] : null;
@@ -68,7 +68,7 @@ export function PipelineLeadCard({ lead, ...h }: { lead: CrmLead } & PipelineHan
       </div>
 
       <div className="mt-2.5 flex items-center gap-1.5">
-        {action && CtaIcon ? (
+        {canAct && action && CtaIcon ? (
           <button type="button" onClick={() => h.onAction(lead, action.cta)}
             className="flex-1 inline-flex items-center justify-center gap-1 rounded-lg bg-[var(--indigo)] px-2 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 transition">
             <CtaIcon className="w-3 h-3" aria-hidden="true" /> {action.label.length > 22 ? action.label.slice(0, 20) + '…' : action.label}
@@ -78,7 +78,7 @@ export function PipelineLeadCard({ lead, ...h }: { lead: CrmLead } & PipelineHan
           // is not one the heuristic knows, so it has nothing to suggest.
           <span className="flex-1 rounded-lg border border-dashed border-[var(--b2)] px-2 py-1.5 text-center text-[11px] text-t3">No suggested action</span>
         )}
-        {lead.knownStage !== 'retained' && lead.knownStage !== 'lost' && (
+        {canAct && lead.knownStage !== 'retained' && lead.knownStage !== 'lost' && (
           <button type="button" onClick={() => h.onAction(lead, 'mark_lost')} title="Mark lost (reason required)" aria-label="Mark lost"
             className="inline-flex items-center justify-center rounded-lg border border-[var(--b1)] w-7 h-7 text-t3 hover:text-red-v hover:border-red-v/30 transition shrink-0">
             <Ban className="w-3.5 h-3.5" aria-hidden="true" />
@@ -92,6 +92,7 @@ export function PipelineLeadCard({ lead, ...h }: { lead: CrmLead } & PipelineHan
 function PipelineColumn({ stage, label, dot, leads, total, ...h }: {
   stage: string; label: string; dot: string; leads: CrmLead[];
   total: { count: number; value: number };
+  canAct?: boolean;
 } & PipelineHandlers) {
   // The header reports the tenant-wide count and value the server computed. It
   // used to sum whichever leads happened to be in memory, so a lane's headline
@@ -119,7 +120,7 @@ function PipelineColumn({ stage, label, dot, leads, total, ...h }: {
   );
 }
 
-export default function PipelineBoard({ pipeline, loading, ...h }: { pipeline: CrmPipeline | null; loading?: boolean } & PipelineHandlers) {
+export default function PipelineBoard({ pipeline, loading, canAct = true, ...h }: { pipeline: CrmPipeline | null; loading?: boolean; canAct?: boolean } & PipelineHandlers) {
   if (loading || !pipeline) {
     return (
       <div className="flex gap-3 overflow-x-auto pb-2">
@@ -144,12 +145,12 @@ export default function PipelineBoard({ pipeline, loading, ...h }: { pipeline: C
       <div className="flex gap-3 overflow-x-auto pb-2">
         {STAGES.map(s => (
           <PipelineColumn key={s} stage={s} label={STAGE_LABEL[s]} dot={STAGE_DOT[s]}
-            leads={pipeline.leads.filter(l => l.knownStage === s)} total={totalFor(s)} {...h} />
+            leads={pipeline.leads.filter(l => l.knownStage === s)} total={totalFor(s)} canAct={canAct} {...h} />
         ))}
         {unknownStages.map(t => (
           <PipelineColumn key={t.stage} stage={t.stage} label={t.stage} dot="bg-slate-400"
             leads={pipeline.leads.filter(l => l.knownStage === null && l.stage === t.stage)}
-            total={t} {...h} />
+            total={t} canAct={canAct} {...h} />
         ))}
       </div>
       {unknownStages.length > 0 && (

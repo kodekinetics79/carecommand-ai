@@ -4,7 +4,7 @@ import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Settings,
   Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, SlidersHorizontal,
-  ChevronsLeft, ChevronsRight, ChevronDown, Search, X, PhoneCall,
+  ChevronsLeft, ChevronsRight, ChevronDown, Search, X, PhoneCall, ArrowRight,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
 import { useEntitlements } from '../../hooks/useEntitlements';
@@ -54,10 +54,30 @@ interface NavSection {
   items: NavItem[];
 }
 
-// Domain-grouped IA. Badges are intentionally NOT pre-populated with "New"/fake
-// counts — the product's ethos is no fabricated data; real counts get wired per
-// item when the data exists.
+// The daily workspace is intentionally short and uses clinic language. Every
+// primary destination still goes through the same route/permission registry.
+// Specialist modules remain available below in "All capabilities"; simplifying
+// navigation must never make a real, authorized workflow disappear.
 const nav: NavSection[] = [
+  {
+    label: 'Daily workspace',
+    items: [
+      { label: 'Today', path: '/', icon: LayoutDashboard },
+      { label: 'Patients', path: '/patients', icon: UserCircle2 },
+      { label: 'Schedule', path: '/scheduling', icon: CalendarDays },
+      { label: 'Work Queue', path: '/front-desk', icon: ClipboardList },
+      { label: 'Communications', path: '/ai-receptionist', icon: PhoneCall },
+      { label: 'Revenue Operations', path: '/revenue-protection', icon: CreditCard },
+      { label: 'Connected Care', path: '/monitoring', icon: Activity },
+      { label: 'Insights', path: '/clinic-radar', icon: Radar },
+      { label: 'Administration', path: '/settings', icon: Settings },
+    ],
+  },
+];
+
+// Domain-grouped specialist IA. Badges are intentionally NOT pre-populated with
+// "New"/fake counts; a number appears only when a real source has loaded.
+const capabilityNav: NavSection[] = [
   {
     label: 'Command Center',
     items: [
@@ -88,7 +108,7 @@ const nav: NavSection[] = [
       { label: 'Campaigns', path: '/campaigns', icon: Megaphone },
       { label: 'Autopilot', path: '/autopilot', icon: Orbit },
       { label: 'Reviews', path: '/reviews', icon: Star },
-      { label: 'ClinicRadar', path: '/clinic-radar', icon: Radar },
+      { label: 'Insights', path: '/clinic-radar', icon: Radar },
     ],
   },
   {
@@ -131,6 +151,8 @@ const nav: NavSection[] = [
     ],
   },
 ];
+
+const PRIMARY_PATHS = new Set(nav.flatMap(section => section.items.map(item => item.path)));
 
 const badgeCls: Record<string, string> = {
   red: 'badge badge-red',
@@ -197,19 +219,27 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
         .map(item => item.path === '/front-desk' ? { ...item, ...frontDeskBadge } : item),
     }))
     .filter(section => section.items.length > 0);
+  const visibleCapabilityNav = loading ? [] : capabilityNav
+    .map(section => ({
+      ...section,
+      items: section.items
+        .filter(item => !PRIMARY_PATHS.has(item.path) && canOpenPath(user, item.path) && (!q || item.label.toLowerCase().includes(q)))
+        .map(item => item.path === '/front-desk' ? { ...item, ...frontDeskBadge } : item),
+    }))
+    .filter(section => section.items.length > 0);
 
   const roleLabel = user?.role ? user.role.toLowerCase().replace(/_/g, ' ') : '';
 
   return (
     <aside id="staff-navigation" className={`sidebar ${collapsed ? 'sidebar--collapsed' : ''} ${mobileOpen ? 'sidebar--mobile-open' : ''}`}>
       {/* Brand */}
-      <div className="px-4 pt-4 pb-3 border-b-b1">
+      <div className="px-3 pt-4 pb-3 border-b-b1">
         <div className="brand-row flex items-center justify-between gap-2">
           <div className="flex items-center gap-2.5 min-w-0">
             <Logo size={30} className="shrink-0" />
             <div className="collapse-hide min-w-0">
-              <p className="text-[13px] font-bold leading-none text-t1 tracking-tight truncate">CareCommand AI</p>
-              <p className="text-[10px] leading-none mt-1 text-t3 truncate">Clinic Operating System</p>
+              <p className="text-[18px] font-bold leading-none text-t1 tracking-tight whitespace-nowrap">CareCommand AI</p>
+              <p className="text-[9px] leading-none mt-1 text-t3 whitespace-nowrap">Clinic Operating System</p>
             </div>
           </div>
           <button type="button" onClick={() => setCollapsed(!collapsed)} aria-label="Collapse sidebar" title="Collapse"
@@ -244,7 +274,7 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
             {Array.from({ length: 8 }, (_, index) => <div key={index} className="skeleton h-7 rounded-lg" />)}
           </div>
         )}
-        {!loading && visibleNav.length === 0 && (
+        {!loading && visibleNav.length === 0 && visibleCapabilityNav.length === 0 && (
           <p className="px-2 py-6 text-center text-[12px] text-t3">
             {q ? <>No modules match “{filter}”.</> : 'No modules are available for your role yet. Ask an owner or administrator to update your access.'}
           </p>
@@ -293,7 +323,42 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
             </div>
           );
         })}
+        {!collapsed && visibleCapabilityNav.length > 0 && (
+          <details className="sidebar-capabilities collapse-hide" open={q ? true : undefined}>
+            <summary><SlidersHorizontal aria-hidden="true" />All capabilities<span>{visibleCapabilityNav.reduce((total, section) => total + section.items.length, 0)}</span></summary>
+            <div className="sidebar-capability-list">
+              {visibleCapabilityNav.map(section => (
+                <div key={section.label}>
+                  <p className="sidebar-section-label">{section.label}</p>
+                  {section.items.map(item => {
+                    const active = isPathActive(pathname, item.path);
+                    const Icon = item.icon;
+                    const feature = NAV_FEATURE[item.path];
+                    const locked = !!feature && entitlements !== null && !entitlements.has(feature);
+                    return locked ? (
+                      <Link key={item.path} to="/subscription" title={`${item.label} requires a plan upgrade or add-on`} className="nav-item opacity-60">
+                        <Icon className="w-[15px] h-[15px] shrink-0" /><span className="flex-1 truncate">{item.label}</span><Lock className="w-3 h-3 shrink-0" />
+                      </Link>
+                    ) : (
+                      <Link key={item.path} to={item.path} title={item.label} className={`nav-item ${active ? 'active' : ''}`}>
+                        <Icon className="w-[15px] h-[15px] shrink-0" /><span className="flex-1 truncate">{item.label}</span>
+                      </Link>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
       </nav>
+
+      {!collapsed && canOpenPath(user, '/compliance') && (
+        <button type="button" className="sidebar-proof-card collapse-hide" onClick={() => { onNavigate?.(); navigate('/compliance/proof'); }}>
+          <ShieldCheck aria-hidden="true" />
+          <span><strong>Open PHI-safe proof</strong><small>Readiness evidence</small></span>
+          <ArrowRight aria-hidden="true" />
+        </button>
+      )}
 
       {/* Collapse control */}
       <div className="px-3 py-2 border-t-b1">

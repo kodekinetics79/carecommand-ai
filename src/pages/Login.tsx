@@ -1,22 +1,21 @@
-import { useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { AlertCircle, ArrowLeft, Eye, EyeOff, Info, KeyRound, Lock, Mail, ShieldCheck, Smartphone, Users } from 'lucide-react';
 import { useSession } from '../hooks/useSession';
 import Logo from '../components/ui/Logo';
-import { mfaSetupWithToken, mfaVerifyWithToken, requestPasswordReset, confirmPasswordReset } from '../lib/session';
+import { clearSession, mfaSetupWithToken, mfaVerifyWithToken, requestPasswordReset, confirmPasswordReset } from '../lib/session';
 
-type Mode = 'login' | 'mfa' | 'mfaSetup' | 'reset' | 'resetConfirm' | 'expired';
+type Mode = 'login' | 'mfa' | 'mfaSetup' | 'reset' | 'resetSent' | 'resetConfirm' | 'resetSuccess' | 'expired';
 const REMEMBER_KEY = 'cc_remember_email';
 
 // The <Logo> geometry, reused as the panel's only ornament — drafted as an
 // outline at ~25x scale and cropped by the corner.
 const BRAND_PULSE = 'M7 18 H11.2 L13 13.5 L16 21 L18.2 16.5 H21 L24 12.5';
 
-// Production has no password-reset delivery adapter, so there is no link to
-// send and no message to wait for. Recovery is an administrator setting a new
-// password, and the screen says exactly that rather than advertising a
-// self-service flow that cannot complete.
-const ADMIN_RECOVERY_COPY = 'Ask a clinic administrator to set a new password for you from Control Plane → Users. Once you are signed in you can change it yourself in Settings → Security.';
+function resetTokenFromFragment(): string {
+  if (typeof window === 'undefined') return '';
+  return new URLSearchParams(window.location.hash.slice(1)).get('reset')?.trim() ?? '';
+}
 
 // Each mode announces where you are. Multi-step auth that silently swaps the
 // panel out from under the user is the main usability flaw of the old screen.
@@ -24,8 +23,10 @@ const COPY: Record<Mode, { eyebrow: string; title: string; sub: string; step?: 1
   login:        { eyebrow: 'Secure sign-in',   title: 'Sign in to your workspace',   sub: 'Use the modules and locations assigned to your account.' },
   mfa:          { eyebrow: 'Verification',     title: 'Confirm it’s you',            sub: 'Enter the 6-digit code from your authenticator app.', step: 2 },
   mfaSetup:     { eyebrow: 'Set up MFA',       title: 'Add an authenticator',        sub: 'Your organization requires multi-factor authentication to continue.', step: 2 },
-  reset:        { eyebrow: 'Account recovery', title: 'Reset your password',         sub: 'We’ll generate a local development reset token for this email.' },
-  resetConfirm: { eyebrow: 'Account recovery', title: 'Choose a new password',       sub: 'Enter your reset token, then set a password that meets your policy.' },
+  reset:        { eyebrow: 'Account recovery', title: 'Reset your password',         sub: 'We’ll email a secure, single-use link to the address on your account.' },
+  resetSent:    { eyebrow: 'Account recovery', title: 'Check your email',             sub: 'If an active account matches those details, a reset link is on its way.' },
+  resetConfirm: { eyebrow: 'Account recovery', title: 'Choose a new password',       sub: 'Set a new password for your CareCommand workspace.', step: 2 },
+  resetSuccess: { eyebrow: 'Account recovery', title: 'Password updated',            sub: 'Your prior sessions have been signed out. MFA settings are unchanged.' },
   expired:      { eyebrow: 'Account recovery', title: 'Your password has expired',   sub: 'It must be reset before you can sign in again.' },
 };
 
@@ -36,15 +37,17 @@ export default function Login() {
 
   // Email-only convenience; authentication tokens and session duration are unchanged.
   const rememberedEmail = typeof localStorage !== 'undefined' ? localStorage.getItem(REMEMBER_KEY) : null;
-  const [mode, setMode] = useState<Mode>('login');
+  const [initialResetToken] = useState(resetTokenFromFragment);
+  const [mode, setMode] = useState<Mode>(initialResetToken ? 'resetConfirm' : 'login');
   const [email, setEmail] = useState(rememberedEmail ?? '');
   const [password, setPassword] = useState('');
   const [tenantSlug, setTenantSlug] = useState('');
   const [tenantRequired, setTenantRequired] = useState(false);
   const [rememberMe, setRememberMe] = useState(rememberedEmail !== null);
   const [code, setCode] = useState('');
-  const [resetToken, setResetToken] = useState('');
+  const [resetToken, setResetToken] = useState(initialResetToken);
   const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [mfaToken, setMfaToken] = useState('');
   const [mfaSetupData, setMfaSetupData] = useState<{ secret: string; otpauthUri: string } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -52,7 +55,16 @@ export default function Login() {
   const [info, setInfo] = useState<string | null>(null);
   const [showPw, setShowPw] = useState(false);
   const [showNewPw, setShowNewPw] = useState(false);
-  const resetUiAvailable = !import.meta.env.PROD;
+  const headingRef = useRef<HTMLHeadingElement>(null);
+
+  useLayoutEffect(() => {
+    if (!initialResetToken || typeof window === 'undefined') return;
+    window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}`);
+  }, [initialResetToken]);
+
+  useEffect(() => {
+    if (mode !== 'login') headingRef.current?.focus();
+  }, [mode]);
 
   function goHome() {
     const destination = (location.state as { from?: string } | null)?.from ?? '/';
@@ -60,7 +72,7 @@ export default function Login() {
   }
 
   function backToLogin() {
-    setError(null); setInfo(null); setCode(''); setMode('login');
+    setError(null); setInfo(null); setCode(''); setResetToken(''); setNewPassword(''); setConfirmPassword(''); setMode('login');
   }
 
   async function run(fn: () => Promise<void>) {
@@ -96,21 +108,22 @@ export default function Login() {
   }); };
 
   const onResetRequest = (e: FormEvent) => { e.preventDefault(); void run(async () => {
-    const res = await requestPasswordReset(email.trim().toLowerCase());
-    if (res.resetAvailable === false) {
-      setInfo(`Self-service password reset is not configured. ${ADMIN_RECOVERY_COPY}`);
-      setMode('login');
+    const res = await requestPasswordReset(email.trim().toLowerCase(), tenantSlug.trim().toLowerCase() || undefined);
+    if (res.devToken) {
+      setResetToken(res.devToken); // explicit test/E2E mode only; absent from production
+      setInfo(res.message);
+      setMode('resetConfirm');
       return;
     }
-    setInfo(res.message);
-    if (res.devToken) setResetToken(res.devToken); // dev-only convenience; absent in production
-    setMode('resetConfirm');
+    setInfo(null);
+    setMode('resetSent');
   }); };
 
   const onResetConfirm = (e: FormEvent) => { e.preventDefault(); void run(async () => {
+    if (newPassword !== confirmPassword) throw new Error('The passwords do not match.');
     await confirmPasswordReset(resetToken.trim(), newPassword);
-    setInfo('Password reset. Please sign in with your new password.');
-    setNewPassword(''); setPassword(''); setMode('login');
+    clearSession();
+    setInfo(null); setNewPassword(''); setConfirmPassword(''); setPassword(''); setResetToken(''); setMode('resetSuccess');
   }); };
 
   const copy = COPY[mode];
@@ -189,7 +202,7 @@ export default function Login() {
                   </div>
                 )}
               </div>
-              <h2 className="mt-3 text-[1.5rem] font-bold leading-tight tracking-[-0.02em] text-t1">{copy.title}</h2>
+              <h2 ref={headingRef} tabIndex={-1} className="mt-3 text-[1.5rem] font-bold leading-tight tracking-[-0.02em] text-t1 outline-none">{copy.title}</h2>
               <p className="mt-2 text-[13px] leading-relaxed text-t2">{copy.sub}</p>
             </header>
 
@@ -218,15 +231,8 @@ export default function Login() {
                     {/* Say exactly what is stored: the email only, never a session. */}
                     <span className="text-[13px] text-t2">Remember email on this device</span>
                   </label>
-                  {resetUiAvailable && (
-                    <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="rounded text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
-                  )}
+                  <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="min-h-11 rounded px-1 text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
                 </div>
-                {!resetUiAvailable && (
-                  <p className="text-[11.5px] leading-relaxed text-t3">
-                    <span className="font-semibold text-t2">Forgot your password?</span> {ADMIN_RECOVERY_COPY}
-                  </p>
-                )}
 
                 <Submit loading={loading} label="Sign in" busyLabel="Signing in…" />
               </form>
@@ -254,30 +260,48 @@ export default function Login() {
                 <Field label="Email" icon={<Mail className="h-4 w-4 shrink-0 text-t3" />}>
                   <input type="email" value={email} onChange={e => setEmail(e.target.value)} className="auth-input" placeholder="you@clinic.com" autoComplete="email" required autoFocus />
                 </Field>
-                <Submit loading={loading} label="Generate local reset token" busyLabel="Generating…" />
+                <Field label="Clinic workspace (optional)" icon={<Users className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input value={tenantSlug} onChange={e => setTenantSlug(e.target.value)} className="auth-input" placeholder="bright-health" autoComplete="organization" aria-describedby="workspace-reset-help" />
+                </Field>
+                <p id="workspace-reset-help" className="-mt-2 text-[11.5px] leading-relaxed text-t3">Add this if you use the same email in more than one CareCommand workspace.</p>
+                <Submit loading={loading} label="Email me a reset link" busyLabel="Sending…" />
                 <BackLink onClick={backToLogin} />
               </form>
+            )}
+
+            {mode === 'resetSent' && (
+              <div className="space-y-4">
+                <Banner tone="info">If an active account matches, you’ll receive a single-use link that expires shortly. Check spam or try again after a few minutes.</Banner>
+                <button type="button" onClick={() => setMode('reset')} className="auth-submit">Try another email</button>
+                <BackLink onClick={backToLogin} />
+              </div>
             )}
 
             {mode === 'resetConfirm' && (
               <form onSubmit={onResetConfirm} className="space-y-4">
-                <Field label="Reset token" icon={<KeyRound className="h-4 w-4 shrink-0 text-t3" />}>
-                  <input value={resetToken} onChange={e => setResetToken(e.target.value)} className="auth-input" placeholder="Paste the reset token" autoComplete="off" required autoFocus />
-                </Field>
                 <Field label="New password" icon={<Lock className="h-4 w-4 shrink-0 text-t3" />}>
-                  <input type={showNewPw ? 'text' : 'password'} value={newPassword} onChange={e => setNewPassword(e.target.value)} className="auth-input" placeholder="Follow your organization’s password policy" autoComplete="new-password" required />
+                  <input type={showNewPw ? 'text' : 'password'} value={newPassword} onChange={e => setNewPassword(e.target.value)} className="auth-input" placeholder="Use a strong, unique password" autoComplete="new-password" required autoFocus aria-describedby="password-reset-help" />
                   <PwReveal shown={showNewPw} onToggle={() => setShowNewPw(v => !v)} />
                 </Field>
+                <Field label="Confirm new password" icon={<KeyRound className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input type={showNewPw ? 'text' : 'password'} value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} className="auth-input" placeholder="Re-enter your new password" autoComplete="new-password" required />
+                </Field>
+                <p id="password-reset-help" className="-mt-2 text-[11.5px] leading-relaxed text-t3">Use the minimum length required by your organization. A password manager can create and save a unique password.</p>
                 <Submit loading={loading} label="Reset password" busyLabel="Updating…" />
-                <BackLink onClick={backToLogin} />
+                <button type="button" onClick={() => { setError(null); setMode('reset'); }} className="inline-flex min-h-11 w-full items-center justify-center rounded py-1 text-[13px] font-semibold text-t3 transition hover:text-t1">Request a new link</button>
               </form>
+            )}
+
+            {mode === 'resetSuccess' && (
+              <div className="space-y-4">
+                <Banner tone="info">All existing sessions were signed out. Sign in with your new password; your MFA settings have not changed.</Banner>
+                <button type="button" onClick={backToLogin} className="auth-submit">Sign in</button>
+              </div>
             )}
 
             {mode === 'expired' && (
               <div className="space-y-4">
-                {resetUiAvailable
-                  ? <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="auth-submit">Reset password</button>
-                  : <p role="alert" className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] px-4 py-3 text-[13px] leading-relaxed text-amber-v">Self-service password reset is not configured. {ADMIN_RECOVERY_COPY}</p>}
+                <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="auth-submit">Reset password</button>
                 <BackLink onClick={backToLogin} />
               </div>
             )}

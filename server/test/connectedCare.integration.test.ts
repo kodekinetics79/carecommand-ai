@@ -88,6 +88,7 @@ function inTenant<T>(t: TenantFixture, work: () => Promise<T>): Promise<T> {
 
 async function prepareRpmBaseEvidence(t: TenantFixture, deviceId?: string, latestReadingAt?: Date) {
   const admin = auth(tok(t.id, t.adminUserId));
+  await configureDeviceProviderSecret(t.id, 'withings', `whsec-${randomUUID()}`);
   const linkedDeviceId = deviceId ?? (await db.device.create({
     data: { tenantId: t.id, branchId: t.branchId, name: 'RPM fixture device', deviceType: 'scale', active: true, status: 'online' },
     select: { id: true },
@@ -382,6 +383,54 @@ describe('insurance provider registry + eligibility (integration)', () => {
 });
 
 describe('connected care — enrollment, webhook ingest, RPM readiness (integration)', () => {
+  it('activates a signed sandbox provider through the management API before allowing enrollment', async () => {
+    const t = await makeTenant('enterprise');
+    const admin = tok(t.id, t.adminUserId);
+    const webhookSecret = `whsec-${randomUUID()}`;
+
+    const incomplete = await app.inject({
+      method: 'POST', url: '/v1/devices/providers/withings/configure', headers: auth(admin),
+      payload: { mode: 'sandbox', config: { clientId: 'synthetic-client', clientSecret: 'synthetic-secret' } },
+    });
+    expect(incomplete.statusCode).toBe(400);
+    expect(await db.deviceProvider.count({ where: { tenantId: t.id, providerKey: 'withings' } })).toBe(0);
+
+    const configured = await app.inject({
+      method: 'POST', url: '/v1/devices/providers/withings/configure', headers: auth(admin),
+      payload: { mode: 'sandbox', config: { clientId: 'synthetic-client', clientSecret: 'synthetic-secret', webhookSecret } },
+    });
+    expect(configured.statusCode).toBe(200);
+    expect(configured.json()).toMatchObject({ providerKey: 'withings', status: 'SANDBOX', mode: 'sandbox', webhookConfigured: true });
+
+    const providers = (await app.inject({ method: 'GET', url: '/v1/devices/providers', headers: auth(admin) })).json() as Array<Record<string, unknown>>;
+    expect(providers.find(provider => provider.key === 'withings')).toMatchObject({ configured: true, webhookConfigured: true, status: 'SANDBOX' });
+    expect(JSON.stringify(providers)).not.toContain(webhookSecret);
+
+    const device = await app.inject({
+      method: 'POST', url: '/v1/devices', headers: auth(admin),
+      payload: {
+        name: 'Synthetic Withings BP monitor', deviceType: 'vitals_monitor', connectionType: 'cloud_api',
+        vendor: 'Withings', model: 'BPM Connect Sandbox', serialNumber: `SYN-${randomUUID()}`, branchId: t.branchId,
+      },
+    });
+    expect(device.statusCode).toBe(201);
+
+    const enrolled = await app.inject({
+      method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin),
+      payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'SYNTHETIC-PATIENT-1', deviceId: device.json().id },
+    });
+    expect(enrolled.statusCode).toBe(201);
+    expect(enrolled.json()).toMatchObject({ status: 'active' });
+    expect(await db.patientDeviceEnrollment.findUnique({ where: { id: enrolled.json().id } })).toMatchObject({
+      patientId: t.patientId, providerKey: 'withings', deviceId: device.json().id, status: 'active',
+    });
+
+    const stored = await db.deviceProvider.findUniqueOrThrow({ where: { tenantId_providerKey: { tenantId: t.id, providerKey: 'withings' } } });
+    expect(stored.webhookConfigured).toBe(true);
+    expect(stored.encryptedConfig).not.toContain(webhookSecret);
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'device.provider.configured', resourceId: stored.id } })).toBe(1);
+  });
+
   it('enrolls a patient, ingests a correctly-signed webhook reading, and creates a backend-decided alert', async () => {
     const t = await makeTenant('enterprise');
     const admin = tok(t.id, t.adminUserId);
@@ -471,8 +520,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
 
   it('FAILS CLOSED: rejects an unsigned / unverifiable webhook (P0) and writes no readings; a correctly-signed one still ingests', async () => {
     const t = await makeTenant('enterprise');
-    const admin = tok(t.id, t.adminUserId);
-    await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-CLOSED-1' } });
+    await db.patientDeviceEnrollment.create({ data: { tenantId: t.id, branchId: t.branchId, patientId: t.patientId, providerKey: 'withings', programType: 'general', externalRef: 'EXT-CLOSED-1', status: 'active' } });
 
     const attackPayload = { readings: [{ patientExternalRef: 'EXT-CLOSED-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] };
 
@@ -511,7 +559,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const admin = tok(t.id, t.adminUserId);
     const SECRET = `whsec-${randomUUID()}`;
     await configureDeviceProviderSecret(t.id, 'withings', SECRET);
-    await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-DEDUP-1' } });
+    await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', programType: 'general', externalRef: 'EXT-DEDUP-1' } });
 
     // Same measurement (same captured timestamp/value) delivered twice.
     const payload = { readings: [{ patientExternalRef: 'EXT-DEDUP-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL', capturedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString() }] };
@@ -787,17 +835,39 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect(JSON.parse(readiness.body)).toMatchObject({ items: [], total: 0 });
   });
 
+  it('refuses active provider enrollments that cannot ingest or bind RPM evidence', async () => {
+    const t = await makeTenant('enterprise');
+    const admin = auth(tok(t.id, t.adminUserId));
+
+    const unconfigured = await app.inject({
+      method: 'POST', url: '/v1/connected-care/enrollments', headers: admin,
+      payload: { patientId: t.patientId, providerKey: 'withings', programType: 'general' },
+    });
+    expect(unconfigured.statusCode).toBe(409);
+    expect(unconfigured.json().message).toContain('Configure and verify');
+
+    await configureDeviceProviderSecret(t.id, 'withings', `whsec-${randomUUID()}`);
+    const noDevice = await app.inject({
+      method: 'POST', url: '/v1/connected-care/enrollments', headers: admin,
+      payload: { patientId: t.patientId, providerKey: 'withings', programType: 'rpm' },
+    });
+    expect(noDevice.statusCode).toBe(400);
+    expect(noDevice.json().message).toContain('specific device');
+    expect(await db.patientDeviceEnrollment.count({ where: { tenantId: t.id } })).toBe(0);
+  });
+
   it('validates enrolled devices and prevents ambiguous provider patient references', async () => {
     const t = await makeTenant('enterprise');
     const admin = auth(tok(t.id, t.adminUserId));
     const otherPatient = await db.patient.create({ data: { tenantId: t.id, branchId: t.branchId, firstName: 'Other', lastName: 'Patient', lifecycleStage: 'NEW' } });
     const foreign = await makeTenant('enterprise');
+    await configureDeviceProviderSecret(t.id, 'withings', `whsec-${randomUUID()}`);
     const foreignDevice = await db.device.create({ data: { tenantId: foreign.id, branchId: foreign.branchId, name: 'foreign', deviceType: 'wearable_gateway', active: true } });
     const badDevice = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: t.patientId, providerKey: 'withings', deviceId: foreignDevice.id } });
     expect(badDevice.statusCode).toBe(400);
-    const first = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'provider-patient-1' } });
+    const first = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: t.patientId, providerKey: 'withings', programType: 'general', externalRef: 'provider-patient-1' } });
     expect(first.statusCode).toBe(201);
-    const collision = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: otherPatient.id, providerKey: 'withings', externalRef: 'provider-patient-1' } });
+    const collision = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: otherPatient.id, providerKey: 'withings', programType: 'general', externalRef: 'provider-patient-1' } });
     expect(collision.statusCode).toBe(409);
   });
 
@@ -880,7 +950,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const foreign = await makeTenant('enterprise');
     const secret = `whsec-${randomUUID()}`;
     await configureDeviceProviderSecret(t.id, 'withings', secret);
-    await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(tok(t.id, t.adminUserId)), payload: { patientId: t.patientId, providerKey: 'withings' } });
+    await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(tok(t.id, t.adminUserId)), payload: { patientId: t.patientId, providerKey: 'withings', programType: 'general' } });
     const payload = { readings: [
       { patientId: t.patientId, readingType: 'glucose', value: '5000', numericValue: 5000, unit: 'mg/dL' },
       { patientId: foreign.patientId, readingType: 'glucose', value: '120', numericValue: 120, unit: 'mg/dL' },

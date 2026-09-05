@@ -13,7 +13,7 @@ const sessionMock = vi.hoisted(() => vi.fn());
 vi.mock('../hooks/useSession', () => ({ useSession: sessionMock }));
 
 import { ApiError } from '../lib/api';
-import { resetFrontDeskPollForTests } from '../hooks/useFrontDeskPoll';
+import { notifyFrontDeskMutated, resetFrontDeskPollForTests } from '../hooks/useFrontDeskPoll';
 import FrontDesk from './FrontDesk';
 
 /**
@@ -222,6 +222,33 @@ describe('FrontDesk lanes', () => {
   });
 });
 
+describe('FrontDesk scope and navigation', () => {
+  it('separates the network queue from clinic-scoped call operations', async () => {
+    happyPath();
+    route('GET', /^\/v1\/receptionist\/clinics$/, () => [
+      CLINIC,
+      { id: 'clinic-2', name: 'Brightsmile North', timezone: 'America/New_York' },
+    ]);
+    renderPage();
+
+    const scope = await screen.findByRole('region', { name: 'Front desk data scope' });
+    expect(within(scope).getByText('Network queue · task lanes and header count')).toBeInTheDocument();
+    expect(within(scope).getByText('Clinic operations · calls, booking requests and call KPIs')).toBeInTheDocument();
+    expect(within(scope).getByRole('combobox', { name: 'Clinic operations scope' })).toHaveValue(CLINIC.id);
+  });
+
+  it('provides keyboard-reachable links to every primary action lane', async () => {
+    happyPath();
+    renderPage();
+
+    const navigation = await screen.findByRole('navigation', { name: 'Jump to queue lane' });
+    expect(await within(navigation).findByRole('link', { name: 'Emergencies, 1' })).toHaveAttribute('href', '#queue-emergencies');
+    expect(within(navigation).getByRole('link', { name: 'Callbacks, 1' })).toHaveAttribute('href', '#queue-callbacks');
+    expect(await within(navigation).findByRole('link', { name: 'Bookings, 1' })).toHaveAttribute('href', '#queue-bookings');
+    expect(within(navigation).getByRole('link', { name: 'Unreviewed calls, 1' })).toHaveAttribute('href', '#queue-unreviewed');
+  });
+});
+
 /** E13 — one number per fact, and a truncated lane that admits it. */
 describe('FrontDesk counts', () => {
   it('counts the same inbound population that the unreviewed lane loads', async () => {
@@ -402,6 +429,9 @@ describe('FrontDesk shift report', () => {
     expect(within(report).getByText('33%')).toBeInTheDocument();
     expect(within(report).getByText('1m 14s')).toBeInTheDocument();
     expect(within(report).getByText(/Inbound BOOKED \/ answered inbound/)).toBeInTheDocument();
+    expect(within(report).getByText(`Call KPIs: ${CLINIC.name} · Open task signals: network-wide`)).toBeInTheDocument();
+    expect(within(report).getByText('Network callers waiting on a person')).toBeInTheDocument();
+    expect(within(report).getByText('Network emergencies open')).toBeInTheDocument();
   });
 
   it('shows UNAVAILABLE, never 0%, for a rate with no denominator', async () => {
@@ -429,6 +459,34 @@ describe('FrontDesk shift report', () => {
     const report = await screen.findByRole('region', { name: 'Shift report' });
     expect(await within(report).findByText('The shift report could not be loaded.')).toBeInTheDocument();
     expect(within(report).getByText(/No figure is shown, because none was read/)).toBeInTheDocument();
+  });
+
+  it('marks preserved call counts and KPI values stale when a background refresh fails', async () => {
+    happyPath();
+    let summaryReads = 0;
+    let callSummaryReads = 0;
+    let kpiReads = 0;
+    route('GET', /^\/v1\/tasks\/summary$/, () => ({
+      ...SUMMARY,
+      generatedAt: summaryReads++ === 0 ? '2026-08-29T17:35:00.000Z' : '2026-08-29T17:36:00.000Z',
+    }));
+    route('GET', /^\/v1\/receptionist\/call-logs\/summary/, () => {
+      if (callSummaryReads++ > 0) throw new ApiError(503, 'Call metrics are temporarily unavailable.', 'UNAVAILABLE');
+      return CALL_SUMMARY;
+    });
+    route('GET', /^\/v1\/receptionist\/overview/, () => {
+      if (kpiReads++ > 0) throw new ApiError(503, 'KPI refresh is temporarily unavailable.', 'UNAVAILABLE');
+      return KPIS;
+    });
+    renderPage();
+
+    const report = await screen.findByRole('region', { name: 'Shift report' });
+    expect(await within(report).findByText('Answered inbound')).toBeInTheDocument();
+    notifyFrontDeskMutated();
+
+    expect(await screen.findByText(/latest clinic call-summary refresh failed/i)).toBeInTheDocument();
+    expect(await within(report).findByText(/latest call-KPI refresh failed/i)).toBeInTheDocument();
+    expect(within(report).getByText('3')).toBeInTheDocument();
   });
 });
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import {
   CalendarDays, ClipboardList, FileText, ShieldCheck, CreditCard, User, Bell, Loader2,
   ChevronRight, Plus, ExternalLink, X, CheckCircle2,
@@ -13,6 +13,7 @@ import {
   type PortalInsurance, type PortalPayment, type PortalEstimate, type PortalPreferences,
   type PortalBookingProvider, type PortalBookingSlot,
 } from '../../lib/portalClient';
+import { clinicDateOffset, clinicLocalDateTimeToIso, formatClinicDateTime, formatClinicTime } from '../../lib/portalTime';
 
 function Skel({ n = 3 }: { n?: number }) { return <div className="space-y-2">{Array.from({ length: n }).map((_, i) => <div key={i} className="skeleton-line h-16 rounded-xl" />)}</div>; }
 function H({ icon: Icon, title, sub }: { icon: React.ElementType; title: string; sub?: string }) {
@@ -118,7 +119,7 @@ export function ClientDashboard() {
               <div className="min-w-0">
                 <p className="text-[13px] font-bold text-t1">{c.label}</p>
                 <p className="text-[12px] text-t3 mt-0.5">
-                  {c.key === 'nextAppointment' && card.service ? `${card.service} · ${card.startsAt ? new Date(card.startsAt).toLocaleDateString() : ''}` :
+                  {c.key === 'nextAppointment' && card.service ? `${card.service} · ${card.startsAt ? formatClinicDateTime(card.startsAt, d.clinicTimezone) : ''}` :
                    c.key === 'payment' && card.amount ? `${formatCurrency(card.amount)} due` :
                    c.key === 'appointmentRequests' && card.count ? `${card.count} awaiting review` : ' '}
                 </p>
@@ -134,22 +135,19 @@ export function ClientDashboard() {
 }
 
 /* -------------------------------------------------------------- Appointments */
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 // A single upcoming appointment card with self-service cancel + reschedule.
-// The provider slot picker is reused when the appointment carries a real
-// provider id; otherwise the patient enters a preferred date/time directly.
+// The provider slot picker is used only with the canonical provider id. Older
+// appointments without that relationship go through a staff-reviewed request.
 function UpcomingApptRow({ appt, onChanged }: { appt: PortalAppt; onChanged: () => Promise<void> | void }) {
   const [mode, setMode] = useState<'idle' | 'cancel' | 'reschedule'>('idle');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const providerId = appt.provider && UUID_RE.test(appt.provider) ? appt.provider : null;
+  const providerId = appt.providerProfileId;
   const durationMin = Math.max(5, Math.round((new Date(appt.endsAt).getTime() - new Date(appt.startsAt).getTime()) / 60000));
-  const [date, setDate] = useState(() => new Date(appt.startsAt).toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => clinicDateOffset(0, appt.clinicTimezone, new Date(appt.startsAt)));
   const [slots, setSlots] = useState<PortalBookingSlot[]>([]);
   const [selectedSlot, setSelectedSlot] = useState('');
-  const [dt, setDt] = useState(''); // free datetime-local fallback
 
   useEffect(() => {
     if (mode !== 'reschedule' || !providerId) return;
@@ -169,7 +167,7 @@ function UpcomingApptRow({ appt, onChanged }: { appt: PortalAppt; onChanged: () 
     catch (e) { setErr(e instanceof Error ? e.message : 'Could not cancel'); setBusy(false); }
   }
   async function doReschedule() {
-    const startsAt = providerId ? selectedSlot : (dt ? new Date(dt).toISOString() : '');
+    const startsAt = providerId ? selectedSlot : '';
     if (!startsAt) { setErr('Please choose a new time.'); return; }
     setBusy(true); setErr(null); setMsg(null);
     try { await portalClient.rescheduleAppointment(appt.id, { startsAt, durationMin }); setMsg('Appointment updated.'); await onChanged(); }
@@ -180,12 +178,16 @@ function UpcomingApptRow({ appt, onChanged }: { appt: PortalAppt; onChanged: () 
   return (
     <div className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5">
       <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0"><p className="text-[13px] font-bold text-t1">{appt.service}</p><p className="text-[12px] text-t3">{new Date(appt.startsAt).toLocaleString()}{appt.provider && !UUID_RE.test(appt.provider) ? ` · ${appt.provider}` : ''}</p></div>
+        <div className="min-w-0"><p className="text-[13px] font-bold text-t1">{appt.service}</p><p className="text-[12px] text-t3">{formatClinicDateTime(appt.startsAt, appt.clinicTimezone)}{appt.providerName ? ` · ${appt.providerName}` : ''}</p></div>
         <span className="badge badge-blue capitalize shrink-0">{appt.status.toLowerCase().replace('_', ' ')}</span>
       </div>
       {mode === 'idle' && (
         <div className="mt-2.5 flex flex-wrap gap-2">
-          <button type="button" onClick={() => { setMode('reschedule'); setErr(null); setMsg(null); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-t2 hover:bg-[var(--s2)]"><CalendarDays className="w-3.5 h-3.5" /> Reschedule</button>
+          {providerId ? (
+            <button type="button" onClick={() => { setMode('reschedule'); setErr(null); setMsg(null); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-t2 hover:bg-[var(--s2)]"><CalendarDays className="w-3.5 h-3.5" /> Reschedule</button>
+          ) : (
+            <Link to="/client/requests" className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-t2 hover:bg-[var(--s2)]"><CalendarDays className="w-3.5 h-3.5" /> Ask clinic to reschedule</Link>
+          )}
           <button type="button" onClick={() => { setMode('cancel'); setErr(null); setMsg(null); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-red-v hover:bg-red-soft"><X className="w-3.5 h-3.5" /> Cancel</button>
         </div>
       )}
@@ -205,15 +207,14 @@ function UpcomingApptRow({ appt, onChanged }: { appt: PortalAppt; onChanged: () 
               <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">New date</span><input className={inp} type="date" value={date} onChange={e => { setSlots([]); setSelectedSlot(''); setDate(e.target.value); }} /></label>
               <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Open slots</span>
                 <select className={inp} value={selectedSlot} onChange={e => setSelectedSlot(e.target.value)} aria-label="Open slots">
-                  {slots.length === 0 ? <option value="">No open slots on this date</option> : slots.map(s => <option key={s.startsAt} value={s.startsAt}>{new Date(s.startsAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</option>)}
+                  {slots.length === 0 ? <option value="">No open slots on this date</option> : slots.map(s => <option key={s.startsAt} value={s.startsAt}>{formatClinicTime(s.startsAt, appt.clinicTimezone)}</option>)}
                 </select>
               </label>
+              <p className="text-[11px] text-t3">Times shown in {appt.clinicTimezone} for {appt.branchName}.</p>
             </>
-          ) : (
-            <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">New date & time</span><input className={inp} type="datetime-local" value={dt} onChange={e => setDt(e.target.value)} aria-label="New date and time" /></label>
-          )}
+          ) : <p className="text-[12px] text-t2">This appointment needs clinic review before it can be moved. Submit a request and the front desk will confirm an available time.</p>}
           <div className="flex gap-2">
-            <button type="button" disabled={busy || (providerId ? !selectedSlot : !dt)} onClick={doReschedule} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Confirm new time'}</button>
+            <button type="button" disabled={busy || !providerId || !selectedSlot} onClick={doReschedule} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Confirm new time'}</button>
             <button type="button" disabled={busy} onClick={() => setMode('idle')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-t2">Back</button>
           </div>
         </div>
@@ -225,6 +226,7 @@ function UpcomingApptRow({ appt, onChanged }: { appt: PortalAppt; onChanged: () 
 }
 
 export function ClientAppointments() {
+  const navigate = useNavigate();
   const [data, setData] = useState<{ upcoming: PortalAppt[]; past: PortalAppt[] } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   async function load() { setData(await portalClient.appointments()); }
@@ -245,7 +247,7 @@ export function ClientAppointments() {
   if (!data) return <Skel />;
   const PastRow = (a: PortalAppt) => (
     <div key={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
-      <div><p className="text-[13px] font-bold text-t1">{a.service}</p><p className="text-[12px] text-t3">{new Date(a.startsAt).toLocaleString()}{a.provider && !UUID_RE.test(a.provider) ? ` · ${a.provider}` : ''}</p></div>
+      <div><p className="text-[13px] font-bold text-t1">{a.service}</p><p className="text-[12px] text-t3">{formatClinicDateTime(a.startsAt, a.clinicTimezone)}{a.providerName ? ` · ${a.providerName}` : ''}</p></div>
       <span className="badge badge-blue capitalize">{a.status.toLowerCase().replace('_', ' ')}</span>
     </div>
   );
@@ -253,7 +255,7 @@ export function ClientAppointments() {
     <div>
       <H icon={CalendarDays} title="Appointments" sub="Your upcoming and past visits" />
       <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Upcoming</p>
-      {data.upcoming.length ? <div className="space-y-2">{data.upcoming.map(a => <UpcomingApptRow key={a.id} appt={a} onChanged={load} />)}</div> : <EmptyStatePremium icon={<CalendarDays className="w-5 h-5" />} title="No upcoming appointments" description="Request one and the clinic will confirm a time." cta={{ label: 'Request appointment', onClick: () => { window.location.assign('/client/requests'); } }} />}
+      {data.upcoming.length ? <div className="space-y-2">{data.upcoming.map(a => <UpcomingApptRow key={a.id} appt={a} onChanged={load} />)}</div> : <EmptyStatePremium icon={<CalendarDays className="w-5 h-5" />} title="No upcoming appointments" description="Request one and the clinic will confirm a time." cta={{ label: 'Request appointment', onClick: () => navigate('/client/requests') }} />}
       {data.past.length > 0 && <><p className="text-[11px] font-bold uppercase tracking-wide text-t3 mt-5 mb-2">Past</p><div className="space-y-2">{data.past.map(PastRow)}</div></>}
     </div>
   );
@@ -265,11 +267,10 @@ export function ClientRequests() {
   const [providers, setProviders] = useState<PortalBookingProvider[] | null>(null);
   const [slots, setSlots] = useState<PortalBookingSlot[]>([]);
   const [providerId, setProviderId] = useState('');
-  const [bookingDate, setBookingDate] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 7);
-    return d.toISOString().slice(0, 10);
-  });
+  const [bookingDate, setBookingDate] = useState('');
+  const [clinicContext, setClinicContext] = useState<{ name: string; timezone: string } | null>(null);
+  const selectedProvider = providers?.find(provider => provider.id === providerId) ?? providers?.[0];
+  const clinicTimezone = selectedProvider?.clinicTimezone ?? clinicContext?.timezone;
   const [selectedSlot, setSelectedSlot] = useState('');
   const [bookingReason, setBookingReason] = useState('');
   const [service, setService] = useState(''); const [when, setWhen] = useState(''); const [notes, setNotes] = useState('');
@@ -291,11 +292,13 @@ export function ClientRequests() {
     void (async () => {
       setLoadError(null);
       try {
-        const [x, p] = await Promise.all([portalClient.requests(), portalClient.bookingProviders()]);
+        const [x, p, dashboard] = await Promise.all([portalClient.requests(), portalClient.bookingProviders(), portalClient.dashboard()]);
         if (a) {
           setRows(x);
           setProviders(p);
+          setClinicContext({ name: dashboard.branchName ?? dashboard.clinicName, timezone: dashboard.clinicTimezone });
           setProviderId(p[0]?.id ?? '');
+          if (p[0]) setBookingDate(clinicDateOffset(7, p[0].clinicTimezone));
         }
       } catch (e) {
         if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load requests');
@@ -306,7 +309,7 @@ export function ClientRequests() {
   useEffect(() => {
     let a = true;
     void (async () => {
-      if (!providerId) { setSlots([]); setSelectedSlot(''); return; }
+      if (!providerId || !bookingDate) { setSlots([]); setSelectedSlot(''); return; }
       try {
         const data = await portalClient.bookingSlots(providerId, bookingDate);
         if (a) {
@@ -321,14 +324,20 @@ export function ClientRequests() {
   }, [providerId, bookingDate]);
   async function submit() {
     setBusy(true); setMsg(null); setMsgIsError(false);
-    try { const r = await portalClient.createRequest({ service: service.trim(), requestedDateTime: when || undefined, notes: notes.trim() || undefined }); setMsg(r.deduped ? 'You already have a matching request pending staff review.' : 'Request recorded for staff review. This is not a confirmed appointment, and no response time is promised.'); setService(''); setWhen(''); setNotes(''); await load(); }
+    const converted = when && clinicTimezone ? clinicLocalDateTimeToIso(when, clinicTimezone) : null;
+    if (converted?.error) {
+      setBusy(false); setMsgIsError(true);
+      setMsg(converted.error === 'ambiguous' ? 'That local time occurs twice because clocks change. Choose another time or leave it flexible.' : converted.error === 'nonexistent' ? 'That local time does not exist because clocks change. Choose another time.' : 'Enter a valid preferred date and time.');
+      return;
+    }
+    try { const r = await portalClient.createRequest({ service: service.trim(), requestedDateTime: converted?.iso ?? undefined, notes: notes.trim() || undefined }); setMsg(r.deduped ? 'You already have a matching request pending staff review.' : 'Request recorded for staff review. This is not a confirmed appointment, and no response time is promised.'); setService(''); setWhen(''); setNotes(''); await load(); }
     catch (e) { setMsgIsError(true); setMsg(e instanceof Error ? e.message : 'Could not submit'); } finally { setBusy(false); }
   }
   async function book() {
     setBookingBusy(true); setBookingMsg(null); setBookingMsgIsError(false);
     try {
       const appt = await portalClient.bookSlot(providerId, { startsAt: selectedSlot, durationMin: 30, reason: bookingReason.trim(), channel: 'EMAIL' });
-      setBookingMsg(`The scheduling system confirmed ${appt.service} for ${new Date(appt.startsAt).toLocaleString()}.`);
+      setBookingMsg(`The scheduling system confirmed ${appt.service} for ${formatClinicDateTime(appt.startsAt, appt.clinicTimezone)}.`);
       setBookingReason('');
       await loadSlots(providerId, bookingDate);
     } catch (e) {
@@ -360,7 +369,7 @@ export function ClientRequests() {
                 <select
                   className={inp}
                   value={providerId}
-                  onChange={e => { setSlots([]); setSelectedSlot(''); setProviderId(e.target.value); }}
+                  onChange={e => { const next = providers.find(provider => provider.id === e.target.value); setSlots([]); setSelectedSlot(''); setProviderId(e.target.value); if (next) setBookingDate(clinicDateOffset(7, next.clinicTimezone)); }}
                   aria-label="Provider"
                 >
                   {providers.map(p => <option key={p.id} value={p.id}>{p.name}{p.specialty ? ` - ${p.specialty}` : ''}</option>)}
@@ -375,10 +384,11 @@ export function ClientRequests() {
               <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Open slots</span>
               <select className={inp} value={selectedSlot} onChange={e => setSelectedSlot(e.target.value)} aria-label="Open slots">
                 {slots.length === 0 ? <option value="">No open slots on this date</option> : slots.map(s => (
-                  <option key={s.startsAt} value={s.startsAt}>{new Date(s.startsAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</option>
+                  <option key={s.startsAt} value={s.startsAt}>{clinicTimezone ? formatClinicTime(s.startsAt, clinicTimezone) : 'Time unavailable'}</option>
                 ))}
               </select>
             </label>
+            {selectedProvider && <p className="text-[11px] text-t3">Times shown in {selectedProvider.clinicTimezone} for {selectedProvider.branchName}.</p>}
             <label className="block space-y-1">
               <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Reason for visit</span>
               <input className={inp} value={bookingReason} onChange={e => setBookingReason(e.target.value)} placeholder="e.g. Annual physical" />
@@ -402,13 +412,14 @@ export function ClientRequests() {
           <input className={inp} type="datetime-local" value={when} onChange={e => setWhen(e.target.value)} aria-label="Preferred date and time" />
           <input className={inp} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes (optional)" />
         </div>
+        {clinicTimezone && <p className="text-[11px] text-t3">Preferred time is interpreted in {clinicTimezone} for {selectedProvider?.branchName ?? clinicContext?.name ?? 'your clinic'}.</p>}
         <button type="button" disabled={busy || service.trim().length < 2} onClick={submit} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50"><Plus className="w-4 h-4" /> Submit request</button>
         {msg && <p role={msgIsError ? 'alert' : 'status'} aria-live={msgIsError ? 'assertive' : 'polite'} className={`text-[12px] ${msgIsError ? 'text-red-v' : 'text-emerald-v'}`}>{msg}</p>}
       </div>
       {loadError ? <LoadError title="Appointment requests unavailable" message={loadError} /> : !rows ? <Skel /> : rows.length === 0 ? <EmptyStatePremium icon={<ClipboardList className="w-5 h-5" />} title="No requests yet" description="Submit a request above and track its status here." /> :
         <div className="space-y-2">{rows.map(r => (
           <div key={r.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
-            <div><p className="text-[13px] font-bold text-t1">{r.service ?? 'Appointment request'}</p><p className="text-[12px] text-t3">{r.requestedDateTime ? new Date(r.requestedDateTime).toLocaleString() : 'Flexible'} · {new Date(r.createdAt).toLocaleDateString()}</p></div>
+            <div><p className="text-[13px] font-bold text-t1">{r.service ?? 'Appointment request'}</p><p className="text-[12px] text-t3">{r.requestedDateTime ? formatClinicDateTime(r.requestedDateTime, r.clinicTimezone) : 'Flexible'} · submitted {formatClinicDateTime(r.createdAt, r.clinicTimezone)}</p></div>
             <span className="badge badge-amber capitalize">{r.status.toLowerCase().replace(/_/g, ' ')}</span>
           </div>
         ))}</div>}

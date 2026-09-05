@@ -1,0 +1,10 @@
+{
+  "useCase": "ui-mockup",
+  "generator": "image_gen",
+  "approved": true,
+  "approvedBy": "user",
+  "approvedAt": "2026-09-01",
+  "identityReference": ".impeccable/current-front-desk-reference.png",
+  "productContext": "PRODUCT.md",
+  "prompt": "Use case: ui-mockup\nAsset type: high-fidelity desktop web application concept comp, landscape first viewport, approximately 1440 × 1000\nPrimary request: Create exactly one shippable-looking CareCommand AI Today workspace concept titled Operational Briefing for a busy multi-clinic practice manager. Preserve the recognizable navy/indigo calm clinical identity, typography character, semantic colors, compact outlined controls, left navigation, top utility bar, and trustworthy operational tone from the identity reference, but substantially improve hierarchy, information density, scale, legibility, and connected workflow clarity. This is a full-fidelity UI, not a wireframe. Include persistent simplified navigation; network, clinic and timezone scope; a morning brief; exactly three priority actions; a dominant live work ledger with clinic, patient or caller, source, owner, SLA or age, evidence or freshness, and next action; truthful connection-health states; and an obvious PHI-safe executive-proof route. Use visibly labelled synthetic, non-PHI data only. Do not invent revenue, ROI, saved-time, outcome, testimonial, customer-success, or live-integration claims."
+}

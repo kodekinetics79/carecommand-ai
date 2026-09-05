@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ElementType } from 'react';
+import { useCallback, useEffect, useRef, useState, type ElementType } from 'react';
 import {
   Activity, AlertOctagon, CalendarX, WifiOff, HeartPulse, RefreshCw, TrendingUp,
   TrendingDown, Minus, Bell, ShieldCheck, Sunrise, CheckCircle2, UserPlus, Check, Stethoscope,
@@ -7,18 +7,20 @@ import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import { apiRequest } from '../lib/api';
+import { useApiResource } from '../hooks/useApiResource';
+import { useSession } from '../hooks/useSession';
 
 // ── Types (mirror the monitoring API responses) ─────────────────────────────
 interface Overview {
-  summary: { readingsToday: number; openAlerts: number; criticalAlerts: number; missedReadings: number; offlineDevices: number; patientsAtRisk: number };
+  summary: { readingsToday: number; openAlerts: number; criticalAlerts: number; missedReadings: number; offlineDevices: number; patientsAtRisk: number; dayDefinition?: string };
   recentReadings: { id: string; patientName: string; deviceName: string; readingType: string; value: string; unit: string | null; capturedAt: string; validationStatus: string; source: string; trend: string }[];
   deviceHealth: { id: string; name: string; deviceType: string; status: string; location: string | null; lastSeenAt: string | null; patientsMonitored: number }[];
   notifications: { id: string; recipientType: string; recipientName: string | null; patientName: string | null; channel: string; status: string; attempts: number; failureReason: string | null; consentChecked: boolean; consentResult: string | null; createdAt: string }[];
-  assignableUsers: { id: string; name: string; role: string }[];
+  assignableUsers: { id: string; name: string; role: string; branchId: string | null }[];
 }
 interface Alert {
   id: string; patientName: string; readingType: string | null; value: string | null; unit: string | null;
-  severity: string; alertType: string; status: string; assignedTo: string | null; generatedReason: string | null; createdAt: string;
+  severity: string; alertType: string; status: string; branchId: string | null; assignedTo: string | null; generatedReason: string | null; createdAt: string;
 }
 /**
  * GET /v1/monitoring/alerts answers with a page, not a bare list.
@@ -37,8 +39,18 @@ interface RiskRow {
 }
 interface Briefing {
   generatedAt: string; counts: { criticalOpen: number; missedHigh: number; offlineDevices: number };
+  dayDefinition?: string;
   signals: { id: string; signalType: string; title: string; detail: string | null; severity: string; metricValue: number | null; patientName: string | null }[];
   disclaimer: string;
+}
+interface ClinicOption { id: string; name: string; location?: string | null }
+interface MonitoringRecords {
+  scope: string;
+  overview: Overview;
+  alerts: Alert[];
+  alertTotal: { total: number; truncated: boolean };
+  risk: RiskRow[];
+  briefing: Briefing;
 }
 
 const SEVERITY: Record<string, string> = { critical: 'badge-red', high: 'badge-amber', warning: 'badge-blue', normal: 'badge-emerald' };
@@ -71,72 +83,142 @@ function notificationStatusLabel(status: string): string {
   return status.replace(/_/g, ' ');
 }
 
+function monitoringPath(path: string, scope: string): string {
+  return scope === 'all' ? path : `${path}?branchId=${encodeURIComponent(scope)}`;
+}
+
+function DataUnavailable() {
+  return <div className="rounded-lg border border-dashed border-amber-200 bg-[var(--amber-soft)] px-3 py-4 text-center text-[11px] font-medium text-amber-v">Current clinic data is unavailable. Refresh before making an operational decision.</div>;
+}
+
 export default function RemoteMonitoring() {
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [alertTotal, setAlertTotal] = useState<{ total: number; truncated: boolean }>({ total: 0, truncated: false });
-  const [risk, setRisk] = useState<RiskRow[]>([]);
-  const [briefing, setBriefing] = useState<Briefing | null>(null);
+  const { user } = useSession();
+  const canManageAlerts = ['OWNER', 'ADMIN', 'MANAGER'].includes(user?.role ?? '');
+  const canChooseClinic = !user?.branchId;
+  const { data: clinicOptions, error: clinicError, loading: clinicsLoading, reload: reloadClinics } = useApiResource<ClinicOption, ClinicOption>('/v1/branches?limit=100', [], row => row);
+  const [selectedClinicId, setSelectedClinicId] = useState<'all' | string>('all');
+  const [records, setRecords] = useState<MonitoringRecords | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [errorState, setErrorState] = useState<{ scope: string; message: string } | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const loadGeneration = useRef(0);
+  const selectedClinicRef = useRef<string>(selectedClinicId);
+
+  function changeClinic(nextClinicId: string) {
+    // Mutation completions consult this ref before reloading. Update it in the
+    // same event as the visible scope so an action started in clinic A can
+    // never invalidate or overwrite clinic B's in-flight board request.
+    selectedClinicRef.current = nextClinicId;
+    setSelectedClinicId(nextClinicId);
+  }
 
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
+    setLoading(true);
+    setErrorState(null);
     try {
       const [o, a, r, b] = await Promise.all([
-        apiRequest<Overview>('/v1/monitoring/overview'),
-        apiRequest<AlertPage>('/v1/monitoring/alerts'),
-        apiRequest<RiskRow[]>('/v1/monitoring/patients-at-risk'),
-        apiRequest<Briefing>('/v1/monitoring/morning-briefing'),
+        apiRequest<Overview>(monitoringPath('/v1/monitoring/overview', selectedClinicId)),
+        apiRequest<AlertPage>(monitoringPath('/v1/monitoring/alerts', selectedClinicId)),
+        apiRequest<RiskRow[]>(monitoringPath('/v1/monitoring/patients-at-risk', selectedClinicId)),
+        apiRequest<Briefing>(monitoringPath('/v1/monitoring/morning-briefing', selectedClinicId)),
       ]);
-      setOverview(o); setAlerts(a.items); setAlertTotal({ total: a.total, truncated: a.truncated });
-      setRisk(r); setBriefing(b); setError(null);
+      if (generation !== loadGeneration.current) return;
+      setRecords({
+        scope: selectedClinicId,
+        overview: o,
+        alerts: a.items,
+        alertTotal: { total: a.total, truncated: a.truncated },
+        risk: r,
+        briefing: b,
+      });
+      setActionError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load monitoring data');
+      if (generation !== loadGeneration.current) return;
+      setErrorState({ scope: selectedClinicId, message: e instanceof Error ? e.message : 'Failed to load monitoring data' });
     } finally {
-      setLoading(false);
+      if (generation === loadGeneration.current) setLoading(false);
     }
-  }, []);
+  }, [selectedClinicId]);
   // Fetch-on-mount: load() only setState after awaits (same pattern as useApiData).
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void load(); }, [load]);
 
   async function act(id: string, action: 'acknowledge' | 'resolve', body?: object) {
+    const actionScope = selectedClinicRef.current;
     setBusy(id);
-    try { await apiRequest(`/v1/monitoring/alerts/${id}/${action}`, { method: 'PATCH', body: body ? JSON.stringify(body) : undefined }); await load(); }
-    catch (e) { setError(e instanceof Error ? e.message : 'Action failed'); }
+    try {
+      await apiRequest(`/v1/monitoring/alerts/${id}/${action}`, { method: 'PATCH', body: body ? JSON.stringify(body) : undefined });
+      if (selectedClinicRef.current === actionScope) await load();
+    }
+    catch (e) { setActionError(e instanceof Error ? e.message : 'Action failed'); }
     finally { setBusy(null); }
   }
   async function assign(id: string, assignedToUserId: string) {
     if (!assignedToUserId) return;
+    const actionScope = selectedClinicRef.current;
     setBusy(id);
-    try { await apiRequest(`/v1/monitoring/alerts/${id}/assign`, { method: 'PATCH', body: JSON.stringify({ assignedToUserId }) }); await load(); }
-    catch (e) { setError(e instanceof Error ? e.message : 'Assign failed'); }
+    try {
+      await apiRequest(`/v1/monitoring/alerts/${id}/assign`, { method: 'PATCH', body: JSON.stringify({ assignedToUserId }) });
+      if (selectedClinicRef.current === actionScope) await load();
+    }
+    catch (e) { setActionError(e instanceof Error ? e.message : 'Assign failed'); }
     finally { setBusy(null); }
   }
 
-  if (error && !overview) {
-    return (
-      <div className="space-y-4 pb-6">
-        <div className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] p-4 text-[13px] text-amber-v">
-          {/403|entitle|feature|plan/i.test(error) ? 'Remote Monitoring is part of the Device Integration Center add-on. Contact your administrator to enable it.' : error}
-        </div>
-      </div>
-    );
-  }
-
+  const error = errorState?.scope === selectedClinicId ? errorState.message : null;
+  const current = records?.scope === selectedClinicId && !error ? records : null;
+  const overview = current?.overview ?? null;
+  const alerts = current?.alerts ?? [];
+  const alertTotal = current?.alertTotal ?? { total: 0, truncated: false };
+  const risk = current?.risk ?? [];
+  const briefing = current?.briefing ?? null;
+  const dataLoading = !error && (loading || !current);
+  const dataUnavailable = Boolean(error);
   const s = overview?.summary;
   const users = overview?.assignableUsers ?? [];
+  const selectedClinic = clinicOptions.find(clinic => clinic.id === selectedClinicId);
+  const scopeLabel = user?.branch?.name ?? (selectedClinicId === 'all' ? 'All clinics' : selectedClinic?.name ?? 'Selected clinic');
+  const displayError = error && /403|entitle|feature|plan/i.test(error)
+    ? 'Remote Monitoring is part of the Device Integration Center add-on. Contact your administrator to enable it.'
+    : error;
 
   return (
     <div className="space-y-4 pb-6">
       {/* Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="badge badge-red inline-flex items-center gap-1"><AlertOctagon className="w-3 h-3" />{s?.criticalAlerts ?? 0} critical-priority open</span>
-        <button type="button" onClick={() => void load()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
-          <RefreshCw className="w-3.5 h-3.5 text-t3" /> Refresh
-        </button>
+      <div className="cc-card flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`badge inline-flex items-center gap-1 ${dataUnavailable ? 'badge-amber' : 'badge-red'}`}><AlertOctagon className="w-3 h-3" />{dataUnavailable ? 'Critical queue unavailable' : dataLoading ? 'Checking critical queue' : `${s?.criticalAlerts ?? 0} critical-priority open`}</span>
+          <span className="text-[11px] font-semibold text-t3">Viewing {scopeLabel}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {canChooseClinic ? (
+            <label className="inline-flex items-center gap-2 text-[11px] font-semibold text-t3">
+              Clinic
+              <select
+                aria-label="Clinic scope"
+                value={selectedClinicId}
+                disabled={clinicsLoading || Boolean(clinicError)}
+                onChange={event => changeClinic(event.target.value)}
+                className="min-w-40 rounded-lg border border-[var(--b1)] bg-white px-2.5 py-1.5 text-[12px] font-semibold text-t1 outline-none focus:border-indigo disabled:opacity-60"
+              >
+                <option value="all">All clinics</option>
+                {clinicOptions.map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
+              </select>
+            </label>
+          ) : null}
+          <button type="button" onClick={() => { reloadClinics(); void load(); }} disabled={loading} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-60">
+            <RefreshCw className="w-3.5 h-3.5 text-t3" /> Refresh
+          </button>
+        </div>
       </div>
+
+      {(displayError || clinicError || actionError) && (
+        <div role="alert" className="rounded-xl border border-amber-200 bg-[var(--amber-soft)] p-4 text-[13px] text-amber-v">
+          {displayError ?? (clinicError ? 'Clinic choices could not be loaded. Refresh before relying on this operational view.' : actionError)}
+        </div>
+      )}
 
       <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[11px] font-medium text-red-700">
         Not an emergency-monitoring service. Do not rely on CareCommand as the only way to detect or respond to a clinical change. Follow the clinic's approved escalation plan; for an emergency in the United States, call 911.
@@ -144,12 +226,12 @@ export default function RemoteMonitoring() {
 
       {/* 1 · KPI cards */}
       <div className="grid gap-2.5 grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-        <StatCard title="Readings Today" value={s?.readingsToday ?? 0} subtitle="Captured" icon={<Activity className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Open Alerts" value={s?.openAlerts ?? 0} subtitle="Need action" icon={<Bell className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Critical-Priority Alerts" value={s?.criticalAlerts ?? 0} subtitle="Needs clinician review" icon={<AlertOctagon className="w-4 h-4" />} accent="red" />
-        <StatCard title="Missed Readings" value={s?.missedReadings ?? 0} subtitle="Operational data gaps" icon={<CalendarX className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Offline Devices" value={s?.offlineDevices ?? 0} subtitle="Impacting monitoring" icon={<WifiOff className="w-4 h-4" />} accent="cyan" />
-        <StatCard title="Patients Flagged" value={s?.patientsAtRisk ?? 0} subtitle="Operational review queue" icon={<HeartPulse className="w-4 h-4" />} accent="red" />
+        <StatCard title="Readings Today" value={s?.readingsToday ?? '—'} subtitle={dataUnavailable ? 'Data unavailable' : dataLoading ? 'Loading current scope' : s?.dayDefinition ?? 'Captured'} icon={<Activity className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Open Alerts" value={s?.openAlerts ?? '—'} subtitle={dataUnavailable ? 'Data unavailable' : dataLoading ? 'Loading current scope' : 'Need action'} icon={<Bell className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Critical-Priority Alerts" value={s?.criticalAlerts ?? '—'} subtitle={dataUnavailable ? 'Data unavailable' : dataLoading ? 'Loading current scope' : 'Needs clinician review'} icon={<AlertOctagon className="w-4 h-4" />} accent="red" />
+        <StatCard title="Missed Readings" value={s?.missedReadings ?? '—'} subtitle={dataUnavailable ? 'Data unavailable' : dataLoading ? 'Loading current scope' : 'Operational data gaps'} icon={<CalendarX className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Offline Devices" value={s?.offlineDevices ?? '—'} subtitle={dataUnavailable ? 'Data unavailable' : dataLoading ? 'Loading current scope' : 'Impacting monitoring'} icon={<WifiOff className="w-4 h-4" />} accent="cyan" />
+        <StatCard title="Patients Flagged" value={s?.patientsAtRisk ?? '—'} subtitle={dataUnavailable ? 'Data unavailable' : dataLoading ? 'Loading current scope' : 'Operational review queue'} icon={<HeartPulse className="w-4 h-4" />} accent="red" />
       </div>
 
       {/* 7 · Morning briefing */}
@@ -158,7 +240,7 @@ export default function RemoteMonitoring() {
           <div className="flex items-center gap-2 mb-3">
             <span className="w-7 h-7 rounded-lg bg-[var(--indigo-soft)] grid place-items-center"><Sunrise className="w-4 h-4 text-indigo" /></span>
             <p className="text-[13px] font-bold text-t1">Morning Briefing</p>
-            <span className="text-[11px] text-t3">· generated {relTime(briefing.generatedAt)}</span>
+            <span className="text-[11px] text-t3">· generated {relTime(briefing.generatedAt)}{briefing.dayDefinition ? ` · ${briefing.dayDefinition}` : ''}</span>
           </div>
           <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
             {briefing.signals.map(sig => {
@@ -185,7 +267,9 @@ export default function RemoteMonitoring() {
         <div className="space-y-3 min-w-0">
           {/* 2 · Alert queue */}
           <BentoCard title="Alert Queue" subtitle="Threshold and workflow alerts · not diagnosis or emergency dispatch">
-            {loading ? <div className="space-y-2">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton-line h-14 rounded-lg" />)}</div>
+            {!canManageAlerts && <div className="mb-3 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-[11px] text-t2"><span className="font-semibold">Read-only clinical view.</span> A clinic owner, administrator, or manager must acknowledge, assign, or close workflow alerts.</div>}
+            {dataLoading ? <div className="space-y-2">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton-line h-14 rounded-lg" />)}</div>
+              : dataUnavailable ? <DataUnavailable />
               : alerts.length === 0 ? <EmptyStatePremium icon={<CheckCircle2 className="w-5 h-5" />} title="No open workflow alerts" description="No threshold, missed-reading, or device alerts were returned in the current response." />
               : (
                 <div className="space-y-2">
@@ -209,7 +293,7 @@ export default function RemoteMonitoring() {
                           <p className="text-[10.5px] text-t3 mt-1">{relTime(a.createdAt)} · {a.assignedTo ? `assigned to ${a.assignedTo}` : 'unassigned'} · <span className="capitalize">{a.status}</span></p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-1.5 mt-2.5 flex-wrap">
+                      {canManageAlerts && <div className="flex items-center gap-1.5 mt-2.5 flex-wrap">
                         {a.status === 'open' && (
                           <button type="button" disabled={busy === a.id} onClick={() => act(a.id, 'acknowledge')} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50"><Check className="w-3 h-3" /> Record acknowledged</button>
                         )}
@@ -217,11 +301,11 @@ export default function RemoteMonitoring() {
                           <UserPlus className="w-3 h-3 text-t3" />
                           <select aria-label="Assign alert" disabled={busy === a.id} value="" onChange={e => assign(a.id, e.target.value)} className="bg-transparent text-[11px] font-semibold text-t2 outline-none cursor-pointer py-0.5">
                             <option value="">Assign…</option>
-                            {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+                            {users.filter(u => u.branchId === null || u.branchId === a.branchId).map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
                           </select>
                         </div>
                         <button type="button" disabled={busy === a.id} onClick={() => act(a.id, 'resolve')} className="inline-flex items-center gap-1 rounded-lg bg-[var(--indigo)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><CheckCircle2 className="w-3 h-3" /> Close workflow alert</button>
-                      </div>
+                      </div>}
                     </div>
                   ))}
                 </div>
@@ -230,7 +314,8 @@ export default function RemoteMonitoring() {
 
           {/* 3 · Live / recent readings */}
           <BentoCard title="Latest Recorded Readings" subtitle="Most recent stored device captures across monitored patients">
-            {loading ? <div className="skeleton-line h-40 rounded-lg" />
+            {dataLoading ? <div className="skeleton-line h-40 rounded-lg" />
+              : dataUnavailable ? <DataUnavailable />
               : !overview || overview.recentReadings.length === 0 ? <p className="text-xs text-t3 py-4 text-center">No readings captured yet.</p>
               : (
                 <div className="overflow-x-auto rounded-xl border border-[var(--b1)]">
@@ -256,7 +341,8 @@ export default function RemoteMonitoring() {
 
           {/* 4 · Patients at risk */}
           <BentoCard title="Patients Flagged for Review" subtitle="Operational priority score — not a diagnosis or clinical risk determination">
-            {loading ? <div className="skeleton-line h-32 rounded-lg" />
+            {dataLoading ? <div className="skeleton-line h-32 rounded-lg" />
+              : dataUnavailable ? <DataUnavailable />
               : risk.length === 0 ? <EmptyStatePremium icon={<HeartPulse className="w-5 h-5" />} title="No patients flagged" description="No patients with qualifying open alerts or missed-reading rules were returned." />
               : (
                 <div className="space-y-2">
@@ -280,7 +366,8 @@ export default function RemoteMonitoring() {
         <div className="space-y-3">
           {/* 5 · Device health visibility */}
           <BentoCard title="Device Health" subtitle="Offline / error devices affecting monitoring" headerRight={<WifiOff className="w-4 h-4 text-t3" />}>
-            {loading ? <div className="skeleton-line h-24 rounded-lg" />
+            {dataLoading ? <div className="skeleton-line h-24 rounded-lg" />
+              : dataUnavailable ? <DataUnavailable />
               : !overview || overview.deviceHealth.length === 0 ? <p className="text-xs text-t3 py-4 text-center inline-flex items-center gap-1.5 w-full justify-center"><CheckCircle2 className="w-4 h-4 text-emerald-v" /> No offline or error devices were returned.</p>
               : (
                 <div className="space-y-2">
@@ -300,11 +387,14 @@ export default function RemoteMonitoring() {
 
           {/* 6 · Notification timeline */}
           <BentoCard title="Notification Timeline" subtitle="Queued, provider-accepted, delivered, and failed are distinct states" headerRight={<Bell className="w-4 h-4 text-t3" />}>
-            {loading ? <div className="skeleton-line h-32 rounded-lg" />
+            {dataLoading ? <div className="skeleton-line h-32 rounded-lg" />
+              : dataUnavailable ? <DataUnavailable />
               : !overview || overview.notifications.length === 0 ? <p className="text-xs text-t3 py-4 text-center">No notification records are available yet.</p>
               : (
-                <ol className="space-y-2.5">
-                  {overview.notifications.map(n => (
+                <div className="space-y-2.5">
+                  <p className="text-[10.5px] font-medium text-t3">Historical delivery log · most recent record {relTime(overview.notifications[0]?.createdAt ?? null)}</p>
+                  <ol className="space-y-2.5">
+                    {overview.notifications.map(n => (
                     <li key={n.id} className="flex items-start gap-2.5">
                       <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${n.status === 'failed' ? 'bg-red-500' : n.status === 'queued' ? 'bg-slate-300' : n.status === 'delivered' ? 'bg-emerald-500' : 'bg-blue-500'}`} />
                       <div className="min-w-0 flex-1">
@@ -321,8 +411,9 @@ export default function RemoteMonitoring() {
                         {n.failureReason && <p className="text-[10.5px] text-red-v mt-0.5">{n.failureReason}</p>}
                       </div>
                     </li>
-                  ))}
-                </ol>
+                    ))}
+                  </ol>
+                </div>
               )}
           </BentoCard>
         </div>

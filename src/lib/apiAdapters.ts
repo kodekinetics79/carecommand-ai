@@ -3,6 +3,8 @@ import { apiRequest } from './api';
 import { isRestrictedView, receptionistViewFromMetadata, type ReceptionistTaskInfo, type TaskOutcomeCode } from './frontDesk';
 import { readPatientConfirmation, type PatientConfirmationFields } from './patientConfirmation';
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Reads a list endpoint, accepting both shapes the API uses: a bare array and
  * a `cursorPage` envelope. Pass the caller's AbortSignal so the request is
@@ -16,6 +18,8 @@ export async function fetchList<T>(path: string, signal?: AbortSignal): Promise<
 export interface ApiPatient {
   id: string;
   branchId: string;
+  branch?: { name: string } | null;
+  externalRef?: string | null;
   firstName: string;
   lastName: string;
   email?: string | null;
@@ -142,6 +146,7 @@ export interface ApiAppointment extends PatientConfirmationFields {
   patientId: string;
   patientName?: string | null;
   providerRef?: string | null;
+  providerName?: string | null;
   service: string;
   startsAt: string;
   // The CLINIC's booking state. `CONFIRMED` is the default a row is created
@@ -243,6 +248,7 @@ export interface ApiStaffProfile {
   tasksCompleted: number;
   tasksPending: number;
   patientFeedbackScore: string;
+  updatedAt: string;
   branch: { name: string };
   user: { displayName: string };
 }
@@ -298,6 +304,7 @@ export interface ApiOpportunity {
 
 export interface ApiConversation {
   id: string;
+  branchId: string;
   channel: 'WHATSAPP' | 'SMS' | 'EMAIL' | 'PUSH' | 'CALL' | 'VIDEO';
   status: string;
   intent?: string | null;
@@ -430,14 +437,19 @@ export function mapProviderProfile(row: ApiProviderProfile): Doctor {
 
 export function mapAppointment(row: ApiAppointment): Appointment {
   const startsAt = new Date(row.startsAt);
+  const providerRef = row.providerRef?.trim() ?? '';
+  const providerLabel = row.providerName?.trim()
+    || (UUID_RE.test(providerRef) ? '' : providerRef)
+    || 'Provider not linked';
   return {
     id: row.id,
+    startsAt: row.startsAt,
     patientId: row.patientId,
     // Real patient name from the API (list/detail now include it); fall back only
     // when a row genuinely lacks a linked patient name.
     patientName: row.patientName?.trim() || 'Unknown patient',
     doctorId: row.providerRef ?? '',
-    doctorName: row.providerRef ?? 'Provider not linked',
+    doctorName: providerLabel,
     branchId: row.branchId,
     service: row.service,
     date: startsAt.toISOString().slice(0, 10),
@@ -590,6 +602,7 @@ export function mapStaffProfile(row: ApiStaffProfile) {
     tasksCompleted: row.tasksCompleted,
     tasksPending: row.tasksPending,
     patientFeedbackScore: Number(row.patientFeedbackScore),
+    updatedAt: row.updatedAt,
   };
 }
 
@@ -662,7 +675,9 @@ export interface ApiTelehealthSession {
   startsAt: string;
   status: 'CONFIRMED' | 'RISKY' | 'ARRIVED' | 'NO_SHOW' | 'CANCELED' | 'COMPLETED' | 'WAITLIST';
   provider: string;
+  providerProfileId: string | null;
   branchName: string;
+  branchTimezone: string;
   value: string;
   noShowRisk: number;
   intakeComplete: boolean;
@@ -675,7 +690,7 @@ export interface TelehealthSession {
   service: string;
   date: string;
   time: string;
-  status: 'Confirmed' | 'Pending';
+  status: 'Confirmed' | 'Needs confirmation' | 'Arrived' | 'No-show' | 'Canceled' | 'Completed' | 'Waitlist';
   provider: string;
   value: number;
   intakeComplete: boolean;
@@ -683,15 +698,19 @@ export interface TelehealthSession {
 
 export function mapTelehealthSession(row: ApiTelehealthSession): TelehealthSession {
   const startsAt = new Date(row.startsAt);
+  const status = ({
+    CONFIRMED: 'Confirmed', RISKY: 'Needs confirmation', ARRIVED: 'Arrived',
+    NO_SHOW: 'No-show', CANCELED: 'Canceled', COMPLETED: 'Completed', WAITLIST: 'Waitlist',
+  } as const)[row.status];
   const initials = row.patientName.split(' ').map(part => part[0]).slice(0, 2).join('').toUpperCase();
   return {
     id: row.id,
     patient: row.patientName,
     initials,
     service: row.service,
-    date: startsAt.toISOString().slice(0, 10),
-    time: startsAt.toTimeString().slice(0, 5),
-    status: row.status === 'CONFIRMED' || row.status === 'ARRIVED' || row.status === 'COMPLETED' ? 'Confirmed' : 'Pending',
+    date: new Intl.DateTimeFormat('en-CA', { timeZone: row.branchTimezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(startsAt),
+    time: new Intl.DateTimeFormat('en-US', { timeZone: row.branchTimezone, hour: 'numeric', minute: '2-digit' }).format(startsAt),
+    status,
     provider: row.provider,
     value: Number(row.value),
     intakeComplete: row.intakeComplete,
@@ -746,6 +765,8 @@ export interface ApiConsentSummary {
 export function mapConversation(row: ApiConversation) {
   return {
     id: row.id,
+    branchId: row.branchId,
+    branchName: row.branch?.name ?? 'Clinic unavailable',
     name: row.patient ? `${row.patient.firstName} ${row.patient.lastName}` : row.branch?.name ?? 'Anonymous caller',
     channel: row.channel.toLowerCase(),
     message: row.latestMessage,

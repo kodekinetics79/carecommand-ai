@@ -393,6 +393,8 @@ export const platformAdmin = {
   createPilotStatusShare: (tenantId: string, body: { label?: string; expiresInDays?: number }, operationKey = crypto.randomUUID()) =>
     pf<PilotStatusShareCreated>(`/v1/platform/tenants/${tenantId}/pilot-status-links`, { method: 'POST', headers: { 'Idempotency-Key': operationKey }, body: JSON.stringify(body) }),
   listPilotStatusShares: (tenantId: string) => pf<PilotStatusShare[]>(`/v1/platform/tenants/${tenantId}/pilot-status-links`),
+  revokePilotStatusShare: (tenantId: string, shareId: string) =>
+    pf<{ id: string; active: false; alreadyInactive: boolean; revokedAt: string }>(`/v1/platform/tenants/${tenantId}/pilot-status-links/${shareId}`, { method: 'DELETE' }),
 
   integrations: () => pf<IntegrationView[]>(`/v1/platform/integrations`),
   saveIntegration: (key: string, fields: Record<string, string>) => pf<IntegrationView>(`/v1/platform/integrations/${key}`, { method: 'PUT', body: JSON.stringify({ fields }) }),

@@ -14,6 +14,7 @@ vi.mock('../workers/queues', () => ({
 const { providerConfig, providerValue, providerConfigured, resolveCredentialPrecedence, __setProviderSnapshotForTests, PROVIDER_CATALOG } =
   await import('../lib/providerCredentials');
 const { retellConfigStatus, retellCredentials } = await import('../lib/retell');
+const { channelStatus, providerModeFor } = await import('../lib/campaigns');
 
 /**
  * The defect this closes: the Control Tower encrypted provider credentials into
@@ -39,6 +40,22 @@ describe('provider credential precedence', () => {
     expect(resolved.source).toBe('db');
     expect(resolved.values.authToken).toBe('tok_saved');
     expect(providerValue('sms', 'fromNumber')).toBe('+15550000001');
+  });
+
+  it('uses the same saved SMS credential for readiness that the sender uses', () => {
+    __setProviderSnapshotForTests({
+      sms: { accountSid: 'AC_saved', authToken: 'tok_saved', fromNumber: '+15550000001' },
+    });
+    expect(channelStatus('sms')).toMatchObject({ configured: true, setupRequired: false, provider: 'twilio' });
+    expect(providerModeFor('sms')).toBe('live_supported');
+  });
+
+  it('recognizes the configured HTTP email provider without requiring unused SMTP fields', () => {
+    __setProviderSnapshotForTests({
+      email: { apiUrl: 'https://mail.example.test/send', apiKey: 'saved-email-key', fromAddress: 'clinic@example.test' },
+    });
+    expect(channelStatus('email')).toMatchObject({ configured: true, setupRequired: false, provider: 'http-email' });
+    expect(providerModeFor('email')).toBe('live_supported');
   });
 
   /**

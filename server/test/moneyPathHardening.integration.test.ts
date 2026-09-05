@@ -223,6 +223,59 @@ describe('#4 FRONT_DESK cannot fabricate revenue via manual collect', () => {
     const still = await db.depositRequirement.findUnique({ where: { id: dep.id } });
     expect(still?.status).toBe('requested');
   });
+
+  it('records one economic event under duplicate collection requests and rejects terminal reversal', async () => {
+    const t = await makeTenant();
+    const patient = await db.patient.create({
+      data: { tenantId: t.id, branchId: t.branchId, firstName: 'Atomic', lastName: 'Payment', outstandingBalance: 100 },
+    });
+    const pr = await db.paymentRequest.create({
+      data: { tenantId: t.id, branchId: t.branchId, patientId: patient.id, amount: 40, currency: 'USD', status: 'link_sent', reason: 'copay', mode: 'live' },
+    });
+    const request = () => app.inject({
+      method: 'PATCH', url: `/v1/revenue-protection/payment/${pr.id}/status`,
+      headers: jsonAuth(t, t.ownerId), payload: JSON.stringify({ status: 'collected' }),
+    });
+
+    const results = await Promise.all([request(), request()]);
+    expect(results.some(result => result.statusCode === 200)).toBe(true);
+    expect(results.every(result => [200, 409].includes(result.statusCode))).toBe(true);
+    expect(await db.paymentTransaction.count({ where: { paymentRequestId: pr.id, status: 'succeeded' } })).toBe(1);
+    expect(Number((await db.patient.findUniqueOrThrow({ where: { id: patient.id } })).outstandingBalance)).toBe(60);
+
+    const reversal = await app.inject({
+      method: 'PATCH', url: `/v1/revenue-protection/payment/${pr.id}/status`,
+      headers: jsonAuth(t, t.ownerId), payload: JSON.stringify({ status: 'pending' }),
+    });
+    expect(reversal.statusCode).toBe(409);
+    expect((await db.paymentRequest.findUniqueOrThrow({ where: { id: pr.id } })).status).toBe('collected');
+  });
+
+  it('decrements AR once for duplicate deposit collection requests and keeps terminal states terminal', async () => {
+    const t = await makeTenant();
+    const patient = await db.patient.create({
+      data: { tenantId: t.id, branchId: t.branchId, firstName: 'Atomic', lastName: 'Deposit', outstandingBalance: 100 },
+    });
+    const dep = await db.depositRequirement.create({
+      data: { tenantId: t.id, branchId: t.branchId, patientId: patient.id, status: 'requested', requiredAmount: 30, collectedAmount: 0, reason: 'deposit', mode: 'live' },
+    });
+    const request = () => app.inject({
+      method: 'PATCH', url: `/v1/revenue-protection/deposit-requirements/${dep.id}/status`,
+      headers: jsonAuth(t, t.ownerId), payload: JSON.stringify({ status: 'collected', collectedAmount: 30 }),
+    });
+
+    const results = await Promise.all([request(), request()]);
+    expect(results.some(result => result.statusCode === 200)).toBe(true);
+    expect(results.every(result => [200, 409].includes(result.statusCode))).toBe(true);
+    expect(Number((await db.patient.findUniqueOrThrow({ where: { id: patient.id } })).outstandingBalance)).toBe(70);
+
+    const reversal = await app.inject({
+      method: 'PATCH', url: `/v1/revenue-protection/deposit-requirements/${dep.id}/status`,
+      headers: jsonAuth(t, t.ownerId), payload: JSON.stringify({ status: 'requested' }),
+    });
+    expect(reversal.statusCode).toBe(409);
+    expect((await db.depositRequirement.findUniqueOrThrow({ where: { id: dep.id } })).status).toBe('collected');
+  });
 });
 
 // ---------------------------------------------------------------------------

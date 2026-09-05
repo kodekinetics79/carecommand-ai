@@ -11,6 +11,12 @@ vi.mock('../lib/api', async () => {
 const sessionMock = vi.hoisted(() => vi.fn());
 vi.mock('../hooks/useSession', () => ({ useSession: sessionMock }));
 
+const getSelectedClinicIdMock = vi.hoisted(() => vi.fn());
+vi.mock('../lib/session', async () => {
+  const actual = await vi.importActual<typeof import('../lib/session')>('../lib/session');
+  return { ...actual, getSelectedClinicId: getSelectedClinicIdMock };
+});
+
 import StaffWorkflow from './StaffWorkflow';
 
 /**
@@ -57,12 +63,15 @@ let tasks: unknown[];
 
 beforeEach(() => {
   signedIn();
+  getSelectedClinicIdMock.mockReturnValue(null);
   tasks = [RECEPTIONIST_TASK, GENERIC_TASK];
   apiRequestMock.mockReset();
   apiRequestMock.mockImplementation(async (path: string, init?: RequestInit) => {
     if (path.startsWith('/v1/tasks')) return { data: tasks, nextCursor: null };
-    if (path.startsWith('/v1/staff/overview')) return [];
+    if (path.startsWith('/v1/staff/overview')) return { data: [], nextCursor: null, measurement: { source: 'snapshot', automatedAggregation: false, limitation: 'Context only.' } };
     if (path.startsWith('/v1/staff/assignees')) return [];
+    if (path.startsWith('/v1/branches')) return { data: [] };
+    if (path.includes('/task-2/status')) return { ...GENERIC_TASK, status: 'COMPLETED', outcomeCode: 'resolved_elsewhere' };
     if (path.includes('/acknowledge')) return { ...RECEPTIONIST_TASK, acknowledgedAt: '2026-08-29T17:45:00.000Z', acknowledgedBy: { displayName: 'Ann Front' } };
     if (path.includes('/notes')) return RECEPTIONIST_TASK;
     throw new Error(`Unexpected request in test: ${init?.method ?? 'GET'} ${path}`);
@@ -111,5 +120,57 @@ describe('StaffWorkflow receptionist card', () => {
     expect(within(card).getByRole('button', { name: 'Mark done' })).toBeDisabled();
     fireEvent.change(within(card).getByLabelText('Outcome for Jordan Vale'), { target: { value: 'left_voicemail' } });
     expect(within(card).getByRole('button', { name: 'Mark done' })).toBeEnabled();
+  });
+
+  it('requires a recorded outcome and explicit confirmation for a generic task', async () => {
+    renderPage();
+    await screen.findByText('Chase an insurance denial');
+    fireEvent.click(screen.getByRole('button', { name: 'Complete…' }));
+    const confirm = screen.getByRole('button', { name: 'Confirm completion' });
+    expect(confirm).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Outcome for Chase an insurance denial'), { target: { value: 'resolved_elsewhere' } });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith('/v1/staff/tasks/task-2/status', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'COMPLETED', outcomeCode: 'resolved_elsewhere' }),
+    })));
+  });
+
+  it('makes work beyond the first 100-row page reachable', async () => {
+    const pageTwo = { ...GENERIC_TASK, id: 'task-101', title: 'Reachable task 101' };
+    apiRequestMock.mockImplementation(async (path: string) => {
+      if (path === '/v1/tasks?limit=100') return { data: tasks, nextCursor: 'next-100' };
+      if (path.includes('cursor=next-100')) return { data: [pageTwo], nextCursor: null };
+      if (path.startsWith('/v1/staff/overview')) return { data: [], nextCursor: null, measurement: { source: 'snapshot', automatedAggregation: false, limitation: 'Context only.' } };
+      if (path.startsWith('/v1/staff/assignees')) return [];
+      if (path.startsWith('/v1/branches')) return { data: [] };
+      throw new Error(`Unexpected request in test: ${path}`);
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Load next 100 tasks' }));
+    expect(await screen.findByText('Reachable task 101')).toBeInTheDocument();
+  });
+
+  it('defaults new work to the globally selected clinic, not the user primary clinic', async () => {
+    signedIn([...GRANTS, 'staff:write']);
+    sessionMock.mockReturnValue({
+      user: { id: 'u1', email: 'a@b.test', displayName: 'Ann Front', role: 'FRONT_DESK', branchId: 'c1', branch: null, tenant: { id: 't', name: 'T', slug: 't' }, active: true, effectivePermissions: [...GRANTS, 'staff:write'] },
+      loading: false,
+    });
+    getSelectedClinicIdMock.mockReturnValue('c2');
+    apiRequestMock.mockImplementation(async (path: string) => {
+      if (path.startsWith('/v1/tasks')) return { data: tasks, nextCursor: null };
+      if (path.startsWith('/v1/staff/overview')) return { data: [], nextCursor: null, measurement: { source: 'snapshot', automatedAggregation: false, limitation: 'Context only.' } };
+      if (path.startsWith('/v1/staff/assignees')) return [];
+      if (path.startsWith('/v1/branches')) return { data: [
+        { id: 'c1', name: 'Arlington', location: 'VA', timezone: 'America/New_York', active: true },
+        { id: 'c2', name: 'Fairfax', location: 'VA', timezone: 'America/New_York', active: true },
+      ] };
+      throw new Error(`Unexpected request in test: ${path}`);
+    });
+    renderPage();
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith('/v1/branches?limit=100'));
+    fireEvent.click(await screen.findByRole('button', { name: 'New task' }));
+    expect(screen.getByRole('combobox', { name: 'Clinic' })).toHaveValue('c2');
   });
 });

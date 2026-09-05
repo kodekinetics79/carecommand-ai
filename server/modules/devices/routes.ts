@@ -336,17 +336,18 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     const hasRequired = required.every(k => (config[k] ?? '').trim().length > 0);
     if (def.category !== 'MANUAL' && !hasRequired) throw app.httpErrors.badRequest(`Missing required config: ${required.join(', ')}`);
     const status = devStatus(def.category, mode, hasRequired);
+    const webhookConfigured = def.supportsWebhook && (config.webhookSecret ?? '').trim().length > 0;
     const encryptedConfig = Object.keys(config).length ? encryptSecret(JSON.stringify(config)) : null;
     const row = await db.deviceProvider.upsert({
       where: { tenantId_providerKey: { tenantId: request.auth.tenantId, providerKey: key } },
-      create: { tenantId: request.auth.tenantId, providerKey: key, displayName: def.displayName, category: def.category, mode, status, encryptedConfig },
+      create: { tenantId: request.auth.tenantId, providerKey: key, displayName: def.displayName, category: def.category, mode, status, encryptedConfig, webhookConfigured },
       // Clear the prior health verdict: it described the OLD credentials. Leaving
       // it in place produced "Health: healthy · checked 71d ago" in green next to
       // credentials that had since been replaced.
-      update: { mode, status, ...(encryptedConfig ? { encryptedConfig } : {}), lastHealthCheckAt: null, lastHealthStatus: null, healthMessage: null },
-      select: { id: true, providerKey: true, status: true, mode: true },
+      update: { mode, status, ...(encryptedConfig ? { encryptedConfig } : {}), webhookConfigured, lastHealthCheckAt: null, lastHealthStatus: null, healthMessage: null },
+      select: { id: true, providerKey: true, status: true, mode: true, webhookConfigured: true },
     });
-    await audit(request, { action: 'device.provider.configured', resource: 'deviceProvider', resourceId: row.id, metadata: { providerKey: key, mode, status } });
+    await audit(request, { action: 'device.provider.configured', resource: 'deviceProvider', resourceId: row.id, metadata: { providerKey: key, mode, status, webhookConfigured } });
     return reply.send(row);
   });
 

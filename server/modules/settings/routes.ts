@@ -351,7 +351,9 @@ async function replaceUserClinicAccess(request: FastifyRequest, userId: string, 
     const existing = await tx.user.findFirst({ where: { id: userId, tenantId } });
     if (!existing) throw request.server.httpErrors.notFound('User not found');
     if (primaryBranchId && !branchIds.includes(primaryBranchId)) throw request.server.httpErrors.badRequest('Primary branch must be included in selected clinic access');
-    if (branchIds.length === 0 && existing.role !== 'OWNER' && existing.role !== 'ADMIN') throw request.server.httpErrors.badRequest('At least one clinic access entry is required');
+    if (['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING'].includes(existing.role) && branchIds.length === 0) {
+      throw request.server.httpErrors.badRequest('Select at least one clinic. To remove this user\u2019s access entirely, deactivate the account instead.');
+    }
     const validBranches = branchIds.length > 0
       ? await tx.branch.findMany({ where: { tenantId, active: true, id: { in: branchIds } }, select: { id: true } })
       : [];

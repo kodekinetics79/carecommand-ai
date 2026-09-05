@@ -1,0 +1,43 @@
+{
+  "regions": [
+    { "id": "sidebar-ground", "kind": "chrome", "grid": "A0:B9", "note": "deep navy navigation rail" },
+    { "id": "brand", "kind": "text", "grid": "A0:B0", "note": "CareCommand AI brand lockup" },
+    { "id": "nav-primary", "kind": "control", "grid": "A1:B5", "note": "Today through Administration navigation labels, icons, active state and count badges" },
+    { "id": "sidebar-proof", "kind": "control", "grid": "A8:B9", "note": "Open PHI-safe executive proof callout with synthetic source-labelled note" },
+
+    { "id": "topbar-ground", "kind": "chrome", "grid": "C0:J0", "note": "white top utility bar with bottom hairline" },
+    { "id": "global-search", "kind": "control", "grid": "C0:E0", "note": "search patients callers tickets and more field with shortcut" },
+    { "id": "topbar-user", "kind": "control", "grid": "I0:J0", "note": "notification help and Olivia Bennett user controls" },
+    { "id": "network-scope", "kind": "control", "grid": "C0:D1", "note": "Network and All 4 clinics scope control" },
+    { "id": "timezone-scope", "kind": "control", "grid": "D0:F1", "note": "America New York and current time scope control" },
+    { "id": "clinic-selector", "kind": "control", "grid": "I0:J1", "note": "All 4 clinics selector at upper right" },
+
+    { "id": "page-title", "kind": "text", "grid": "C1:E1", "note": "Operational Briefing display heading" },
+    { "id": "page-context", "kind": "text", "grid": "C1:E1", "note": "Tuesday 1 September and synthetic pilot workspace context" },
+    { "id": "synthetic-badge", "kind": "control", "grid": "E1:F1", "note": "synthetic data status badge" },
+
+    { "id": "priority-ground", "kind": "chrome", "grid": "C2:J3", "note": "single connected morning-priority surface divided into three actions" },
+    { "id": "brief-summary", "kind": "text", "grid": "C2:F2", "note": "three items need attention before the opening window" },
+    { "id": "brief-freshness", "kind": "text", "grid": "I2:J2", "note": "updated time source count and information affordance" },
+    { "id": "priority-one", "kind": "control", "grid": "C2:E3", "note": "number one voice routing mismatch with clinic severity owner SLA and open incident action" },
+    { "id": "priority-two", "kind": "control", "grid": "F2:G3", "note": "number two submitted intake with patient clinic owner age and review packet action" },
+    { "id": "priority-three", "kind": "control", "grid": "H2:J3", "note": "number three protected appointment with patient clinic eligibility owner and review coverage action" },
+
+    { "id": "ledger-heading", "kind": "text", "grid": "C4:E4", "note": "Live work ledger heading" },
+    { "id": "ledger-open-queue", "kind": "control", "grid": "I4:J4", "note": "View full work queue action" },
+    { "id": "ledger-columns", "kind": "text", "grid": "C4:J4", "note": "Clinic Patient caller Source Owner SLA age Evidence freshness and Next action column headings" },
+    { "id": "ledger-row-one", "kind": "control", "grid": "C5:J5", "note": "Downtown intake record for Zack Testpatient with unassigned owner age freshness and review packet action" },
+    { "id": "ledger-row-two", "kind": "control", "grid": "C5:J6", "note": "Northgate scheduling record for Jordan Test with owner risk stored freshness and protect appointment action" },
+    { "id": "ledger-row-three", "kind": "control", "grid": "C6:J6", "note": "Brightsmile call record for Maya Gonzalez with owner overdue stale evidence and callback action" },
+    { "id": "ledger-row-four", "kind": "control", "grid": "C6:J7", "note": "Harley Street unknown caller with owner live evidence and assign action" },
+    { "id": "ledger-row-five", "kind": "control", "grid": "C7:J7", "note": "network scheduling API latency service item with monitoring source and resolve action" },
+    { "id": "ledger-pagination", "kind": "control", "grid": "I7:J7", "note": "five-record count and pagination controls" },
+
+    { "id": "connection-ground", "kind": "chrome", "grid": "C8:G9", "note": "connection health evidence surface" },
+    { "id": "connection-title", "kind": "text", "grid": "C8:E8", "note": "Connection health heading and information affordance" },
+    { "id": "connection-statuses", "kind": "control", "grid": "C8:G9", "note": "Scheduling Live Voice Needs attention Eligibility Sandbox and Payments Not configured with checked times" },
+    { "id": "executive-proof-ground", "kind": "chrome", "grid": "H8:J9", "note": "PHI-safe executive proof surface" },
+    { "id": "executive-proof-title", "kind": "text", "grid": "H8:J9", "note": "Open PHI-safe executive proof and synthetic source-labelled explanation" },
+    { "id": "executive-proof-action", "kind": "control", "grid": "I8:J9", "note": "Open proof outlined action" }
+  ]
+}

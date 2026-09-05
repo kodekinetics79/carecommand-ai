@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import { useLocation, useNavigate, Link } from 'react-router';
-import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe, Menu } from 'lucide-react';
+import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe, Menu, MapPin } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
 import BackButton from './BackButton';
 import { useSession } from '../../hooks/useSession';
 import { matchRoute } from '../../lib/access';
 import { usePreferences, LANGUAGES } from '../../lib/preferences';
+import { getSelectedClinicId, selectClinic } from '../../lib/session';
 
 function initials(name: string): string {
   return name.trim().split(/\s+/).slice(0, 2).map(p => p[0]?.toUpperCase() ?? '').join('') || '·';
@@ -29,11 +30,23 @@ export default function Topbar({ mobileNavOpen = false, onOpenNavigation }: { mo
   // Destination names come from the shared route registry, so the breadcrumb
   // and the no-access notice always call a section the same thing.
   const matched = matchRoute(pathname);
+  const isToday = pathname === '/';
   const isDetail = pathname !== matched.path && matched.path !== '/';
   const detailLabel = isDetail ? prettySegment(pathname.split('/').filter(Boolean).pop() ?? '') : null;
 
   const workspace = user?.tenant?.name;
-  const locationLabel = user?.branch?.name ?? user?.branch?.location ?? null;
+  const clinicAccesses = user?.clinicAccesses ?? [];
+  const currentClinicId = getSelectedClinicId();
+  const selectedClinicId = currentClinicId && clinicAccesses.some(clinic => clinic.id === currentClinicId)
+    ? currentClinicId
+    : clinicAccesses.find(clinic => clinic.isPrimary)?.id ?? clinicAccesses[0]?.id ?? '';
+  const selectedClinic = clinicAccesses.find(clinic => clinic.id === selectedClinicId);
+  const locationLabel = selectedClinic?.name ?? user?.branch?.name ?? user?.branch?.location ?? null;
+
+  const changeClinic = (clinicId: string) => {
+    if (!user || clinicId === selectedClinicId) return;
+    selectClinic(user.tenant.id, clinicId);
+  };
 
   return (
     <>
@@ -43,8 +56,17 @@ export default function Topbar({ mobileNavOpen = false, onOpenNavigation }: { mo
         </button>
         {/* Smart back control — true previous screen, parent fallback on deep link */}
         <BackButton className="mr-1" />
-        {/* Breadcrumb: workspace › section, with location context chip */}
-        <nav aria-label="Breadcrumb" className="flex items-center gap-1.5 min-w-0 flex-1 text-[13px]">
+        {/* Search is the first desktop utility: busy clinic users should be able
+            to find a patient, caller or task without scanning page chrome. */}
+        <button type="button" onClick={() => setCmdOpen(true)} className="topbar-search">
+          <Search className="w-3.5 h-3.5 shrink-0" />
+          <span className="topbar-search-text">Search patients, callers, tickets, and more…</span>
+          <kbd className="topbar-kbd"><Command className="w-2.5 h-2.5" />K</kbd>
+        </button>
+
+        {/* Today already carries its network and clinic context in the briefing
+            scope row. Other pages retain a compact breadcrumb here. */}
+        {!isToday && <nav aria-label="Breadcrumb" className="hidden items-center gap-1.5 min-w-0 flex-1 text-[13px] sm:flex">
           {workspace && (
             <>
               <span className="text-t3 truncate max-w-[160px] hidden sm:inline">{workspace}</span>
@@ -63,14 +85,18 @@ export default function Topbar({ mobileNavOpen = false, onOpenNavigation }: { mo
           {locationLabel && (
             <span className="ml-1.5 hidden md:inline-flex items-center rounded-md border border-[var(--b1)] bg-[var(--s2)] px-2 py-0.5 text-[11px] font-medium text-t2 shrink-0">{locationLabel}</span>
           )}
-        </nav>
+        </nav>}
+        {isToday && <span className="flex-1" aria-hidden="true" />}
 
-        {/* Command search */}
-        <button type="button" onClick={() => setCmdOpen(true)} className="topbar-search">
-          <Search className="w-3.5 h-3.5 shrink-0" />
-          <span className="topbar-search-text">Search</span>
-          <kbd className="topbar-kbd"><Command className="w-2.5 h-2.5" />K</kbd>
-        </button>
+        {clinicAccesses.length > 1 && (
+          <label className="inline-flex min-h-11 min-w-0 items-center gap-1 rounded-lg border border-[var(--b1)] bg-white px-2 md:gap-1.5" title="Active clinic">
+            <MapPin className="w-3.5 h-3.5 text-t3 shrink-0" aria-hidden="true" />
+            <select aria-label="Active clinic" value={selectedClinicId} onChange={event => changeClinic(event.target.value)}
+              className="max-w-[150px] bg-transparent pr-0.5 text-[11px] font-semibold text-t2 outline-none cursor-pointer md:max-w-[180px] md:pr-1 md:text-[12px]">
+              {clinicAccesses.map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
+            </select>
+          </label>
+        )}
 
         {/* Language switcher — auto-translates the whole app */}
         <label className="hidden sm:inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-2 py-1.5" title="Language" data-no-translate>

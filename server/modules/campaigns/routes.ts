@@ -469,6 +469,23 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return previewAudience(request.auth.tenantId, type, query.channel, { branchId: request.auth.branchId });
   });
 
+  // Campaign-specific preview for the workspace detail pane. The campaign's
+  // stored branch is authoritative; an unrestricted tenant admin viewing a
+  // single-clinic campaign must not be shown a tenant-wide sample/count that
+  // differs from what approval and dispatch will use.
+  app.get('/campaigns/:id/audience-preview', { preHandler: [campaignEntityRead, crmRead, campaignFeature] }, async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const campaign = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request), archivedAt: null } });
+    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, campaign, 'read'))) return reply;
+    if (!campaign.audienceType) throw app.httpErrors.badRequest('Campaign has no audience type');
+    const audienceType = campaign.audienceType as AudienceType;
+    if (!(await isFeatureEnabled(request.auth.tenantId, AUDIENCE_FEATURE[audienceType]))) {
+      return reply.code(403).send({ error: 'feature_locked', feature: AUDIENCE_FEATURE[audienceType] });
+    }
+    return previewAudience(request.auth.tenantId, audienceType, channelEnum.parse(campaign.campaignChannel ?? 'sms'), { branchId: campaign.branchId ?? undefined });
+  });
+
   // ----- Approve ----------------------------------------------------------
   app.post('/campaigns/:id/approve', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);

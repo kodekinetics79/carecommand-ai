@@ -129,6 +129,10 @@ export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promis
   };
 
   const campaignsToDeploy: Array<{ tenantId: string; campaignId: string; ownerId: string }> = [];
+  const runnableTenantIds = new Set((await db.tenant.findMany({
+    where: { status: 'active' },
+    select: { id: true },
+  })).map(tenant => tenant.id));
 
   for (const [index, clinicId] of ctx.clinicIds.entries()) {
     const branchId = ctx.branchIds[index];
@@ -238,7 +242,15 @@ export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promis
     ] });
 
     const owner = ctx.userIds.find((userId, userIndex) => ctx.userTenant[userIndex] === tenantId);
-    if (owner) campaignsToDeploy.push({ tenantId, campaignId: campaign.id, ownerId: owner });
+    if (owner && runnableTenantIds.has(tenantId)) {
+      campaignsToDeploy.push({ tenantId, campaignId: campaign.id, ownerId: owner });
+    } else if (!runnableTenantIds.has(tenantId)) {
+      // PILOT and EDGE deliberately include suspended/cancelled tenants so
+      // access-denial behavior can be exercised. Seed their configuration,
+      // but do not invoke a production deploy path that correctly refuses to
+      // establish a trusted runtime context for a non-runnable tenant.
+      counts.notes.push(`campaign ${campaign.id} left in draft because tenant ${tenantId} is not active`);
+    }
   }
 
   // Providers, and then their hours. Peer sessions found the live demo tenant
@@ -260,11 +272,18 @@ export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promis
       data: {
         id: stableUuid('receptionist-provider-user', index),
         tenantId, role: 'PROVIDER', active: true,
+        branchId,
         email: `synthetic.receptionist.provider.${index + 1}@example.test`,
         displayName: `Synthetic Provider ${index + 1}`,
         createdAt: now, updatedAt: now,
       },
       select: { id: true },
+    });
+    await db.user.update({ where: { id: candidate.id }, data: { branchId } });
+    await db.userClinicAccess.upsert({
+      where: { tenantId_userId_branchId: { tenantId, userId: candidate.id, branchId } },
+      create: { tenantId, userId: candidate.id, branchId, isPrimary: true },
+      update: { tenantId, isPrimary: true },
     });
     await db.providerProfile.create({ data: {
       id: stableUuid('receptionist-provider', index),

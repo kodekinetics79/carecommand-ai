@@ -603,6 +603,9 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     }, async tx => {
       await tx.tenant.update({ where: { id: tenantId }, data: { status: tenantStatus } });
       await tx.tenantSubscription.updateMany({ where: { tenantId }, data: { status: subStatus } });
+      if (action === 'suspend') {
+        await tx.passwordResetToken.updateMany({ where: { tenantId, usedAt: null }, data: { usedAt: new Date() } });
+      }
       await recomputeEntitlements(tenantId, tx);
     });
     return { tenantId, status: tenantStatus };
@@ -1004,6 +1007,7 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     }, async tx => {
       await tx.tenant.update({ where: { id: tenantId }, data: { status: 'archived' } });
       await tx.tenantSubscription.updateMany({ where: { tenantId }, data: { status: 'CANCELLED' } });
+      await tx.passwordResetToken.updateMany({ where: { tenantId, usedAt: null }, data: { usedAt: new Date() } });
       await recomputeEntitlements(tenantId, tx);
     });
     return { tenantId, status: 'archived' };

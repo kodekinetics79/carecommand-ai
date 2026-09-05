@@ -13,6 +13,7 @@ import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
 import { runInTenantContext, runWithJobTenantContext } from '../lib/tenantContext';
 import { dispatchDueAppointmentConfirmations } from '../lib/receptionist/confirmationOutbox';
 import { reverifyExpiringAgents } from '../lib/receptionist/agentReverification';
+import { purgeDueReceptionistArtifacts } from '../lib/receptionist/privacyLifecycle';
 import {
   runReadinessRecalc,
   runEvidenceExpiry,
@@ -34,6 +35,7 @@ const COMPLIANCE_SCHEDULERS: Record<ComplianceJobName, string> = {
   'security-scan-placeholder': 'compliance-security-scan',
   'receptionist-confirmation-dispatch': 'receptionist-confirmation-dispatch',
   'receptionist-agent-reverify': 'receptionist-agent-reverify',
+  'receptionist-artifact-retention-purge': 'receptionist-artifact-retention-purge',
 };
 
 function isComplianceJobName(name: string): name is ComplianceJobName {
@@ -76,6 +78,15 @@ export async function runTenantComplianceJob(operation: ComplianceJobName, tenan
       await runInTenantContext(
         { tenantId, actorId: 'worker:receptionist-agent-reverify', actorRole: 'WORKER', source: 'worker' },
         async () => { await reverifyExpiringAgents(tenantId); },
+      );
+      break;
+    case 'receptionist-artifact-retention-purge':
+      // Like agent re-verification, this may make a provider HTTPS request.
+      // Keep the tenant fence without holding one database transaction open
+      // around the network call; each database operation remains RLS-scoped.
+      await runInTenantContext(
+        { tenantId, actorId: 'worker:receptionist-artifact-retention-purge', actorRole: 'WORKER', source: 'worker' },
+        async () => { await purgeDueReceptionistArtifacts(); },
       );
       break;
   }

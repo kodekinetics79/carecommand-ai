@@ -28,6 +28,7 @@
 import { createRequire } from 'node:module';
 import type { ReadableSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { env } from '../config/env';
+import { resolveReleaseIdentity } from './releaseIdentity';
 import { URL_SPAN_ATTRIBUTES, scrubUrlAttribute } from './spanRedaction';
 
 // This package is ESM ("type": "module"), so there is no global `require`.
@@ -99,7 +100,7 @@ export function startTracing(serviceName = env.OTEL_SERVICE_NAME): void {
   const nodeSdk: TracingSdk = new NodeSDK({
     resource: resourceFromAttributes({
       [ATTR_SERVICE_NAME]: serviceName,
-      [ATTR_SERVICE_VERSION]: env.RELEASE ?? '0.0.0',
+      [ATTR_SERVICE_VERSION]: resolveReleaseIdentity(env) ?? '0.0.0',
       'deployment.environment': env.SERVICE_ENV ?? env.NODE_ENV,
     }),
     // Redaction first, then batching/export — order matters.

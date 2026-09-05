@@ -8,6 +8,16 @@ vi.mock('../lib/api', async () => {
   const actual = await vi.importActual<typeof import('../lib/api')>('../lib/api');
   return { ...actual, apiRequest: apiRequestMock };
 });
+vi.mock('../hooks/useSession', () => ({
+  useSession: () => ({
+    user: {
+      id: 'user-1', email: 'manager@test.local', displayName: 'Manager', role: 'MANAGER', active: true,
+      tenant: { id: 'tenant-1', name: 'Test Clinic', slug: 'test-clinic' },
+      effectivePermissions: ['crm:read', 'crm:write'],
+    },
+    loading: false,
+  }),
+}));
 
 import { ApiError } from '../lib/api';
 import type { ApiReview } from '../lib/apiAdapters';
@@ -60,7 +70,7 @@ const REVIEWS: ApiReview[] = [
   },
 ];
 
-const BRANCHES = [{ id: 'branch-1', name: 'Riverside Clinic' }];
+const BRANCHES = [{ id: 'branch-1', name: 'Riverside Clinic' }, { id: 'branch-2', name: 'North Clinic' }];
 
 /**
  * `GET /v1/growth/policy`. The seven fields the reputation screens classify
@@ -216,6 +226,18 @@ describe('Reviews request volume', () => {
     // Five feeds, five requests. The policy is read once per mount like the
     // rest — it is not re-fetched per clinic row it bands.
     expect(apiRequestMock).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe('Reviews clinic filtering', () => {
+  it('distinguishes an empty selected clinic from an empty network-wide review feed', async () => {
+    respond = answerEverything;
+    renderPage();
+    await screen.findByText('Average rating');
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Review clinic filter' }), { target: { value: 'branch-2' } });
+    expect(screen.getByText('No reviews in the selected clinic')).toBeInTheDocument();
+    expect(screen.queryByText('No reviews recorded yet')).not.toBeInTheDocument();
   });
 });
 

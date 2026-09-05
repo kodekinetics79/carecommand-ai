@@ -9,15 +9,21 @@ import { formatCurrency } from '../utils/formatters';
 
 const statusColors: Record<string, { dot: string; text: string; bg: string }> = {
   Confirmed: { dot: 'bg-emerald-500', text: 'text-emerald-v', bg: 'badge badge-emerald' },
-  Pending:   { dot: 'bg-amber-400',   text: 'text-amber-v',   bg: 'badge badge-amber' },
+  'Needs confirmation': { dot: 'bg-amber-400', text: 'text-amber-v', bg: 'badge badge-amber' },
+  Arrived: { dot: 'bg-blue-500', text: 'text-blue-v', bg: 'badge badge-blue' },
+  'No-show': { dot: 'bg-red-500', text: 'text-red-v', bg: 'badge badge-red' },
+  Canceled: { dot: 'bg-slate-400', text: 'text-t3', bg: 'badge' },
+  Completed: { dot: 'bg-violet-500', text: 'text-violet-v', bg: 'badge badge-violet' },
+  Waitlist: { dot: 'bg-slate-400', text: 'text-t3', bg: 'badge' },
 };
 
 export default function Telehealth() {
   const navigate = useNavigate();
   const { data: sessions, source, loading, error: loadError } = useApiResource<ApiTelehealthSession, TelehealthSession>(
-    '/v1/telehealth/sessions?limit=100',
+    '/v1/telehealth/sessions?limit=100&page=true',
     [],
     mapTelehealthSession,
+    { allPages: true },
   );
 
   const intakeComplete = sessions.filter(s => s.intakeComplete).length;
@@ -29,13 +35,13 @@ export default function Telehealth() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Virtual Visit Booking"
-        subtitle="Virtual appointment and intake workflow status; clinical care occurs only with an authorized provider."
+        title="Video Appointments"
+        subtitle="Today’s video appointment records and pre-visit intake status. Video-room delivery and the clinical encounter remain in the clinic’s approved systems."
         badge={loadError ? 'Data unavailable' : metricsReady ? `${sessions.length} today` : 'Loading'}
         badgeColor={loadError ? 'red' : 'blue'}
         actions={
           <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
-            <Video className="w-4 h-4" /> Schedule virtual visit
+            <Video className="w-4 h-4" /> Schedule video appointment
           </button>
         }
       />
@@ -59,9 +65,13 @@ export default function Telehealth() {
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         {/* Session queue */}
-          <BentoCard title="Virtual Visit Schedule" subtitle="Today's stored appointment records · all providers">
+          <BentoCard title="Virtual Visit Schedule" subtitle="Today's accessible stored appointment records · current clinic scope">
             <div className="space-y-3">
-            {sessions.length === 0 ? (
+            {loadError ? (
+              <div className="rounded-2xl border border-dashed border-red-200 bg-red-50 px-4 py-6 text-center text-sm text-red-700">
+                Video appointment records are unavailable. Retry after the clinic service recovers.
+              </div>
+            ) : sessions.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-6 text-center text-sm text-t3">
                 No virtual-visit records are available for this clinic today.
               </div>
@@ -69,7 +79,7 @@ export default function Telehealth() {
               const sc = statusColors[session.status];
               return (
                 <div key={session.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
-                  session.status === 'Confirmed' ? 'border-[var(--b1)] bg-[var(--emerald-soft)]' : 'border-[var(--b1)] bg-[var(--amber-soft)]'
+                  session.status === 'Confirmed' ? 'border-[var(--b1)] bg-[var(--emerald-soft)]' : 'border-[var(--b1)] bg-[var(--s2)]'
                 }`}>
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex items-center gap-3">

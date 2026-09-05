@@ -6,8 +6,12 @@ import { requireRoles } from '../../plugins/roles';
 import { aiGateway, AiGatewayBlockedError } from '../../lib/ai/gateway';
 import { aiRecommendationService, aiUsageCostService } from '../../lib/ai/services';
 
-const readRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'PROVIDER');
-const manageRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
+// These legacy AI records and aggregate context carry tenant scope but no
+// branch authority column. Until branch provenance is durable on every row,
+// only tenant-wide roles may read or generate them; otherwise a provider or
+// clinic manager could infer another clinic's operations from counts/usage.
+const readRoles = requireRoles('OWNER', 'ADMIN');
+const manageRoles = requireRoles('OWNER', 'ADMIN');
 
 export const aiRoutes: FastifyPluginAsync = async app => {
   app.addHook('preHandler', readRoles);

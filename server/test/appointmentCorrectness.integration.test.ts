@@ -74,9 +74,12 @@ describe('appointment correctness — name, double-book, reschedule, DOB', () =>
     const row = list.json().data.find((a: { patientId: string }) => a.patientId === t.patientId);
     expect(row.patientName).toBe('Ada Lovelace');
     expect(row.patientName).not.toBe('Live DB Customer');
+    expect(row.providerName).toBe('Dr');
+    expect(row.providerName).not.toBe(t.providerId);
     // Detail read carries the name too.
     const detail = await app.inject({ method: 'GET', url: `/v1/appointments/${row.id}`, headers: staff(t) });
     expect(detail.json().patientName).toBe('Ada Lovelace');
+    expect(detail.json().providerName).toBe('Dr');
   });
 
   it('DB exclusion constraint stops concurrent double-book: one 201, one 409', async () => {

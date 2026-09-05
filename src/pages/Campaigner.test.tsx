@@ -10,6 +10,16 @@ vi.mock('../lib/api', async () => {
   const actual = await vi.importActual<typeof import('../lib/api')>('../lib/api');
   return { ...actual, apiRequest: apiRequestMock };
 });
+vi.mock('../hooks/useSession', () => ({
+  useSession: () => ({
+    user: {
+      id: 'user-1', email: 'owner@test.local', displayName: 'Owner', role: 'OWNER', active: true,
+      tenant: { id: 'tenant-1', name: 'Test Clinic', slug: 'test-clinic' },
+      effectivePermissions: ['campaign:read', 'campaign:manage', 'crm:read'],
+    },
+    loading: false,
+  }),
+}));
 
 import { ApiError } from '../lib/api';
 import type {
@@ -40,7 +50,7 @@ const KPI_LABELS = ['Recorded campaigns', 'Awaiting approval', 'Running'];
 
 function campaign(overrides: Partial<Campaign> = {}): Campaign {
   return {
-    id: 'campaign-1', name: 'Six-month recall',
+    id: 'campaign-1', branchId: null, name: 'Six-month recall',
     campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients',
     channel: 'sms', status: 'ACTIVE', requiresApproval: true,
     approvedByUserId: 'user-1', approvedAt: '2026-08-20T09:00:00.000Z', scheduledAt: null,
@@ -180,9 +190,10 @@ beforeEach(() => {
 /** Registers the reads a fully-loaded page performs. */
 function stubLoadedPage(rows: Campaign[] = CAMPAIGNS, attribution: CampaignAttributionSummary = NO_ATTRIBUTION) {
   handlers['GET /v1/crm/campaigns'] = () => rows;
-  handlers['GET /v1/crm/audiences/inactive_patients/preview?channel=sms'] = () => AUDIENCE_PREVIEW;
+  handlers['GET /v1/branches?limit=100'] = () => [{ id: 'branch-1', name: 'Riverside Clinic' }];
   handlers['GET /v1/crm/attribution/summary'] = () => attribution;
   for (const row of rows) {
+    handlers[`GET /v1/crm/campaigns/${row.id}/audience-preview`] = () => AUDIENCE_PREVIEW;
     handlers[`GET /v1/crm/campaigns/${row.id}/deliveries`] = () => [];
     handlers[`GET /v1/crm/campaigns/${row.id}/attribution`] = () => attributionDetail({ campaignId: row.id });
   }
@@ -299,7 +310,7 @@ describe('Campaigner portfolio state', () => {
     await new Promise(resolve => setTimeout(resolve, 40));
 
     expect(callsTo('GET', '/v1/crm/campaigns')).toHaveLength(1);
-    expect(callsTo('GET', '/v1/crm/audiences/inactive_patients/preview?channel=sms')).toHaveLength(1);
+    expect(callsTo('GET', '/v1/crm/campaigns/campaign-1/audience-preview')).toHaveLength(1);
     expect(callsTo('GET', '/v1/crm/campaigns/campaign-1/deliveries')).toHaveLength(1);
     // The two attribution reads are held to the same rule: one request per
     // endpoint per mount, however many times the page re-renders.
@@ -320,7 +331,7 @@ describe('Campaigner attribution honesty', () => {
     // The campaign list answers; attribution stays pending, so the tile is the
     // only thing still loading.
     handlers['GET /v1/crm/campaigns'] = () => CAMPAIGNS;
-    handlers['GET /v1/crm/audiences/inactive_patients/preview?channel=sms'] = () => AUDIENCE_PREVIEW;
+    handlers['GET /v1/crm/campaigns/campaign-1/audience-preview'] = () => AUDIENCE_PREVIEW;
     renderPage();
 
     await screen.findByText('Awaiting approval');
@@ -419,7 +430,7 @@ describe('Campaigner attribution honesty', () => {
 describe('Campaigner per-campaign outcomes', () => {
   it('shows the selected campaign\'s attributed outcomes and the reason there is no open rate', async () => {
     handlers['GET /v1/crm/campaigns'] = () => [RUNNING];
-    handlers['GET /v1/crm/audiences/inactive_patients/preview?channel=sms'] = () => AUDIENCE_PREVIEW;
+    handlers['GET /v1/crm/campaigns/campaign-1/audience-preview'] = () => AUDIENCE_PREVIEW;
     handlers['GET /v1/crm/attribution/summary'] = () => EVIDENCED_ATTRIBUTION;
     handlers['GET /v1/crm/campaigns/campaign-1/deliveries'] = () => [];
     handlers['GET /v1/crm/campaigns/campaign-1/attribution'] = () => EVIDENCED_DETAIL;
@@ -461,7 +472,7 @@ describe('Campaigner per-campaign outcomes', () => {
 
   it('prints no per-campaign outcome figure while the read is in flight or after it fails', async () => {
     handlers['GET /v1/crm/campaigns'] = () => [RUNNING];
-    handlers['GET /v1/crm/audiences/inactive_patients/preview?channel=sms'] = () => AUDIENCE_PREVIEW;
+    handlers['GET /v1/crm/campaigns/campaign-1/audience-preview'] = () => AUDIENCE_PREVIEW;
     handlers['GET /v1/crm/attribution/summary'] = () => NO_ATTRIBUTION;
     handlers['GET /v1/crm/campaigns/campaign-1/deliveries'] = () => [];
     // In flight.
@@ -622,7 +633,7 @@ describe('Campaigner governed workflow', () => {
 
   it('shows the audience and dispatch evidence, and refuses to imply either when it is missing', async () => {
     handlers['GET /v1/crm/campaigns'] = () => [RUNNING];
-    handlers['GET /v1/crm/audiences/inactive_patients/preview?channel=sms'] = () => {
+    handlers['GET /v1/crm/campaigns/campaign-1/audience-preview'] = () => {
       throw new ApiError(500, 'Audience preview failed', 'INTERNAL_SERVER_ERROR');
     };
     handlers['GET /v1/crm/campaigns/campaign-1/deliveries'] = () => {

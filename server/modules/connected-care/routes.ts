@@ -77,6 +77,24 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
     const patient = await db.patient.findFirst({ where: { id: input.patientId, tenantId, deletedAt: null }, select: { id: true, branchId: true } });
     if (!patient) throw app.httpErrors.notFound('Patient not found');
     assertBranchAccess(request, patient.branchId);
+    if (input.providerKey !== 'manual') {
+      const provider = await db.deviceProvider.findFirst({
+        where: {
+          tenantId,
+          providerKey: input.providerKey,
+          active: true,
+          status: { in: ['SANDBOX', 'ACTIVE'] },
+          webhookConfigured: true,
+        },
+        select: { id: true },
+      });
+      if (!provider) {
+        throw app.httpErrors.conflict('Configure and verify this device provider before enrolling a patient.');
+      }
+      if (input.programType === 'rpm' && !input.deviceId) {
+        throw app.httpErrors.badRequest('RPM enrollment requires the specific device assigned to the patient.');
+      }
+    }
     if (input.deviceId) {
       const device = await db.device.findFirst({ where: { id: input.deviceId, tenantId, active: true, OR: [{ branchId: patient.branchId }, { branchId: null }] }, select: { id: true } });
       if (!device) throw app.httpErrors.badRequest('Device is not active for this tenant and branch');

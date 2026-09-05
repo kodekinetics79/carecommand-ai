@@ -69,7 +69,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       db.patientResponsibilityEstimate.findFirst({ where: { tenantId, patientId }, orderBy: { createdAt: 'desc' }, select: { id: true, acknowledgedAt: true } }),
     ]);
 
-    const branchName = patient?.branchId ? (await db.branch.findUnique({ where: { id: patient.branchId }, select: { name: true } }))?.name ?? null : null;
+    const branch = patient?.branchId ? await db.branch.findUnique({ where: { id: patient.branchId }, select: { name: true, timezone: true } }) : null;
     const unpaidTotal = payments.reduce((s, p) => s + n(p.amount), 0);
     const insuranceStatus = safeInsuranceStatus(policy);
     const cards = {
@@ -83,7 +83,8 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     return {
       displayName: `${patient?.firstName ?? ''} ${patient?.lastName ?? ''}`.trim() || 'Patient',
       clinicName: tenant?.name ?? 'Your clinic',
-      branchName,
+      branchName: branch?.name ?? null,
+      clinicTimezone: branch?.timezone ?? 'UTC',
       cards,
       // No versioned clinic payment-policy artifact exists yet. Never represent
       // a legacy timestamp as acknowledgment of unknown text/version.
@@ -98,7 +99,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
   app.get('/appointments', async request => {
     const { tenantId, patientId } = request.portal!;
     const now = new Date();
-    const rows = await db.appointment.findMany({ where: { tenantId, patientId }, orderBy: { startsAt: 'desc' }, take: 50, select: { id: true, service: true, startsAt: true, endsAt: true, status: true, providerRef: true } });
+    const rows = await db.appointment.findMany({ where: { tenantId, patientId }, orderBy: { startsAt: 'desc' }, take: 50, select: { id: true, service: true, startsAt: true, endsAt: true, status: true, providerProfileId: true, branch: { select: { name: true, timezone: true } }, providerProfile: { select: { user: { select: { displayName: true } } } } } });
     return {
       upcoming: rows.filter(r => r.startsAt >= now && !['CANCELED', 'NO_SHOW'].includes(r.status)).map(safeAppt),
       past: rows.filter(r => r.startsAt < now || ['CANCELED', 'NO_SHOW'].includes(r.status)).slice(0, 20).map(safeAppt),
@@ -107,7 +108,14 @@ export const portalRoutes: FastifyPluginAsync = async app => {
   app.get('/appointments/:id', async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const { tenantId, patientId } = request.portal!;
-    const a = await db.appointment.findFirst({ where: { id, tenantId, patientId }, select: { id: true, service: true, startsAt: true, endsAt: true, status: true, providerRef: true } });
+    const a = await db.appointment.findFirst({
+      where: { id, tenantId, patientId },
+      select: {
+        id: true, service: true, startsAt: true, endsAt: true, status: true, providerProfileId: true,
+        branch: { select: { name: true, timezone: true } },
+        providerProfile: { select: { user: { select: { displayName: true } } } },
+      },
+    });
     if (!a) return reply.code(404).send({ error: 'not_found' });
     return safeAppt(a);
   });
@@ -115,8 +123,8 @@ export const portalRoutes: FastifyPluginAsync = async app => {
   // ===== Appointment requests (submit for staff review; idempotent) ======
   app.get('/appointment-requests', async request => {
     const { tenantId, patientId } = request.portal!;
-    const rows = await db.appointmentRequest.findMany({ where: { tenantId, patientId }, orderBy: { createdAt: 'desc' }, take: 30, select: { id: true, requestedService: true, requestedDateTime: true, status: true, createdAt: true } });
-    return rows.map(r => ({ id: r.id, service: r.requestedService, requestedDateTime: r.requestedDateTime?.toISOString() ?? null, status: r.status, createdAt: r.createdAt.toISOString() }));
+    const rows = await db.appointmentRequest.findMany({ where: { tenantId, patientId }, orderBy: { createdAt: 'desc' }, take: 30, select: { id: true, requestedService: true, requestedDateTime: true, status: true, createdAt: true, branch: { select: { name: true, timezone: true } } } });
+    return rows.map(r => ({ id: r.id, service: r.requestedService, requestedDateTime: r.requestedDateTime?.toISOString() ?? null, status: r.status, createdAt: r.createdAt.toISOString(), branchName: r.branch?.name ?? 'Your clinic', clinicTimezone: r.branch?.timezone ?? 'UTC' }));
   });
   app.post('/appointment-requests', async (request, reply) => {
     const { tenantId, patientId } = request.portal!;
@@ -148,17 +156,17 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const providers = await db.providerProfile.findMany({
       // Deactivated clinicians are off the schedule; never offer one to a patient.
       where: { tenantId, branchId: patient.branchId, active: true },
-      select: { id: true, specialty: true, rating: true, reviewCount: true, user: { select: { displayName: true } } },
+      select: { id: true, specialty: true, rating: true, reviewCount: true, branch: { select: { name: true, timezone: true } }, user: { select: { displayName: true } } },
       orderBy: { rating: 'desc' },
     });
     // Patient-safe fields only — no utilization/revenue/internal metrics.
-    return providers.map(p => ({ id: p.id, name: p.user.displayName, specialty: p.specialty, rating: n(p.rating), reviewCount: p.reviewCount }));
+    return providers.map(p => ({ id: p.id, name: p.user.displayName, specialty: p.specialty, rating: n(p.rating), reviewCount: p.reviewCount, branchName: p.branch.name, clinicTimezone: p.branch.timezone }));
   });
 
   async function loadBookableProvider(tenantId: string, patientId: string, providerId: string) {
     const patient = await db.patient.findUnique({ where: { id: patientId }, select: { branchId: true } });
     if (!patient) return null;
-    return db.providerProfile.findFirst({ where: { id: providerId, tenantId, branchId: patient.branchId, active: true }, select: { id: true, branchId: true } });
+    return db.providerProfile.findFirst({ where: { id: providerId, tenantId, branchId: patient.branchId, active: true }, select: { id: true, branchId: true, branch: { select: { name: true, timezone: true } }, user: { select: { displayName: true } } } });
   }
 
   app.get('/booking/providers/:providerId/slots', async (request, reply) => {
@@ -170,7 +178,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const service = await resolveSchedulingService({ tenantId, serviceCatalogItemId, service: serviceName, fallbackDurationMin: durationMin });
     if (!service) return reply.code(400).send({ error: 'invalid_service' });
     const slots = await computeProviderSlots({ tenantId, providerProfileId: providerId, dateISO: date, durationMin: service.durationMin });
-    return { providerId, date, slots: slots.map(s => ({ startsAt: s.startsAt.toISOString(), endsAt: s.endsAt.toISOString() })) };
+    return { providerId, date, branchName: provider.branch.name, clinicTimezone: provider.branch.timezone, slots: slots.map(s => ({ startsAt: s.startsAt.toISOString(), endsAt: s.endsAt.toISOString() })) };
   });
 
   app.post('/booking/providers/:providerId/book', async (request, reply) => {
@@ -229,7 +237,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     }
     if ('conflict' in result) return reply.code(409).send({ error: 'slot_unavailable', reason: result.conflict });
 
-    return reply.code(201).send(safeAppt(result.appointment));
+    return reply.code(201).send(safeAppt({ ...result.appointment, branch: provider.branch, providerProfile: { user: { displayName: provider.user.displayName } } }));
   });
 
   // ===== Self cancel / reschedule =========================================
@@ -313,7 +321,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
 
     // Conflict-safe move: in-transaction check excludes self; the DB exclusion
     // constraint is the final guard against a concurrent booking racing in.
-    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.update>> };
+    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: PortalSafeAppointment };
     try {
       result = await db.$transaction(async tx => {
         if (appt.providerProfileId) {
@@ -325,7 +333,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
           data: { startsAt: body.startsAt, endsAt, service: service.name, serviceCatalogItemId: service.id },
         });
         if (changed.count !== 1) return { conflict: 'already_booked' as const };
-        const appointment = await tx.appointment.findUniqueOrThrow({ where: { id } });
+        const appointment = await tx.appointment.findUniqueOrThrow({ where: { id }, select: { id: true, service: true, startsAt: true, endsAt: true, status: true, providerProfileId: true, branch: { select: { name: true, timezone: true } }, providerProfile: { select: { user: { select: { displayName: true } } } } } });
         await portalAudit(tenantId, 'portal.appointment.rescheduled', id, request, { startsAt: body.startsAt.toISOString() }, { critical: true, tx });
         return { appointment } as const;
       });
@@ -650,8 +658,28 @@ export const portalRoutes: FastifyPluginAsync = async app => {
 };
 
 // ---- helpers ---------------------------------------------------------------
-function safeAppt(a: { id: string; service: string; startsAt: Date; endsAt: Date; status: string; providerRef: string | null }) {
-  return { id: a.id, service: a.service, startsAt: a.startsAt.toISOString(), endsAt: a.endsAt.toISOString(), status: a.status, provider: a.providerRef };
+type PortalSafeAppointment = {
+  id: string;
+  service: string;
+  startsAt: Date;
+  endsAt: Date;
+  status: string;
+  providerProfileId: string | null;
+  providerProfile?: { user: { displayName: string } } | null;
+  branch: { name: string; timezone: string };
+};
+function safeAppt(a: PortalSafeAppointment) {
+  return {
+    id: a.id,
+    service: a.service,
+    startsAt: a.startsAt.toISOString(),
+    endsAt: a.endsAt.toISOString(),
+    status: a.status,
+    providerProfileId: a.providerProfileId,
+    providerName: a.providerProfile?.user.displayName ?? null,
+    branchName: a.branch.name,
+    clinicTimezone: a.branch.timezone,
+  };
 }
 function isPolicyRangeConflict(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;

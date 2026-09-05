@@ -134,7 +134,11 @@ const baseEnvSchema = z.object({
   PASSWORD_MIN_LENGTH: z.coerce.number().int().min(8).max(128).default(8),
   AUTH_LOCKOUT_THRESHOLD: z.coerce.number().int().min(1).max(50).default(5),
   AUTH_LOCKOUT_DURATION_MINUTES: z.coerce.number().int().min(1).max(1440).default(15),
-  PASSWORD_RESET_TTL_MINUTES: z.coerce.number().int().min(5).max(1440).default(60),
+  PASSWORD_RESET_TTL_MINUTES: z.coerce.number().int().min(5).max(1440).default(30),
+  // Canonical tenant-app origin used in authentication emails. It is optional
+  // so an unconfigured deployment can still boot, but password-reset delivery
+  // fails closed unless production supplies a public HTTPS origin.
+  PUBLIC_APP_URL: z.string().url().optional(),
   MFA_ISSUER: z.string().default('CareCommand AI'),
   CORS_ORIGINS: z.string().default('http://localhost:12000'),
   // Auth cookie SameSite policy. Use 'lax' for same-origin deploys; set 'none'
@@ -151,6 +155,11 @@ const baseEnvSchema = z.object({
   SENTRY_TRACES_SAMPLE_RATE: z.coerce.number().min(0).max(1).default(0),
   SERVICE_ENV: z.string().optional(),
   RELEASE: z.string().optional(),
+  // Hosting platforms supply the immutable deployed commit at build/runtime.
+  // Keep RELEASE as an explicit override, but never report "unknown" when the
+  // process host has already provided its own source identity.
+  RENDER_GIT_COMMIT: z.string().optional(),
+  VERCEL_GIT_COMMIT_SHA: z.string().optional(),
   // Logical service name stamped on traces/metrics/logs so the API and worker
   // are distinguishable in one backend. Overridden per-process where needed.
   OTEL_SERVICE_NAME: z.string().default('carecommand-api'),
@@ -215,6 +224,7 @@ const baseEnvSchema = z.object({
   TWILIO_BASE_URL: z.string().url().default('https://api.twilio.com'),
   // Optional HTTP email API (e.g. SendGrid) so email can really send without an
   // SMTP TCP library. If unset, email stays configured_pending_provider.
+  EMAIL_HTTP_PROVIDER: z.enum(['generic', 'sendgrid']).default('generic'),
   EMAIL_HTTP_API_URL: z.string().url().optional(),
   EMAIL_HTTP_API_KEY: z.string().optional(),
   EMAIL_FROM_ADDRESS: z.string().optional(),
@@ -474,6 +484,15 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
         'PUBLIC_API_URL',
         `${cfg.DEPLOYMENT_PROFILE} deployments require a non-loopback HTTPS PUBLIC_API_URL for signed callbacks.`,
       );
+    }
+    if (!cfg.PUBLIC_APP_URL || !isPublicHttpsOrigin(cfg.PUBLIC_APP_URL)) {
+      addProfileIssue(
+        'PUBLIC_APP_URL',
+        `${cfg.DEPLOYMENT_PROFILE} deployments require the exact public HTTPS tenant-app origin for password recovery.`,
+      );
+    }
+    if (cfg.PASSWORD_RESET_TTL_MINUTES > 60) {
+      addProfileIssue('PASSWORD_RESET_TTL_MINUTES', `${cfg.DEPLOYMENT_PROFILE} password-reset links must expire within 60 minutes.`);
     }
     const origins = cfg.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean);
     if (origins.length === 0 || origins.some(origin => !isPublicHttpsOrigin(origin))) {

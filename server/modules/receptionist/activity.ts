@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
@@ -799,6 +799,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
   // carries no raw phone and no recording URL — both are detail-route only.
   const callLogQuery = z.object({
     clinicId: uuid.optional(),
+    branchId: uuid.optional(),
     campaignId: uuid.optional(),
     direction: z.enum(['inbound', 'outbound']).optional(),
     outcome: csvEnum(['IN_PROGRESS', 'BOOKED', 'NOT_INTERESTED', 'NO_ANSWER', 'VOICEMAIL', 'ESCALATED', 'OPTED_OUT', 'FAILED'] as const).optional(),
@@ -811,10 +812,27 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     limit: z.coerce.number().int().min(1).max(100).default(50),
   });
 
+  // A receptionist clinic can serve more than one physical branch. The call
+  // log does not yet carry immutable per-call location attribution, so a
+  // `locations.some(branchId)` filter is not sufficient: it would return every
+  // call on a shared line to users assigned to either branch. Until call-level
+  // attribution exists, fail closed and expose a line in branch scope only
+  // when every configured location belongs to that branch. Tenant-wide reads
+  // remain available to users whose authorization is tenant-wide.
+  function exclusiveBranchCallScope(branchId: string): Prisma.ReceptionistCallLogWhereInput {
+    return {
+      AND: [
+        { clinic: { locations: { some: { branchId } } } },
+        { clinic: { locations: { every: { branchId } } } },
+      ],
+    };
+  }
+
   function callLogWhere(tenantId: string, query: z.infer<typeof callLogQuery>) {
     return {
       tenantId,
       ...(query.clinicId ? { clinicId: query.clinicId } : {}),
+      ...(query.branchId ? exclusiveBranchCallScope(query.branchId) : {}),
       ...(query.campaignId ? { campaignId: query.campaignId } : {}),
       ...(query.direction ? { direction: query.direction } : {}),
       ...(query.outcome ? { outcome: { in: query.outcome } } : {}),
@@ -827,8 +845,16 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     } satisfies Prisma.ReceptionistCallLogWhereInput;
   }
 
+  function authenticatedCallLogScope(request: FastifyRequest): Prisma.ReceptionistCallLogWhereInput {
+    return request.auth.branchId
+      ? exclusiveBranchCallScope(request.auth.branchId)
+      : {};
+  }
+
   app.get('/call-logs', { preHandler: callArtifactRead }, async request => {
-    const query = callLogQuery.parse(request.query);
+    const parsed = callLogQuery.parse(request.query);
+    if (parsed.branchId) assertBranchAccess(request, parsed.branchId);
+    const query = { ...parsed, branchId: request.auth.branchId ?? parsed.branchId };
     const rows = await db.receptionistCallLog.findMany({
       where: callLogWhere(request.auth.tenantId, query),
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -836,6 +862,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       skip: query.cursor ? 1 : 0,
       take: query.limit + 1,
       include: {
+        clinic: { select: { id: true, name: true } },
         campaign: { select: { id: true, name: true } },
         patient: { select: { id: true, firstName: true, lastName: true, humanOnly: true } },
         appointments: { select: { id: true }, take: 1, orderBy: { createdAt: 'desc' } },
@@ -853,6 +880,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       data: page.data.map(row => ({
         id: row.id,
         clinicId: row.clinicId,
+        clinic: row.clinic,
         campaign: row.campaign,
         // Was `retellCallId: row.retellCallId` — the supplier's name in the
         // field and the UNMASKED provider call id in the value, on a list
@@ -889,7 +917,9 @@ export const activityRoutes: FastifyPluginAsync = async app => {
 
   // Counts for the queue header. Same filters, no rows, no PHI.
   app.get('/call-logs/summary', { preHandler: callArtifactRead }, async request => {
-    const query = callLogQuery.parse(request.query);
+    const parsed = callLogQuery.parse(request.query);
+    if (parsed.branchId) assertBranchAccess(request, parsed.branchId);
+    const query = { ...parsed, branchId: request.auth.branchId ?? parsed.branchId };
     const where = callLogWhere(request.auth.tenantId, query);
     const [unreviewed, openHandoffs, inbound, outbound, booked, pendingRequests] = await Promise.all([
       db.receptionistCallLog.count({ where: { ...where, reviewStatus: 'UNREVIEWED' } }),
@@ -901,7 +931,12 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         where: {
           tenantId: request.auth.tenantId,
           status: { in: [...PENDING_REQUEST_STATUS] },
-          ...(query.clinicId ? { callLog: { clinicId: query.clinicId } } : {}),
+          ...(query.clinicId || query.branchId ? {
+            callLog: {
+              ...(query.clinicId ? { clinicId: query.clinicId } : {}),
+              ...(query.branchId ? exclusiveBranchCallScope(query.branchId) : {}),
+            },
+          } : {}),
         },
       }),
     ]);
@@ -914,7 +949,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
   app.get('/call-logs/:id', { preHandler: callArtifactRead }, async request => {
     const { id } = idParam.parse(request.params);
     const row = await db.receptionistCallLog.findFirst({
-      where: { id, tenantId: request.auth.tenantId },
+      where: { id, tenantId: request.auth.tenantId, ...authenticatedCallLogScope(request) },
       include: {
         campaign: { select: { id: true, name: true } },
         reviewedBy: { select: { id: true, displayName: true } },
@@ -1021,7 +1056,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     const input = humanOnlyInput.parse(request.body);
     return runWithTenantContext(request.auth.tenantId, async tx => {
       const call = await tx.receptionistCallLog.findFirst({
-        where: { id, tenantId: request.auth.tenantId },
+        where: { id, tenantId: request.auth.tenantId, ...authenticatedCallLogScope(request) },
         select: { id: true, patientId: true, callerPhone: true },
       });
       if (!call) throw app.httpErrors.notFound('Call log not found');
@@ -1090,7 +1125,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
 
     const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
       const current = await tx.receptionistCallLog.findFirst({
-        where: { id, tenantId: request.auth.tenantId },
+        where: { id, tenantId: request.auth.tenantId, ...authenticatedCallLogScope(request) },
         select: { id: true, reviewRevision: true, reviewStatus: true, operationalNotes: true, unresolvedActionItems: true },
       });
       if (!current) throw app.httpErrors.notFound('Call log not found');

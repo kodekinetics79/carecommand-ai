@@ -1,285 +1,199 @@
-import { lazy, Suspense, useState } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import {
-  CalendarDays, Users, AlertCircle, Phone, Coins, Globe, Gauge, LineChart, BarChart3, MapPin, TrendingUp,
+  ArrowRight, Building2, CalendarClock, CheckCircle2,
+  CircleDot, Clock3, Database, ExternalLink, Info,
+  ShieldCheck, Signal, UserRound,
 } from 'lucide-react';
-import { usePreferences, CURRENCIES, LANGUAGES } from '../lib/preferences';
-import BentoCard from '../components/ui/BentoCard';
-import ResourceSection from '../components/ui/ResourceSection';
-import CommandDeck from '../components/dashboard/CommandDeck';
-import StatTile from '../components/dashboard/StatTile';
-import PriorityActionRail from '../components/dashboard/PriorityActionRail';
-import ActionDrawer from '../components/dashboard/ActionDrawer';
-import BranchHealthCard from '../components/dashboard/BranchHealthCard';
-import CampaignROIPanel from '../components/dashboard/CampaignROIPanel';
 import { apiRequest } from '../lib/api';
-import type { CampaignHandoff } from '../lib/crm';
-import { receivedData } from '../lib/resourceState';
+import { canOpenPath, hasPermission } from '../lib/access';
+import { dashboardService, type BranchHealth, type PriorityAction } from '../lib/dashboardService';
+import { useBackendHealth } from '../hooks/useBackendHealth';
 import { useResource } from '../hooks/useResource';
 import { useSession } from '../hooks/useSession';
-import { hasPermission } from '../lib/access';
-import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../lib/apiAdapters';
-import RevenueChart, { type RevenueChartRow } from '../components/charts/RevenueChart';
-import {
-  dashboardService,
-  type DashboardSummary, type BranchHealth, type ProviderUtilization, type CampaignROI, type PriorityAction,
-} from '../lib/dashboardService';
+import { receivedData } from '../lib/resourceState';
 
-// Heavy panels are code-split so they don't bloat the route bundle.
-const ProviderUtilizationPanel = lazy(() => import('../components/dashboard/ProviderUtilizationPanel'));
+type CapabilityState = 'available' | 'test_data' | 'not_set_up';
 
-// Module-scope loaders: useResource keys a request by the identity of its
-// source, so these must not be re-created on every render.
+interface TenantCapability {
+  key: 'eligibility_checks' | 'card_payments';
+  label: string;
+  state: CapabilityState;
+  detail: string;
+  usable: boolean;
+}
+
 const loadSummary = () => dashboardService.getSummary();
-const loadBranchHealth = () => dashboardService.getBranchHealth();
-const loadProviderUtilization = () => dashboardService.getProviderUtilization();
-const loadCampaignROI = () => dashboardService.getCampaignROI();
-const loadPriorityActions = () => dashboardService.getPriorityActions();
-const loadRevenueSnapshots = async (signal: AbortSignal): Promise<RevenueChartRow[]> => {
-  const response = await apiRequest<ApiRevenueSnapshot[] | { data: ApiRevenueSnapshot[] }>('/v1/revenue-snapshots?limit=100', { signal });
-  return (Array.isArray(response) ? response : response.data).map(mapRevenueSnapshot);
+const loadBranches = () => dashboardService.getBranchHealth();
+const loadActions = () => dashboardService.getPriorityActions();
+const loadCapabilities = () => apiRequest<TenantCapability[]>('/v1/capabilities');
+
+const severityRank: Record<PriorityAction['severity'], number> = { critical: 0, high: 1, medium: 2, low: 3 };
+const categoryLabel: Record<PriorityAction['category'], string> = {
+  revenue: 'Revenue', no_shows: 'Schedule', missed_calls: 'Call', insurance: 'Eligibility',
+  payments: 'Payment', device_alerts: 'Monitoring', reputation: 'Reputation',
 };
 
-/**
- * Dashboard — single-viewport cockpit. On desktop everything fits one screen
- * (the page never scrolls); dense lists scroll inside their own panels. Below
- * xl it degrades to a normal stacked page.
- *
- * Every panel owns its own request state, so a failed panel says which feed
- * failed and offers a retry while its neighbours keep working. No panel prints
- * a figure, an average or an empty queue that it did not actually receive.
- */
+function ageLabel(dueDate: string | null): { label: string; tone: 'critical' | 'warning' | 'neutral' } {
+  if (!dueDate) return { label: 'No due time', tone: 'neutral' };
+  const due = new Date(dueDate).getTime();
+  if (!Number.isFinite(due)) return { label: 'Due time unavailable', tone: 'neutral' };
+  const minutes = Math.round((due - Date.now()) / 60000);
+  if (minutes < 0) return { label: `${Math.abs(minutes)}m overdue`, tone: 'critical' };
+  if (minutes <= 30) return { label: `${minutes}m remaining`, tone: 'warning' };
+  if (minutes < 1440) return { label: `Due in ${Math.round(minutes / 60)}h`, tone: 'neutral' };
+  return { label: new Date(dueDate).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }), tone: 'neutral' };
+}
+
+function freshnessLabel(generatedAt?: string): string {
+  if (!generatedAt) return 'Freshness unavailable';
+  const updated = new Date(generatedAt).getTime();
+  if (!Number.isFinite(updated)) return 'Freshness unavailable';
+  const minutes = Math.max(0, Math.round((Date.now() - updated) / 60000));
+  if (minutes < 1) return 'Updated just now';
+  if (minutes < 60) return `Updated ${minutes}m ago`;
+  if (minutes < 1440) return `Updated ${Math.round(minutes / 60)}h ago`;
+  return `Updated ${new Date(updated).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
+}
+
+function capabilityStatus(state: CapabilityState): { label: string; tone: string } {
+  if (state === 'available') return { label: 'Live', tone: 'live' };
+  if (state === 'test_data') return { label: 'Test data', tone: 'test' };
+  return { label: 'Not configured', tone: 'off' };
+}
+
 export default function Dashboard() {
   const navigate = useNavigate();
-  const [drawerAction, setDrawerAction] = useState<PriorityAction | null>(null);
-
-  // What this user is allowed to be shown. Each panel below asks an endpoint
-  // guarded by a specific grant, and the cockpit used to ask for all of them
-  // regardless: FRONT_DESK, PROVIDER and AUDITOR each collected fourteen 403s
-  // on their landing page, every visit, while the UI quietly swallowed them.
-  //
-  // A panel a role can never fill is HIDDEN rather than shown refused. Four
-  // permanent "your role does not have access" boxes are not information, they
-  // are furniture — and the same reasoning the navigation registry already
-  // applies to doors ("an entry they lack is hidden outright") applies to the
-  // panels behind them.
-  //
-  // Until the session resolves we do not know, so nothing is asked yet and the
-  // panels read as loading. The API remains the enforcement point: this only
-  // stops us asking questions we know the answer to.
+  const apiReady = useBackendHealth();
   const { user, loading: sessionLoading } = useSession();
   const knowsUser = !sessionLoading;
   const canSeeRevenue = knowsUser && hasPermission(user, 'revenue:read');
   const canSeeStaff = knowsUser && hasPermission(user, 'staff:read');
-  const canSeeCampaigns = knowsUser && hasPermission(user, 'campaign:read');
 
-  const summary = useResource<DashboardSummary>(loadSummary);
-  const branches = useResource<BranchHealth[]>(loadBranchHealth, { enabled: canSeeStaff });
-  const providers = useResource<ProviderUtilization[]>(loadProviderUtilization, { enabled: canSeeStaff });
-  const campaigns = useResource<CampaignROI[]>(loadCampaignROI, { enabled: canSeeCampaigns });
-  const actions = useResource<PriorityAction[]>(loadPriorityActions, { enabled: canSeeRevenue });
-  // One snapshots fetch feeds both the deck sparkline and the revenue chart.
-  const snapshots = useResource<RevenueChartRow[]>(loadRevenueSnapshots, { enabled: canSeeRevenue });
+  const summary = useResource(loadSummary);
+  const branches = useResource<BranchHealth[]>(loadBranches, { enabled: canSeeStaff });
+  const actions = useResource<PriorityAction[]>(loadActions, { enabled: canSeeRevenue });
+  const capabilities = useResource<TenantCapability[]>(loadCapabilities);
 
-  // The sparkline hides below two points, so an unavailable feed reads as an
-  // absent sparkline rather than a flat line that was never measured.
-  const snapshotRows = receivedData(snapshots.state) ?? [];
-  const spark = [...snapshotRows]
-    .sort((a, b) => (a.periodTs ?? 0) - (b.periodTs ?? 0))
-    .map(s => ({ label: s.month, value: s.revenue }));
+  useEffect(() => {
+    const previous = document.title;
+    document.title = 'Today | CareCommand AI';
+    return () => { document.title = previous; };
+  }, []);
 
-  const receivedSummary = receivedData(summary.state);
-  const reportDate = receivedSummary ? new Date(receivedSummary.generatedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
-
-  const receivedBranches = receivedData(branches.state);
-  const avgHealth = receivedBranches && receivedBranches.length > 0
-    ? Math.round(receivedBranches.reduce((s, b) => s + b.healthScore, 0) / receivedBranches.length)
-    : null;
-
-  const openCta = (a: PriorityAction) => navigate(a.cta.route);
-  // Every route into the campaign workspace carries where the decision was
-  // made (and, when one CTA honestly implies it, the goal) — never an empty
-  // navigation that asks the user to repeat themselves one screen later.
-  const openCampaigns = (handoff: CampaignHandoff) => navigate('/campaigns', { state: handoff });
+  const summaryData = receivedData(summary.state);
+  const branchRows = receivedData(branches.state) ?? [];
+  const actionRows = [...(receivedData(actions.state) ?? [])]
+    .sort((a, b) => severityRank[a.severity] - severityRank[b.severity])
+    .slice(0, 8);
+  const capabilityRows = receivedData(capabilities.state) ?? [];
+  const generatedAt = summaryData?.generatedAt;
+  const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local timezone';
+  const syntheticWorkspace = !!user && (
+    /(^|[-_])(demo|synthetic|test)([-_]|$)/i.test(user.tenant.slug)
+    || user.email.endsWith('.local')
+    || user.email.endsWith('@example.test')
+  );
+  const canOpenProof = canOpenPath(user, '/compliance');
 
   return (
-    <div className="dash-cockpit animate-fade-up">
-      {/* Context bar — date + display preferences. Actions live in the deck. */}
-      <div className="dash-bar flex flex-wrap items-center justify-between gap-2">
-        <p className="text-[12.5px] text-t3">{reportDate ? `Network overview · updated ${reportDate}` : 'Network overview'}</p>
-        <CurrencyLanguagePicker />
+    <section className="today-workspace" aria-labelledby="today-heading">
+      <div className="today-scope" aria-label="Active workspace scope">
+        <ScopeChip icon={<Building2 />} value={user?.tenant.name ?? 'Clinic network'} label="Network scope" />
+        <ScopeChip icon={<Clock3 />} value={localTimezone} label="Browser timezone" />
+        <ScopeChip className="today-scope-clinics" icon={<Database />} value={branchRows.length > 0 ? `All ${branchRows.length} clinics` : user?.branch?.name ?? 'Accessible clinics'} label="Clinic coverage" />
       </div>
 
-      {/* Command deck — hero band */}
-      <div className="dash-deck">
-        <ResourceSection
-          label="Dashboard summary"
-          state={summary.state}
-          onRetry={summary.reload}
-          loading={<div className="skeleton-line h-full min-h-[132px] rounded-2xl" />}
-        >
-          {data => <CommandDeck summary={data} spark={spark} onNavigate={navigate} />}
-        </ResourceSection>
-      </div>
+      <header className="today-heading-row">
+        <div>
+          <h1 id="today-heading">Operational Briefing</h1>
+          <p>{new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())} · {user?.tenant.name ?? 'Clinic workspace'}</p>
+        </div>
+        <div className={`today-data-state ${syntheticWorkspace ? 'is-synthetic' : 'is-live'}`}><CircleDot aria-hidden="true" />{syntheticWorkspace ? 'Synthetic data' : 'Tenant data'}</div>
+      </header>
 
-      {/* KPI ribbon */}
-      <div className="dash-kpis grid gap-2.5 grid-cols-2 lg:grid-cols-4">
-        <ResourceSection
-          label="Today's key figures"
-          state={summary.state}
-          onRetry={summary.reload}
-          className="col-span-full"
-          loading={<>{[0, 1, 2, 3].map(i => <div key={i} className="skeleton-line h-[92px] rounded-xl" />)}</>}
-        >
-          {data => (
-            <>
-              <StatTile label="Today's appointments" value={data.todaysAppointments} subtitle="Across your scope" icon={<CalendarDays className="w-4 h-4" />} accent="blue" onClick={() => navigate('/scheduling')} />
-              <StatTile label="Active patients" value={data.activeCustomers} subtitle="Engaged base" icon={<Users className="w-4 h-4" />} accent="cyan" onClick={() => navigate('/patients')} />
-              <StatTile label="No-show flags" value={data.noShowRisk} subtitle="Appointments flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" onClick={() => navigate('/scheduling')} />
-              <StatTile label="Call conversations with staff reply evidence" value={data.callsRecovered}
-                format={n => `${Math.round(n)}/${data.callsRecovered + data.missedCalls}`}
-                meter={data.callsRecovered + data.missedCalls > 0 ? data.callsRecovered / (data.callsRecovered + data.missedCalls) : 0}
-                subtitle="Provider-accepted staff replies / accepted + unread; delivery not implied" icon={<Phone className="w-4 h-4" />} accent="amber" onClick={() => navigate('/ai-receptionist')} />
-            </>
-          )}
-        </ResourceSection>
-      </div>
+      <section className="today-brief" aria-labelledby="attention-heading">
+        <div className="today-brief-head">
+          <div>
+            <h2 id="attention-heading">{briefHeading(canSeeRevenue, actions.state.status, actionRows.length)}</h2>
+          </div>
+          <span className="today-freshness"><Info aria-hidden="true" /> {freshnessLabel(generatedAt)}</span>
+        </div>
+        <div className="today-priority-grid">
+          {canSeeRevenue && actions.state.status === 'loading' && [0, 1, 2].map(index => <div key={index} className="today-priority skeleton" aria-hidden="true" />)}
+          {canSeeRevenue && actions.state.status === 'error' && <StateMessage error actionLabel="Try again" onAction={actions.reload}>Priority actions could not be loaded.</StateMessage>}
+          {canSeeRevenue && actions.state.status === 'ready' && actionRows.length === 0 && <StateMessage icon={<CheckCircle2 />}>The priority feed loaded and contains no recorded actions.</StateMessage>}
+          {canSeeRevenue && actionRows.slice(0, 3).map((action, index) => <PriorityBrief key={action.id} action={action} index={index + 1} canOpen={canOpenPath(user, action.cta.route)} onOpen={() => navigate(action.cta.route)} />)}
+          {!canSeeRevenue && <StateMessage icon={<ShieldCheck />} actionLabel={canOpenPath(user, '/front-desk') ? 'Open Work Queue' : undefined} onAction={() => navigate('/front-desk')}>This briefing does not request revenue data your role cannot read.</StateMessage>}
+        </div>
+      </section>
 
-      {/* Visualization row — money + capacity. A row whose every panel is
-          withheld is removed rather than left as an empty band. */}
-      {(!knowsUser || canSeeRevenue || canSeeStaff) && (
-      <div className="dash-viz">
-        {(!knowsUser || canSeeRevenue) && (
-        <BentoCard className="cockpit-card" title="Revenue snapshot trend" subtitle="Recorded revenue and associated-value fields"
-          headerRight={<LineChart className="w-4 h-4 text-violet-v" aria-hidden="true" />}>
-          <ResourceSection
-            label="Revenue snapshots"
-            state={snapshots.state}
-            onRetry={snapshots.reload}
-            loading={<div className="skeleton-line h-full min-h-[150px] rounded-xl" />}
-            empty={{
-              icon: <TrendingUp className="w-5 h-5" />,
-              title: 'No revenue snapshots recorded',
-              description: 'The snapshot feed loaded successfully and this workspace has no recorded revenue snapshots yet.',
-            }}
-          >
-            {rows => <RevenueChart data={rows} fitParent />}
-          </ResourceSection>
-        </BentoCard>
+      <section className="today-ledger" aria-labelledby="ledger-heading">
+        <div className="today-section-head">
+          <div><h2 id="ledger-heading">Live work ledger</h2><p>Recorded priorities with source, ownership, due state and evidence freshness.</p></div>
+          {canSeeRevenue && <button type="button" className="today-secondary-action" onClick={() => navigate('/opportunities')}>View full work queue <ArrowRight aria-hidden="true" /></button>}
+        </div>
+        {canSeeRevenue && actions.state.status === 'loading' && <div className="today-ledger-loading skeleton" aria-label="Loading work ledger" />}
+        {canSeeRevenue && actions.state.status === 'error' && <StateMessage error actionLabel="Retry" onAction={actions.reload}>The work ledger could not be loaded.</StateMessage>}
+        {canSeeRevenue && actions.state.status === 'ready' && actionRows.length === 0 && <StateMessage>The priority feed loaded successfully and contains no recorded work.</StateMessage>}
+        {canSeeRevenue && actionRows.length > 0 && (
+          <div className="today-ledger-table" role="table" aria-label="Current operational priorities">
+            <div className="today-ledger-header" role="row"><span role="columnheader">Scope</span><span role="columnheader">Work item / context</span><span role="columnheader">Source</span><span role="columnheader">Owner</span><span role="columnheader">SLA / due</span><span role="columnheader">Evidence / freshness</span><span role="columnheader">Next action</span></div>
+            {actionRows.slice(0, 5).map(action => <LedgerRow key={action.id} action={action} freshness={freshnessLabel(action.updatedAt ?? undefined)} canOpen={canOpenPath(user, action.cta.route)} onOpen={() => navigate(action.cta.route)} />)}
+            <div className="today-ledger-footer">
+              <span>1–{Math.min(5, actionRows.length)} of {actionRows.length}</span>
+              {actionRows.length > 5 && <button type="button" onClick={() => navigate('/opportunities')}>View remaining {actionRows.length - 5} <ArrowRight aria-hidden="true" /></button>}
+            </div>
+          </div>
         )}
-        {(!knowsUser || canSeeStaff) && (
-        <BentoCard className="cockpit-card" title="Provider Capacity" subtitle="Recorded utilization, ordered highest to lowest"
-          headerRight={<Gauge className="w-4 h-4 text-indigo" aria-hidden="true" />}>
-          <ResourceSection
-            label="Provider capacity"
-            state={providers.state}
-            onRetry={providers.reload}
-            loading={<div className="skeleton-line h-full min-h-[140px] rounded-xl" />}
-            empty={{
-              icon: <Gauge className="w-5 h-5" />,
-              title: 'No providers recorded',
-              description: 'The provider feed loaded successfully and this workspace has no provider utilization records.',
-            }}
-          >
-            {rows => (
-              <Suspense fallback={<div className="skeleton-line h-full min-h-[140px] rounded-xl" />}>
-                <ProviderUtilizationPanel providers={rows} />
-              </Suspense>
-            )}
-          </ResourceSection>
-        </BentoCard>
-        )}
-      </div>
-      )}
+        {!canSeeRevenue && <StateMessage>This ledger stays hidden because your current role does not include the underlying revenue records.</StateMessage>}
+      </section>
 
-      {/* Operations row — locations + growth */}
-      {(!knowsUser || canSeeStaff || canSeeCampaigns) && (
-      <div className="dash-ops">
-        {(!knowsUser || canSeeStaff) && (
-        <BentoCard className="cockpit-card" title="Branch Capacity Planning" subtitle="Unvalidated fixed index from utilization and recorded ratings"
-          headerRight={avgHealth != null ? <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Planning avg {avgHealth}/100</span> : undefined}>
-          <ResourceSection
-            label="Branch capacity"
-            state={branches.state}
-            onRetry={branches.reload}
-            loading={<div className="space-y-2.5"><div className="skeleton-line h-20 rounded-xl" /><div className="skeleton-line h-20 rounded-xl" /></div>}
-            empty={{
-              icon: <MapPin className="w-5 h-5" />,
-              title: 'No branches recorded',
-              description: 'The branch feed loaded successfully and this workspace has no branch records.',
-            }}
-          >
-            {rows => (
-              <div className="space-y-2.5">
-                {rows.map(b => <BranchHealthCard key={b.id} branch={b} onOpen={() => navigate('/scheduling')} />)}
-              </div>
-            )}
-          </ResourceSection>
-        </BentoCard>
-        )}
-        {(!knowsUser || canSeeCampaigns) && (
-        <BentoCard className="cockpit-card" title="Campaign performance evidence" subtitle="Stored audience, booking, and associated-value fields; causation not established"
-          headerRight={<button type="button" onClick={() => openCampaigns({ source: 'Dashboard' })} className="text-xs font-semibold text-indigo hover:opacity-75 inline-flex items-center gap-1"><BarChart3 className="w-3.5 h-3.5" aria-hidden="true" /> All campaigns</button>}>
-          <ResourceSection
-            label="Campaign performance"
-            state={campaigns.state}
-            onRetry={campaigns.reload}
-            loading={<div className="space-y-2.5">{[0, 1, 2].map(i => <div key={i} className="skeleton-line h-16 rounded-xl" />)}</div>}
-            // The panel owns the "no campaigns yet" claim and its create CTA.
-            isEmpty={() => false}
-          >
-            {rows => <CampaignROIPanel campaigns={rows} onViewAll={() => openCampaigns({ source: 'Dashboard' })} onCreate={() => openCampaigns({ goal: 'winback', source: 'Dashboard', contextLabel: 'No campaigns recorded yet' })} />}
-          </ResourceSection>
-        </BentoCard>
-        )}
+      <div className="today-evidence-row">
+        <section className="today-connections" aria-labelledby="connections-heading">
+          <div className="today-section-head compact"><div><h2 id="connections-heading">Connection health</h2><p>Customer-safe capability states only.</p></div><Info aria-label="States come from current capability and readiness checks." /></div>
+          <div className="today-connection-grid">
+            <ConnectionStatus icon={<Signal />} label="Application API" status={apiReady ? 'Live' : 'Unavailable'} tone={apiReady ? 'live' : 'off'} detail="Readiness check" />
+            {capabilityRows.map(capability => { const status = capabilityStatus(capability.state); return <ConnectionStatus key={capability.key} icon={capability.key === 'eligibility_checks' ? <ShieldCheck /> : <CalendarClock />} label={capability.label} status={status.label} tone={status.tone} detail={capability.detail} />; })}
+            {capabilities.state.status === 'loading' && <div className="today-connection-loading skeleton" aria-label="Loading capability status" />}
+            {capabilities.state.status === 'error' && <button type="button" className="today-connection-error" onClick={capabilities.reload}>Capability states unavailable · Retry</button>}
+          </div>
+        </section>
+        <section className="today-proof" aria-labelledby="proof-heading">
+          <div className="today-proof-mark"><ShieldCheck aria-hidden="true" /></div>
+          <div><h2 id="proof-heading">Open PHI-safe executive proof</h2><p>Readiness evidence only; this view does not claim certification or customer outcomes.</p></div>
+          <button type="button" disabled={!canOpenProof} onClick={() => canOpenProof && navigate('/compliance/proof')}>{canOpenProof ? <>Open proof <ExternalLink aria-hidden="true" /></> : 'Proof unavailable for this role'}</button>
+        </section>
       </div>
-      )}
-
-      {/* Priority queue — full-height rail, scrolls internally */}
-      {(!knowsUser || canSeeRevenue) && (
-      <div className="dash-rail">
-        <ResourceSection
-          label="Priority queue"
-          state={actions.state}
-          onRetry={actions.reload}
-          loading={<PriorityActionRail actions={[]} loading onOpen={setDrawerAction} onCta={openCta} onCreateCampaign={() => openCampaigns({ source: 'Dashboard' })} />}
-          // An empty queue is the rail's own claim, made only on a real response.
-          isEmpty={() => false}
-        >
-          {rows => (
-            <PriorityActionRail
-              actions={rows}
-              onOpen={setDrawerAction}
-              onCta={openCta}
-              onCreateCampaign={() => openCampaigns({ source: 'Dashboard' })}
-            />
-          )}
-        </ResourceSection>
-      </div>
-      )}
-
-      {drawerAction && <ActionDrawer action={drawerAction} onClose={() => setDrawerAction(null)} onNavigate={(r) => { setDrawerAction(null); navigate(r); }} />}
-    </div>
+    </section>
   );
 }
 
-function CurrencyLanguagePicker() {
-  const { currency, language, setCurrency, setLanguage } = usePreferences();
-  const selectCls = 'appearance-none rounded-lg border border-[var(--b1)] bg-white pl-7 pr-6 py-1.5 text-[12px] font-semibold text-t1 hover:bg-[var(--s2)] cursor-pointer outline-none';
-  return (
-    <div className="flex items-center gap-2">
-      <div className="relative">
-        <Coins className="w-3.5 h-3.5 text-t3 absolute left-2 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" />
-        <select aria-label="Display currency" value={currency} onChange={e => setCurrency(e.target.value)} className={selectCls}>
-          {CURRENCIES.map(c => <option key={c.code} value={c.code}>{c.label}</option>)}
-        </select>
-      </div>
-      <div className="relative">
-        <Globe className="w-3.5 h-3.5 text-t3 absolute left-2 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" />
-        <select aria-label="Language" value={language} onChange={e => setLanguage(e.target.value)} className={selectCls}>
-          {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
-        </select>
-      </div>
-    </div>
-  );
+function briefHeading(canSeeRevenue: boolean, status: string, count: number) {
+  if (!canSeeRevenue) return 'Your role-specific work is available from the Work Queue.';
+  if (status === 'loading') return 'Loading the current priority record…';
+  if (count === 0) return 'No priority actions were returned.';
+  return `${count} recorded ${count === 1 ? 'item needs' : 'items need'} attention.`;
+}
+
+function ScopeChip({ icon, value, label, className = '' }: { icon: ReactNode; value: string; label: string; className?: string }) {
+  return <div className={`today-scope-chip ${className}`}><span aria-hidden="true">{icon}</span><span><strong>{value}</strong><small>{label}</small></span></div>;
+}
+
+function StateMessage({ children, icon, error = false, actionLabel, onAction }: { children: ReactNode; icon?: ReactNode; error?: boolean; actionLabel?: string; onAction?: () => void }) {
+  return <div className={`today-state-message ${error ? 'is-error' : ''}`} role={error ? 'alert' : undefined}>{icon && <span aria-hidden="true">{icon}</span>}<p>{children}</p>{actionLabel && onAction && <button type="button" onClick={onAction}>{actionLabel}</button>}</div>;
+}
+
+function PriorityBrief({ action, index, canOpen, onOpen }: { action: PriorityAction; index: number; canOpen: boolean; onOpen: () => void }) {
+  const due = ageLabel(action.dueDate);
+  return <article className="today-priority"><div className={`today-priority-number severity-${action.severity}`}>{index}</div><div className="today-priority-copy"><div className="today-priority-title-row"><h3>{action.title}</h3><span className={`today-severity severity-${action.severity}`}>{action.severity}</span></div><p>{action.description || `${categoryLabel[action.category]} record`}</p><dl><div><dt>Owner</dt><dd><UserRound aria-hidden="true" /> {action.owner}</dd></div><div><dt>SLA / due</dt><dd className={`tone-${due.tone}`}><Clock3 aria-hidden="true" /> {due.label}</dd></div></dl></div><button type="button" disabled={!canOpen} onClick={onOpen}>{canOpen ? action.cta.label : 'Unavailable for this role'}</button></article>;
+}
+
+function LedgerRow({ action, freshness, canOpen, onOpen }: { action: PriorityAction; freshness: string; canOpen: boolean; onOpen: () => void }) {
+  const due = ageLabel(action.dueDate);
+  return <div className="today-ledger-row" role="row"><span role="cell" data-label="Scope"><Building2 aria-hidden="true" /> Network</span><span role="cell" data-label="Work item / context"><strong>{action.title}</strong><small>{action.description || 'No additional context supplied by the source.'}</small></span><span role="cell" data-label="Source"><Database aria-hidden="true" /> {categoryLabel[action.category]}</span><span role="cell" data-label="Owner"><UserRound aria-hidden="true" /> {action.owner}</span><span role="cell" data-label="SLA / due" className={`tone-${due.tone}`}><Clock3 aria-hidden="true" /> {due.label}</span><span role="cell" data-label="Evidence / freshness"><CircleDot aria-hidden="true" /> API record<small>{freshness}</small></span><span role="cell" data-label="Next action"><button type="button" disabled={!canOpen} onClick={onOpen}>{canOpen ? action.cta.label : 'Unavailable for this role'}</button></span></div>;
+}
+
+function ConnectionStatus({ icon, label, status, tone, detail }: { icon: ReactNode; label: string; status: string; tone: string; detail: string }) {
+  return <div className="today-connection-item" title={detail}><span className="today-connection-icon" aria-hidden="true">{icon}</span><span><strong>{label}</strong><small className={`connection-${tone}`}><i /> {status}</small></span></div>;
 }

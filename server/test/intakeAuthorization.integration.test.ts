@@ -210,4 +210,37 @@ describe('public intake mandatory audit durability', () => {
     expect((await db.patientIntakePacket.findUniqueOrThrow({ where: { id: packet.id } })).submittedAt).not.toBeNull();
     expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'intake.packet.submitted', resourceId: packet.id } })).toBe(2);
   });
+
+  it('submits a fully completed packet idempotently while rejecting post-submit section edits', async () => {
+    const t = await makeTenant();
+    const packet = await makePacket(t.id, t.patientA.id, t.appointmentA.id);
+    const token = await runWithTenantContext(t.id, () => issueIntakeToken(t.id, packet.id), { id: t.users.frontA.id, role: 'FRONT_DESK' });
+    const sectionUrl = `/v1/intake/public/${token}/sections`;
+
+    const completed = await app.inject({
+      method: 'POST',
+      url: sectionUrl,
+      payload: { sectionType: 'demographics', data: { firstName: 'Alex', lastName: 'Patient', email: 'alex@example.test' } },
+    });
+    expect(completed.statusCode).toBe(200);
+
+    const firstSubmit = await app.inject({ method: 'POST', url: `/v1/intake/public/${token}/submit` });
+    expect(firstSubmit.statusCode).toBe(200);
+    expect(firstSubmit.json()).toMatchObject({ submitted: true, status: 'submitted', alreadySubmitted: false });
+
+    const retrySubmit = await app.inject({ method: 'POST', url: `/v1/intake/public/${token}/submit` });
+    expect(retrySubmit.statusCode).toBe(200);
+    expect(retrySubmit.json()).toMatchObject({ submitted: true, status: 'submitted', alreadySubmitted: true });
+
+    const rejectedEdit = await app.inject({
+      method: 'POST',
+      url: sectionUrl,
+      payload: { sectionType: 'demographics', data: { firstName: 'Changed', lastName: 'After Submit' } },
+    });
+    expect(rejectedEdit.statusCode).toBe(409);
+    expect(rejectedEdit.json().message).toBe('This intake has already been submitted');
+
+    const stored = await db.patientIntakeSection.findFirstOrThrow({ where: { packetId: packet.id, sectionType: 'demographics' } });
+    expect(stored.data).toMatchObject({ firstName: 'Alex', lastName: 'Patient' });
+  });
 });

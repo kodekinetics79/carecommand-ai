@@ -32,6 +32,7 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { computeCampaignLaunchFingerprint, buildCampaignLaunchPreview } = await import('../lib/campaignIntegrity');
 const { dispatchCampaign } = await import('../lib/campaignDispatch');
+const { runCampaignAttribution } = await import('../lib/campaignAttribution');
 const { runScheduledCampaigns } = await import('../modules/campaigns/jobs');
 const { runWithJobTenantContext } = await import('../lib/tenantContext');
 
@@ -135,6 +136,71 @@ afterAll(async () => {
 });
 
 describe('campaign dispatch is branch-scoped', () => {
+  it('keeps advisory campaign evidence and revenue inside a restricted manager\'s branch', async () => {
+    const tenant = await makeTenant();
+    const [campaignA, campaignB] = await Promise.all([
+      db.campaign.create({
+        data: {
+          tenantId: tenant.id, branchId: tenant.branchA, name: 'Clinic A recovery', goal: 'inactive_patient_reactivation',
+          status: 'ACTIVE', channels: [], campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients',
+          campaignChannel: 'sms', audienceSize: 8, createdByUserId: tenant.users.MANAGER,
+        },
+      }),
+      db.campaign.create({
+        data: {
+          tenantId: tenant.id, branchId: tenant.branchB, name: 'Clinic B private campaign', goal: 'inactive_patient_reactivation',
+          status: 'ACTIVE', channels: [], campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients',
+          campaignChannel: 'sms', audienceSize: 99, createdByUserId: tenant.users.ADMIN,
+        },
+      }),
+    ]);
+
+    // Revenue is a protected rollup. Produce it from accepted delivery,
+    // completed appointment, and succeeded payment evidence rather than
+    // mutating the aggregate column directly.
+    const acceptedAt = new Date(Date.now() - 5 * 86400000);
+    for (const [campaign, branchId, amount] of [
+      [campaignA, tenant.branchA, 125],
+      [campaignB, tenant.branchB, 9_999],
+    ] as const) {
+      const patient = await db.patient.create({
+        data: { tenantId: tenant.id, branchId, firstName: 'Attributed', lastName: campaign.name, lifecycleStage: 'ACTIVE' },
+      });
+      await db.campaignDelivery.create({
+        data: {
+          tenantId: tenant.id, campaignId: campaign.id, patientId: patient.id, channel: 'sms',
+          status: 'accepted', provider: 'twilio', sentAt: acceptedAt,
+          providerAcceptedAt: acceptedAt, statusUpdatedAt: acceptedAt,
+        },
+      });
+      const appointment = await db.appointment.create({
+        data: {
+          tenantId: tenant.id, branchId, patientId: patient.id, service: 'Follow-up',
+          startsAt: new Date(acceptedAt.getTime() + 2 * 86400000),
+          endsAt: new Date(acceptedAt.getTime() + 2 * 86400000 + 1800000),
+          status: 'COMPLETED', channel: 'SMS', value: amount,
+          createdAt: new Date(acceptedAt.getTime() + 86400000),
+        },
+      });
+      await db.paymentTransaction.create({
+        data: {
+          tenantId: tenant.id, branchId, patientId: patient.id, appointmentId: appointment.id,
+          amount, currency: 'USD', status: 'succeeded', mode: 'test',
+          receivedAt: new Date(acceptedAt.getTime() + 3 * 86400000),
+        },
+      });
+    }
+    await runCampaignAttribution(new Date(), tenant.id);
+
+    const response = await inject(tenant, 'MANAGER', 'GET', '/v1/advisory/brief');
+    expect(response.statusCode, response.body).toBe(200);
+    const growth = response.json().advisors.find((row: { advisorType: string }) => row.advisorType === 'growth');
+    expect(growth.evidence.join(' ')).toContain('Clinic A recovery');
+    expect(growth.evidence.join(' ')).toContain('$125');
+    expect(growth.evidence.join(' ')).not.toContain('Clinic B private campaign');
+    expect(growth.evidence.join(' ')).not.toContain('$10,124');
+  });
+
   it('a branch-scoped MANAGER reaches only their own branch, and an ADMIN tenant-wide campaign still reaches everyone', async () => {
     const tenant = await makeTenant();
     const [a1, a2, b1, b2] = await Promise.all([

@@ -131,8 +131,30 @@ const billingWrite = requirePermission('billing:write');
 // collection — mirrors the deposit-waiver gate, which also excludes FRONT_DESK.
 const COLLECT_PRIVILEGED_ROLES = ['OWNER', 'ADMIN', 'MANAGER', 'BILLING'] as const;
 // Constrained, auditable status vocabularies (no unvalidated free-string status).
-const PAYMENT_REQUEST_STATUSES = ['pending', 'link_sent', 'collected', 'failed', 'expired', 'cancelled', 'refunded'] as const;
+const PAYMENT_REQUEST_STATUSES = ['pending', 'link_sent', 'follow_up_required', 'collected', 'failed', 'expired', 'cancelled', 'refunded'] as const;
 const DEPOSIT_REQUIREMENT_STATUSES = ['required', 'requested', 'link_sent', 'collected', 'waived', 'cancelled', 'failed', 'expired', 'refunded'] as const;
+const PAYMENT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  pending: ['link_sent', 'follow_up_required', 'collected', 'failed', 'expired', 'cancelled'],
+  link_sent: ['follow_up_required', 'collected', 'failed', 'expired', 'cancelled'],
+  follow_up_required: ['link_sent', 'collected', 'failed', 'cancelled'],
+  failed: ['link_sent', 'follow_up_required', 'collected', 'cancelled'],
+  collected: [], refunded: [], expired: [], cancelled: [],
+};
+const DEPOSIT_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  required: ['requested', 'link_sent', 'collected', 'waived', 'failed', 'expired', 'cancelled'],
+  requested: ['link_sent', 'collected', 'waived', 'failed', 'expired', 'cancelled'],
+  link_sent: ['collected', 'waived', 'failed', 'expired', 'cancelled'],
+  failed: ['link_sent', 'collected', 'waived', 'cancelled'],
+  collected: [], waived: [], refunded: [], expired: [], cancelled: [],
+};
+
+function isStatusTransitionAllowed(
+  current: string,
+  next: string,
+  transitions: Record<string, readonly string[]>,
+) {
+  return current === next || (transitions[current] ?? []).includes(next);
+}
 // Payments & deposits routes additionally require the payments_deposits entitlement.
 const paymentsFeature = requireFeature('payments_deposits');
 // Insurance/eligibility routes require the insurance_eligibility entitlement.
@@ -1358,7 +1380,7 @@ function mapAppointmentQueueRow(row: {
       dueAt?: Date | null;
     }>;
   };
-  branch: { name: string };
+  branch: { name: string; timezone: string };
 }) {
   const latestPolicy = row.patient.patientInsurancePolicies[0] ?? null;
   const latestVerification = row.patient.eligibilityVerifications[0] ?? null;
@@ -1367,6 +1389,7 @@ function mapAppointmentQueueRow(row: {
     id: row.id,
     branchId: row.branchId,
     branchName: row.branch.name,
+    clinicTimezone: row.branch.timezone,
     patientId: row.patient.id,
     patientName: `${row.patient.firstName} ${row.patient.lastName}`,
     appointmentTime: row.startsAt.toISOString(),
@@ -1718,7 +1741,8 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
     paymentsDueTodayCount,
     unpaidBalancesAgg,
     depositsCollectedAgg,
-    failedPaymentsCount,
+    failedPaymentRequestsCount,
+    unlinkedFailedTransactionsCount,
     succeededTransactionsAgg,
     refundedTransactionsAgg,
     revenueAtRiskAgg,
@@ -1728,7 +1752,24 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
     db.paymentRequest.count({ where: { tenantId: context.tenantId, ...filter, status: 'pending', dueAt: { gte: dueStart, lt: dueEnd } } }),
     db.paymentRequest.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: { notIn: NON_OPEN_REQUEST_STATUSES } } }),
     runWithTenantContext(context.tenantId, tx => tx.depositRequirement.aggregate({ _sum: { collectedAmount: true }, where: { tenantId: context.tenantId, ...filter, status: 'collected' } })),
-    db.paymentTransaction.count({ where: { tenantId: context.tenantId, ...filter, status: 'failed' } }),
+    // The staff-facing command center is built from PaymentRequest rows. A
+    // request can be marked failed even when no separate transaction row was
+    // recorded (provider refusal, simulator evidence, legacy import). Count
+    // those operational failures, then add only failed transactions that are
+    // not already represented by a failed request. This keeps the headline in
+    // agreement with the cases staff can actually see without double-counting.
+    db.paymentRequest.count({ where: { tenantId: context.tenantId, ...filter, status: 'failed' } }),
+    db.paymentTransaction.count({
+      where: {
+        tenantId: context.tenantId,
+        ...filter,
+        status: 'failed',
+        OR: [
+          { paymentRequestId: null },
+          { paymentRequest: { is: { status: { not: 'failed' } } } },
+        ],
+      },
+    }),
     db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: { in: ['succeeded', 'paid'] } } }),
     db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: 'refunded' } }),
     runWithTenantContext(context.tenantId, tx => tx.revenueProtectionAlert.aggregate({ _sum: { estimatedValue: true }, where: { tenantId: context.tenantId, ...filter, status: { not: 'resolved' } } })),
@@ -1760,7 +1801,7 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
     copaysExpected: unpaidBalancesTotal,
     depositsCollected: depositsCollectedTotal,
     unpaidBalances: unpaidBalancesTotal,
-    failedPayments: failedPaymentsCount,
+    failedPayments: failedPaymentRequestsCount + unlinkedFailedTransactionsCount,
     revenueProtected: netTransactionsTotal + manualDepositsTotal,
     revenueAtRisk: toNumber(revenueAtRiskAgg._sum.estimatedValue),
   };
@@ -1960,7 +2001,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       // hide this morning's arrivals from a clinic that did not send one.
       : { gte: new Date(Date.now() - 86_400_000) };
 
-    const rows = await db.appointment.findMany({
+    const rowsWithOverflow = await db.appointment.findMany({
       where: {
         tenantId: request.auth.tenantId,
         deletedAt: null,
@@ -1969,9 +2010,9 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         ...filter,
       },
       orderBy: { startsAt: 'asc' },
-      take: query.limit,
+      take: query.limit + 1,
       include: {
-        branch: { select: { name: true } },
+        branch: { select: { name: true, timezone: true } },
         patient: {
           select: {
             id: true,
@@ -2002,6 +2043,9 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       },
     });
 
+    const truncated = rowsWithOverflow.length > query.limit;
+    const rows = truncated ? rowsWithOverflow.slice(0, query.limit) : rowsWithOverflow;
+
     // An eligibility check performed for a DIFFERENT appointment must never be
     // presented as this appointment's coverage. The nested include cannot
     // reference the outer row, so scope it here: keep checks tied to this
@@ -2013,7 +2057,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     }
 
     await audit(request, { action: 'eligibility.appointmentQueue.list', resource: 'appointment', metadata: { count: rows.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
-    return { appointments: rows.map(mapAppointmentQueueRow) };
+    return { appointments: rows.map(mapAppointmentQueueRow), truncated };
   });
 
   app.post('/eligibility/check', { preHandler: [insuranceFeature, billingWrite] }, async (request, reply) => {
@@ -2696,34 +2740,41 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     if (body.status === 'collected' && !COLLECT_PRIVILEGED_ROLES.includes(request.auth.role as typeof COLLECT_PRIVILEGED_ROLES[number])) {
       throw app.httpErrors.forbidden('Your role cannot manually mark a payment as collected');
     }
-    const existing = await db.paymentRequest.findFirst({
-      where: { id: params.id, tenantId: request.auth.tenantId },
-    });
-    if (!existing) throw app.httpErrors.notFound('Payment request not found');
-    assertBranchAccess(request, existing.branchId);
+    const row = await db.$transaction(async tx => {
+      const existing = await tx.paymentRequest.findFirst({
+        where: { id: params.id, tenantId: request.auth.tenantId },
+      });
+      if (!existing) throw app.httpErrors.notFound('Payment request not found');
+      assertBranchAccess(request, existing.branchId);
+      if (!isStatusTransitionAllowed(existing.status, body.status, PAYMENT_STATUS_TRANSITIONS)) {
+        throw app.httpErrors.conflict(`Payment request cannot change from ${existing.status} to ${body.status}`);
+      }
 
-    const isNewCollection = body.status === 'collected' && existing.status !== 'collected';
-    const collectedAmount = toNumber(existing.amount);
+      // A replay of the same terminal/action state is idempotent. In
+      // particular, a duplicated collection click must not write a second
+      // transaction or reduce the patient balance twice.
+      if (existing.status === body.status) return existing;
 
-    const row = await db.paymentRequest.update({
-      where: { id: params.id },
-      data: { status: body.status, providerReference: body.providerReference ?? existing.providerReference },
-    });
+      const changed = await tx.paymentRequest.updateMany({
+        where: { id: params.id, tenantId: request.auth.tenantId, status: existing.status },
+        data: { status: body.status, providerReference: body.providerReference ?? existing.providerReference },
+      });
+      if (changed.count !== 1) throw app.httpErrors.conflict('Payment request changed concurrently; refresh and retry');
+      const updated = await tx.paymentRequest.findUniqueOrThrow({ where: { id: params.id } });
 
-    if (isNewCollection) {
-      await db.$transaction(async tx => {
+      if (body.status === 'collected') {
         await tx.paymentTransaction.create({
           data: {
             tenantId: request.auth.tenantId,
-            branchId: row.branchId,
-            patientId: row.patientId ?? undefined,
-            appointmentId: row.appointmentId ?? undefined,
-            paymentRequestId: row.id,
-            amount: row.amount,
-            currency: row.currency,
+            branchId: updated.branchId,
+            patientId: updated.patientId ?? undefined,
+            appointmentId: updated.appointmentId ?? undefined,
+            paymentRequestId: updated.id,
+            amount: updated.amount,
+            currency: updated.currency,
             status: 'succeeded',
-            mode: row.mode,
-            providerReference: body.providerReference ?? row.providerReference ?? undefined,
+            mode: updated.mode,
+            providerReference: body.providerReference ?? updated.providerReference ?? undefined,
             receivedAt: new Date(),
             rawResponse: {
               status: 'succeeded',
@@ -2732,13 +2783,22 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
             },
           },
         });
+        await tx.depositRequirement.updateMany({
+          where: {
+            tenantId: request.auth.tenantId,
+            paymentRequestId: updated.id,
+            status: { in: ['required', 'requested', 'link_sent', 'failed'] },
+          },
+          data: { status: 'collected', collectedAmount: updated.amount, collectedAt: new Date() },
+        });
         // AR reconciliation: a real collection reduces the patient's outstanding
         // balance (clamped at 0 — the column is non-negative by constraint).
-        if (row.patientId) {
-          await decrementOutstandingBalance(request.auth.tenantId, row.patientId, collectedAmount, tx);
+        if (updated.patientId) {
+          await decrementOutstandingBalance(request.auth.tenantId, updated.patientId, toNumber(updated.amount), tx);
         }
-      });
-    }
+      }
+      return updated;
+    });
 
     await audit(request, {
       action: 'payment.status.updated',
@@ -2872,37 +2932,45 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     if (body.status === 'collected' && !COLLECT_PRIVILEGED_ROLES.includes(request.auth.role as typeof COLLECT_PRIVILEGED_ROLES[number])) {
       throw app.httpErrors.forbidden('Your role cannot manually mark a deposit as collected');
     }
-    const existing = await db.depositRequirement.findFirst({
-      where: { id: params.id, tenantId: request.auth.tenantId },
+    const row = await db.$transaction(async tx => {
+      const existing = await tx.depositRequirement.findFirst({
+        where: { id: params.id, tenantId: request.auth.tenantId },
+      });
+      if (!existing) throw app.httpErrors.notFound('Deposit requirement not found');
+      assertBranchAccess(request, existing.branchId);
+      if (!isStatusTransitionAllowed(existing.status, body.status, DEPOSIT_STATUS_TRANSITIONS)) {
+        throw app.httpErrors.conflict(`Deposit requirement cannot change from ${existing.status} to ${body.status}`);
+      }
+
+      // Integrity: a manual collectedAmount can never exceed the required
+      // amount, otherwise revenue is fabricated beyond what was ever owed.
+      const requiredAmount = toNumber(existing.requiredAmount);
+      if (body.collectedAmount != null && body.collectedAmount > requiredAmount) {
+        throw app.httpErrors.badRequest('collectedAmount cannot exceed the required amount');
+      }
+      if (existing.status === body.status) return existing;
+
+      const collectedAmount = body.collectedAmount ?? (body.status === 'collected' ? requiredAmount : toNumber(existing.collectedAmount));
+      const changed = await tx.depositRequirement.updateMany({
+        where: { id: params.id, tenantId: request.auth.tenantId, status: existing.status },
+        data: {
+          status: body.status,
+          collectedAmount,
+          waiverReason: body.waiverReason ?? existing.waiverReason,
+          collectedAt: body.status === 'collected' ? new Date() : existing.collectedAt,
+          reason: body.reason ?? existing.reason,
+        },
+      });
+      if (changed.count !== 1) throw app.httpErrors.conflict('Deposit requirement changed concurrently; refresh and retry');
+      const updated = await tx.depositRequirement.findUniqueOrThrow({ where: { id: params.id } });
+
+      // AR reconciliation is in the same transaction as the compare-and-swap.
+      // A duplicate or concurrent request therefore cannot reduce AR twice.
+      if (body.status === 'collected' && updated.patientId) {
+        await decrementOutstandingBalance(request.auth.tenantId, updated.patientId, collectedAmount, tx);
+      }
+      return updated;
     });
-    if (!existing) throw app.httpErrors.notFound('Deposit requirement not found');
-    assertBranchAccess(request, existing.branchId);
-
-    // Integrity: a manual collectedAmount can never exceed the required amount —
-    // otherwise revenue is fabricated beyond what was ever owed.
-    const requiredAmount = toNumber(existing.requiredAmount);
-    if (body.collectedAmount != null && body.collectedAmount > requiredAmount) {
-      throw app.httpErrors.badRequest('collectedAmount cannot exceed the required amount');
-    }
-    const isNewCollection = body.status === 'collected' && existing.status !== 'collected';
-    const collectedAmount = body.collectedAmount ?? (isNewCollection ? requiredAmount : toNumber(existing.collectedAmount));
-
-    const row = await db.depositRequirement.update({
-      where: { id: params.id },
-      data: {
-        status: body.status,
-        collectedAmount,
-        waiverReason: body.waiverReason ?? existing.waiverReason,
-        collectedAt: body.status === 'collected' ? new Date() : existing.collectedAt,
-        reason: body.reason ?? existing.reason,
-      },
-    });
-
-    // AR reconciliation: a fresh manual deposit collection reduces the patient's
-    // outstanding balance (tenant-scoped, clamped at 0).
-    if (isNewCollection && existing.patientId) {
-      await decrementOutstandingBalance(request.auth.tenantId, existing.patientId, collectedAmount);
-    }
 
     await audit(request, {
       action: 'depositRequirement.status.updated',

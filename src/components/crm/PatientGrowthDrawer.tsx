@@ -11,8 +11,8 @@ interface PatientDetail {
   eligibilityVerifications?: Array<{ status: string }>;
 }
 
-export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate }: {
-  lead?: CrmLead; patient?: CrmPatient; onClose: () => void; onNavigate: (route: string) => void;
+export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate, canCreateCampaign = true }: {
+  lead?: CrmLead; patient?: CrmPatient; onClose: () => void; onNavigate: (route: string) => void; canCreateCampaign?: boolean;
 }) {
   const [detail, setDetail] = useState<PatientDetail | null>(null);
   const subjectName = patient?.name ?? lead?.name ?? 'Record';
@@ -111,9 +111,9 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
           <button type="button" onClick={() => onNavigate('/patients' + (isPatient ? `/${patient!.id}` : ''))} className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-[var(--b1)] px-3 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] transition">
             <User className="w-4 h-4" /> Full record
           </button>
-          <button type="button" onClick={() => onNavigate('/campaigner')} className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[var(--indigo)] px-3 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+          {canCreateCampaign && <button type="button" onClick={() => onNavigate('/campaigner')} className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[var(--indigo)] px-3 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Sparkles className="w-4 h-4" /> Next best action
-          </button>
+          </button>}
         </footer>
       </div>
     </div>

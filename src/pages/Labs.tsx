@@ -6,6 +6,8 @@ import BentoCard from '../components/ui/BentoCard';
 import { useApiResource } from '../hooks/useApiResource';
 import { apiRequest } from '../lib/api';
 import { mapPartnerReport, type ApiPartnerReport } from '../lib/apiAdapters';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 
 interface ApiBranchOption { id: string; name: string }
 
@@ -18,8 +20,11 @@ const statusConfig: Record<string, { label: string; color: string; bg: string; i
 };
 
 export default function Labs() {
+  const { user } = useSession();
+  const canReview = hasPermission(user, 'partner-report:review');
   const [busyId, setBusyId] = useState<string | null>(null);
-  const { data: reportRecords, source, error, reload } = useApiResource<ApiPartnerReport, ReturnType<typeof mapPartnerReport>>('/v1/partner-reports?limit=100', [], mapPartnerReport);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const { data: reportRecords, source, error, reload } = useApiResource<ApiPartnerReport, ReturnType<typeof mapPartnerReport>>('/v1/partner-reports?limit=100&page=true', [], mapPartnerReport, { allPages: true });
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
   const loadError = error;
   const openCount = reportRecords.filter(order => order.status !== 'doctor-reviewed').length;
@@ -35,12 +40,15 @@ export default function Labs() {
 
   async function markReviewed(orderId: string, summary?: string) {
     setBusyId(orderId);
+    setActionError(null);
     try {
       await apiRequest(`/v1/partner-reports/${orderId}/review`, {
         method: 'PATCH',
         body: JSON.stringify({ status: 'doctor-reviewed', summary }),
       });
       await reload();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'The review could not be recorded.');
     } finally {
       setBusyId(null);
     }
@@ -60,6 +68,7 @@ export default function Labs() {
           Partner-report records could not be loaded from the clinic service: {loadError}
         </div>
       )}
+      {actionError && <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{actionError}</div>}
 
       <div className="rounded-xl border border-[var(--b1)] bg-[var(--blue-soft)] px-4 py-3 text-[11px] text-blue-v">
         File upload is not available on this page. Use the clinic-approved external document workflow, then use this screen to track the report record and clinician review status.
@@ -74,8 +83,9 @@ export default function Labs() {
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
         {/* Document tracker */}
-        <BentoCard title="Partner Report Tracker" subtitle="All documents · All branches">
+        <BentoCard title="Partner Report Tracker" subtitle="All accessible documents · current clinic scope">
           <div className="space-y-2.5">
+            {!loadError && reportRecords.length === 0 && <p className="py-8 text-center text-sm text-t3">No partner-report records are available for this clinic.</p>}
             {reportRecords.map((order) => {
               const sc = statusConfig[order.status];
               const branch = branchOptions.find(b => b.id === order.branchId);
@@ -112,7 +122,7 @@ export default function Labs() {
                   <div className="flex items-center justify-between gap-3 mt-2">
                     <p className="text-[10px] text-t3">Provider reference: {order.doctorName}</p>
                     <div className="flex items-center gap-2">
-                      {order.status === 'result-received' && (
+                      {order.status === 'result-received' && canReview && (
                         <button
                           type="button"
                           disabled={busyId === order.id}
@@ -122,6 +132,7 @@ export default function Labs() {
                           <CheckCircle2 className="w-3 h-3" /> Record review complete
                         </button>
                       )}
+                      {order.status === 'result-received' && !canReview && <span className="text-[10px] text-t3">Clinician review required</span>}
                     </div>
                   </div>
                 </div>
@@ -147,7 +158,7 @@ export default function Labs() {
           </BentoCard>
 
           {/* Status breakdown */}
-          <BentoCard title="Status Breakdown" subtitle="All documents by stage">
+          <BentoCard title="Status Breakdown" subtitle="All accessible documents by stage">
             <div className="space-y-2">
               {(['ordered', 'sample-collected', 'pending-result', 'result-received', 'doctor-reviewed'] as const).map((status) => {
                 const count = reportRecords.filter(o => o.status === status).length;
@@ -157,12 +168,12 @@ export default function Labs() {
                     <span className={`inline-flex items-center gap-1.5 text-xs font-semibold ${sc.color}`}>
                       {sc.icon}{sc.label}
                     </span>
-                    <span className="text-sm font-bold text-t1">{count}</span>
+                    <span className="text-sm font-bold text-t1">{metricsReady ? count : '—'}</span>
                   </div>
                 );
               })}
             </div>
-            {reportRecords.length === 0 && <p className="text-xs text-t3 mt-3">No partner-report records are available for this clinic.</p>}
+            {!loadError && reportRecords.length === 0 && <p className="text-xs text-t3 mt-3">No partner-report records are available for this clinic.</p>}
           </BentoCard>
 
         </div>

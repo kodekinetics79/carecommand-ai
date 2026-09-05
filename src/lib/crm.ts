@@ -155,6 +155,7 @@ export function resolveHandoffDefaults(handoff: CampaignHandoff | null): {
 
 export interface Campaign {
   id: string;
+  branchId: string | null;
   name: string;
   campaignType: string | null;
   audienceType: string | null;
@@ -283,10 +284,11 @@ export const crmApi = {
   // repaint a screen the user already left.
   listCampaigns: (signal?: AbortSignal) => apiRequest<Campaign[]>(`${base}/campaigns`, signal ? { signal } : undefined),
   getCampaign: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}`),
-  createCampaign: (body: { name: string; campaignType: CampaignType; audienceType?: AudienceType; channel?: CommChannel }) =>
+  createCampaign: (body: { name: string; campaignType: CampaignType; audienceType?: AudienceType; channel?: CommChannel; branchId?: string }) =>
     apiRequest<Campaign>(`${base}/campaigns`, { method: 'POST', body: JSON.stringify(body) }),
   generateDraft: (id: string) => apiRequest<CampaignDraft & { campaignId: string }>(`${base}/campaigns/${id}/draft`, { method: 'POST' }),
   previewAudience: (type: AudienceType, channel: CommChannel) => apiRequest<AudiencePreview>(`${base}/audiences/${type}/preview?channel=${channel}`),
+  previewCampaignAudience: (id: string) => apiRequest<AudiencePreview>(`${base}/campaigns/${id}/audience-preview`),
   approve: (id: string, previewFingerprint: string) => apiRequest<Campaign>(`${base}/campaigns/${id}/approve`, {
     method: 'POST',
     body: JSON.stringify({ previewFingerprint, confirmExactAudienceTemplateProvider: true }),

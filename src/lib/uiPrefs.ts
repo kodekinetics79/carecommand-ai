@@ -20,7 +20,7 @@ export const ACCENTS: Accent[] = [
 export function getCollapsed(): boolean { return typeof localStorage !== 'undefined' && localStorage.getItem(COLLAPSE_KEY) === '1'; }
 export function getAccent(): string { return (typeof localStorage !== 'undefined' && localStorage.getItem(ACCENT_KEY)) || 'indigo'; }
 
-function applyCollapsed(v: boolean) { document.documentElement.style.setProperty('--sidebar-w', v ? '68px' : '260px'); }
+function applyCollapsed(v: boolean) { document.documentElement.style.setProperty('--sidebar-w', v ? '68px' : '270px'); }
 function applyAccent(key: string) {
   const a = ACCENTS.find(x => x.key === key) ?? ACCENTS[0];
   const r = document.documentElement.style;

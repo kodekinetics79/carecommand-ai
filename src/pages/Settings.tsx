@@ -12,10 +12,11 @@ import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import ResourceSection, { ResourceErrorNotice, ResourceSkeleton } from '../components/ui/ResourceSection';
 import { apiRequest } from '../lib/api';
 import { describeFailure, hasResponse, type ResourceFailure } from '../lib/resourceState';
-import { useResource } from '../hooks/useResource';
+import { useResource, type UseResourceResult } from '../hooks/useResource';
 import { useCrudResource } from '../hooks/useCrudResource';
 import { usePreferences, CURRENCIES, LANGUAGES } from '../lib/preferences';
 import { formatCurrency } from '../utils/formatters';
+import { hasPermission } from '../lib/access';
 
 /* ------------------------------------------------------------------ types */
 interface Branch { id: string; name: string; location: string; active?: boolean }
@@ -26,7 +27,8 @@ interface AdminOverview {
 }
 interface AdminUser {
   id: string; displayName: string; email: string; role: string; active: boolean;
-  branch?: { name: string } | null; accessBranches?: { id: string; name: string }[];
+  branchId?: string | null; branch?: { id?: string; name: string } | null;
+  accessBranches?: { id: string; name: string; isPrimary?: boolean }[];
 }
 interface AdminUsersResponse { users: AdminUser[]; branches: Branch[]; summary?: unknown }
 interface RoleDef { id: string; name: string; description: string; accent: string; userCount: number }
@@ -43,7 +45,7 @@ interface SessionRow {
   lastLoginAudit?: { occurredAt: string; ipAddress: string; userAgent: string } | null;
 }
 
-const ROLE_OPTIONS = ['OWNER', 'ADMIN', 'MANAGER', 'PROVIDER', 'FRONT_DESK', 'ANALYST'];
+const ROLE_OPTIONS = ['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST'];
 // Compliance roles are enforced by the Compliance module and assignable here
 // (the backend role-change API accepts them). Assignment itself remains gated
 // to OWNER/ADMIN by the backend.
@@ -54,12 +56,13 @@ const accentBadge: Record<string, string> = {
   amber: 'badge badge-amber', red: 'badge badge-red',
 };
 const NAV = [
-  { id: 'overview', label: 'Overview', icon: Building2 },
-  { id: 'preferences', label: 'Display & Currency', icon: Coins },
-  { id: 'team', label: 'Team & Users', icon: Users },
-  { id: 'roles', label: 'Roles & Access', icon: Lock },
-  { id: 'notifications', label: 'Notifications', icon: Bell },
-  { id: 'security', label: 'Security', icon: ShieldCheck },
+  { id: 'overview', label: 'Workspace Overview', icon: Building2, access: 'admin' },
+  { id: 'preferences', label: 'Display & Currency', icon: Coins, access: 'all' },
+  { id: 'team', label: 'Team & Users', icon: Users, access: 'admin' },
+  { id: 'roles', label: 'Roles & Access', icon: Lock, access: 'settings-write' },
+  { id: 'notifications', label: 'Notifications', icon: Bell, access: 'settings-write' },
+  { id: 'account', label: 'My Account', icon: KeyRound, access: 'all' },
+  { id: 'security', label: 'Security & Sessions', icon: ShieldCheck, access: 'admin' },
 ] as const;
 type SectionId = typeof NAV[number]['id'];
 
@@ -75,30 +78,54 @@ function postureChecks(posture: SecurityPosture): boolean[] {
     posture.csrf.enabled,
     posture.secrets.jwtSecretConfigured,
     posture.secrets.jwtRefreshSecretConfigured,
+    posture.devTokenDisabledInProduction,
+    posture.httpsRequired,
   ];
+}
+
+function authModeLabel(posture: SecurityPosture): string {
+  return posture.devTokenDisabledInProduction
+    ? 'Password sign-in · secure session refresh'
+    : 'Password sign-in · development test mode';
 }
 
 export default function Settings() {
   const [section, setSection] = useState<SectionId>('overview');
+  const { user, loading } = useSession();
+  const canAdminister = hasPermission(user, 'admin:manage');
+  const canWriteSettings = hasPermission(user, 'settings:write');
+  // One authoritative load per admin page. The summary and active panel share
+  // these results instead of asking the same endpoint twice on first paint.
+  // Disabled resources issue no request for personal-settings roles.
+  const overview = useResource<AdminOverview>('/v1/admin/overview', { enabled: canAdminister });
+  const posture = useResource<SecurityPosture>('/v1/security/posture', { enabled: canAdminister });
+  const visibleNav = loading ? [] : NAV.filter(item => (
+    item.access === 'all'
+    || (item.access === 'admin' && canAdminister)
+    || (item.access === 'settings-write' && canWriteSettings)
+  ));
+  const activeSection = visibleNav.some(item => item.id === section) ? section : (visibleNav[0]?.id ?? 'preferences');
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Settings"
-        subtitle="Manage workspace preferences, team access, integrations, and recorded security controls."
-        badge="Workspace settings"
+        title="Administration"
+        subtitle={canAdminister
+          ? 'Manage workspace identity, staff access, communication templates, and recorded security controls.'
+          : 'Manage your display preferences and account security within the access assigned to your role.'}
+        badge={canAdminister ? 'Tenant administration' : 'Personal settings'}
         badgeColor="violet"
       />
 
-      <SettingsSummary />
+      {canAdminister && <SettingsSummary overview={overview} posture={posture} />}
 
       <div className="grid gap-4 lg:grid-cols-[220px_1fr] items-start">
         {/* Section nav */}
         <nav className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-2 lg:sticky lg:top-4">
           <div className="flex lg:flex-col gap-1 overflow-x-auto">
-            {NAV.map(item => {
+            {visibleNav.map(item => {
               const Icon = item.icon;
-              const active = section === item.id;
+              const active = activeSection === item.id;
               return (
                 <button
                   key={item.id}
@@ -117,22 +144,24 @@ export default function Settings() {
 
         {/* Section content */}
         <div className="min-w-0 space-y-4">
-          {section === 'overview' && <OverviewSection />}
-          {section === 'preferences' && <PreferencesSection />}
-          {section === 'team' && <TeamSection />}
-          {section === 'roles' && <RolesSection />}
-          {section === 'notifications' && <NotificationsSection />}
-          {section === 'security' && <SecuritySection />}
+          {loading && <ResourceSkeleton label="administration access" lines={4} rowClassName="h-16 rounded-xl" />}
+          {!loading && activeSection === 'overview' && <OverviewSection overview={overview} />}
+          {!loading && activeSection === 'preferences' && <PreferencesSection />}
+          {!loading && activeSection === 'team' && <TeamSection />}
+          {!loading && activeSection === 'roles' && <RolesSection />}
+          {!loading && activeSection === 'notifications' && <NotificationsSection />}
+          {!loading && activeSection === 'account' && <ChangePasswordCard />}
+          {!loading && activeSection === 'security' && <SecuritySection posture={posture} />}
         </div>
       </div>
     </div>
   );
 }
 
-function SettingsSummary() {
-  const overview = useResource<AdminOverview>('/v1/admin/overview');
-  const posture = useResource<SecurityPosture>('/v1/security/posture');
-
+function SettingsSummary({ overview, posture }: {
+  overview: UseResourceResult<AdminOverview>;
+  posture: UseResourceResult<SecurityPosture>;
+}) {
   return (
     <BentoCard title="Workspace summary" subtitle="Current configuration and the latest recorded control status">
       <div className="grid gap-3 xl:grid-cols-[1.3fr_0.9fr]">
@@ -170,7 +199,7 @@ function SettingsSummary() {
             <StatusRow label="Security posture">
               <ResourceSection label="Security posture" state={posture.state} onRetry={posture.reload} compact
                 loading={<ResourceSkeleton label="security posture" lines={1} rowClassName="h-3.5 w-24 rounded" />}>
-                {data => <span className="font-semibold text-t1">{data.authMode}</span>}
+                {data => <span className="font-semibold text-t1">{authModeLabel(data)}</span>}
               </ResourceSection>
             </StatusRow>
             <StatusRow label="Tenant created">
@@ -235,8 +264,7 @@ function PreferencesSection() {
 }
 
 /* ------------------------------------------------------------------ Overview */
-function OverviewSection() {
-  const overview = useResource<AdminOverview>('/v1/admin/overview');
+function OverviewSection({ overview }: { overview: UseResourceResult<AdminOverview> }) {
   return (
     <ResourceSection
       label="Workspace overview"
@@ -248,7 +276,7 @@ function OverviewSection() {
         <div className="space-y-4">
           <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
             <StatCard title="Team Members" value={data.summary.totalUsers} subtitle={`${data.summary.activeUsers} active`} icon={<Users className="w-4 h-4" />} accent="blue" />
-            <StatCard title="Roles" value={data.summary.totalRoles} subtitle="Defined" icon={<Lock className="w-4 h-4" />} accent="violet" />
+            <StatCard title="Custom Roles" value={data.summary.totalRoles} subtitle="Tenant-defined" icon={<Lock className="w-4 h-4" />} accent="violet" />
             <StatCard title="Branches" value={data.summary.activeBranches} subtitle="Active locations" icon={<MapPin className="w-4 h-4" />} accent="emerald" />
             <StatCard title="Audit Events" value={data.summary.recentAuditEvents} subtitle="Recent activity" icon={<Activity className="w-4 h-4" />} accent="amber" />
           </div>
@@ -298,6 +326,7 @@ function TeamSection() {
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [actionFailure, setActionFailure] = useState<ResourceFailure | null>(null);
   const [search, setSearch] = useState('');
+  const [accessEditor, setAccessEditor] = useState<{ userId: string; branchIds: string[]; primaryBranchId: string } | null>(null);
 
   async function changeRole(id: string, role: string) {
     setPendingId(id);
@@ -316,6 +345,37 @@ function TeamSection() {
     setActionFailure(null);
     try {
       await apiRequest(`/v1/admin/users/${id}/status`, { method: 'PATCH', body: JSON.stringify({ active }) });
+      team.reload();
+    } catch (err) {
+      setActionFailure(describeFailure(err));
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  async function saveClinicAccess(user: AdminUser) {
+    if (!accessEditor || accessEditor.userId !== user.id) return;
+    if (accessEditor.branchIds.length === 0 && user.role !== 'OWNER' && user.role !== 'ADMIN') {
+      setActionFailure({
+        message: 'Select at least one clinic for this role before saving.',
+        timedOut: false,
+        offline: false,
+        permissionDenied: false,
+        sessionExpired: false,
+      });
+      return;
+    }
+    setPendingId(user.id);
+    setActionFailure(null);
+    try {
+      await apiRequest(`/v1/admin/users/${user.id}/branches`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          branchIds: accessEditor.branchIds,
+          ...(accessEditor.branchIds.length > 0 ? { primaryBranchId: accessEditor.primaryBranchId || accessEditor.branchIds[0] } : {}),
+        }),
+      });
+      setAccessEditor(null);
       team.reload();
     } catch (err) {
       setActionFailure(describeFailure(err));
@@ -352,37 +412,112 @@ function TeamSection() {
               <>
                 <p className="text-[11px] text-t3 mb-2">{data.users.length} member records</p>
                 <div className="space-y-2">
-                  {users.map(user => (
-                    <div key={user.id} className="flex flex-wrap items-center gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
-                      <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
-                        {user.displayName.split(' ').map(n => n[0]).join('').slice(0, 2)}
+                  {users.map(user => {
+                    const editingAccess = accessEditor?.userId === user.id;
+                    const assignedClinics = user.accessBranches ?? [];
+                    return (
+                    <div key={user.id} className="rounded-xl border border-[var(--b1)] p-3 transition-all hover:bg-[var(--s3)]">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
+                          {user.displayName.split(' ').map(n => n[0]).join('').slice(0, 2)}
+                        </div>
+                        <div className="flex-1 min-w-[170px]">
+                          <p className="text-sm font-semibold text-t1">{user.displayName}</p>
+                          <p className="text-[11px] text-t3">{user.email}</p>
+                          <div className="mt-1 flex flex-wrap items-center gap-1">
+                            {assignedClinics.length > 0
+                              ? assignedClinics.map(branch => <span key={branch.id} className="badge badge-blue">{branch.name}{branch.isPrimary ? ' · primary' : ''}</span>)
+                              : user.role === 'OWNER' || user.role === 'ADMIN'
+                                ? <span className="badge badge-violet">Tenant-wide</span>
+                                : <span className="badge badge-red">No clinic access recorded</span>}
+                          </div>
+                        </div>
+                        <select
+                          aria-label={`Role for ${user.displayName}`}
+                          value={user.role}
+                          disabled={pendingId === user.id}
+                          onChange={e => changeRole(user.id, e.target.value)}
+                          className="px-2.5 py-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] font-semibold text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40"
+                        >
+                          {ROLE_OPTIONS.map(r => <option key={r} value={r}>{r.replace('_', ' ')}</option>)}
+                          {COMPLIANCE_ROLE_OPTIONS.map(r => <option key={r} value={r}>{COMPLIANCE_ROLE_LABEL[r]}</option>)}
+                        </select>
+                        <button
+                          type="button"
+                          disabled={pendingId === user.id}
+                          onClick={() => setAccessEditor(editingAccess ? null : {
+                            userId: user.id,
+                            branchIds: assignedClinics.map(branch => branch.id),
+                            primaryBranchId: assignedClinics.find(branch => branch.isPrimary)?.id ?? assignedClinics[0]?.id ?? '',
+                          })}
+                          aria-expanded={editingAccess}
+                          className="text-[10px] font-semibold text-indigo hover:opacity-80 border border-[var(--b1)] px-2.5 py-1 rounded-lg disabled:opacity-40"
+                        >
+                          {editingAccess ? 'Close clinic access' : 'Edit clinic access'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={pendingId === user.id}
+                          onClick={() => toggleActive(user.id, !user.active)}
+                          aria-label={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
+                          title={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
+                          className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition disabled:opacity-40 ${user.active ? 'badge badge-emerald' : 'badge badge-red'}`}
+                        >
+                          {user.active ? 'Active' : 'Disabled'}
+                        </button>
                       </div>
-                      <div className="flex-1 min-w-[140px]">
-                        <p className="text-sm font-semibold text-t1">{user.displayName}</p>
-                        <p className="text-[11px] text-t3">{user.email}{user.branch ? ` · ${user.branch.name.split(' ')[0]}` : ''}</p>
-                      </div>
-                      <select
-                        aria-label={`Role for ${user.displayName}`}
-                        value={user.role}
-                        disabled={pendingId === user.id}
-                        onChange={e => changeRole(user.id, e.target.value)}
-                        className="px-2.5 py-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] font-semibold text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40"
-                      >
-                        {ROLE_OPTIONS.map(r => <option key={r} value={r}>{r.replace('_', ' ')}</option>)}
-                        {COMPLIANCE_ROLE_OPTIONS.map(r => <option key={r} value={r}>{COMPLIANCE_ROLE_LABEL[r]}</option>)}
-                      </select>
-                      <button
-                        type="button"
-                        disabled={pendingId === user.id}
-                        onClick={() => toggleActive(user.id, !user.active)}
-                        aria-label={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
-                        title={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
-                        className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition disabled:opacity-40 ${user.active ? 'badge badge-emerald' : 'badge badge-red'}`}
-                      >
-                        {user.active ? 'Active' : 'Disabled'}
-                      </button>
+
+                      {editingAccess && accessEditor && (
+                        <div className="mt-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                          <p className="text-xs font-bold text-t1">Clinic access for {user.displayName}</p>
+                          <p className="mt-0.5 text-[11px] text-t3">Select accessible clinics and identify the primary location. Owner/admin accounts may use no selection for tenant-wide access.</p>
+                          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                            {data.branches.filter(branch => branch.active !== false).map(branch => {
+                              const selected = accessEditor.branchIds.includes(branch.id);
+                              return (
+                                <label key={branch.id} className="flex items-center gap-2 rounded-lg border border-[var(--b1)] px-3 py-2 text-xs text-t2">
+                                  <input
+                                    type="checkbox"
+                                    checked={selected}
+                                    onChange={() => setAccessEditor(current => {
+                                      if (!current || current.userId !== user.id) return current;
+                                      const branchIds = selected ? current.branchIds.filter(id => id !== branch.id) : [...current.branchIds, branch.id];
+                                      return {
+                                        ...current,
+                                        branchIds,
+                                        primaryBranchId: branchIds.includes(current.primaryBranchId) ? current.primaryBranchId : (branchIds[0] ?? ''),
+                                      };
+                                    })}
+                                  />
+                                  <span>{branch.name}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                          {accessEditor.branchIds.length > 0 && (
+                            <label className="mt-3 block text-[11px] font-semibold text-t2">
+                              Primary clinic
+                              <select
+                                aria-label={`Primary clinic for ${user.displayName}`}
+                                value={accessEditor.primaryBranchId}
+                                onChange={e => setAccessEditor(current => current ? { ...current, primaryBranchId: e.target.value } : current)}
+                                className={`${inputClass} mt-1`}
+                              >
+                                {data.branches.filter(branch => accessEditor.branchIds.includes(branch.id)).map(branch => (
+                                  <option key={branch.id} value={branch.id}>{branch.name}</option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+                          <div className="mt-3 flex justify-end gap-2">
+                            <button type="button" onClick={() => setAccessEditor(null)} className="px-3 py-2 text-xs font-semibold text-t2">Cancel</button>
+                            <button type="button" disabled={pendingId === user.id} onClick={() => void saveClinicAccess(user)} className="rounded-lg bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-40">Save clinic access</button>
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  ))}
+                    );
+                  })}
                   {users.length === 0 && <p className="text-xs text-t3 py-6 text-center">No users match your search.</p>}
                 </div>
               </>
@@ -408,7 +543,7 @@ function RolesSection() {
   }
 
   return (
-    <BentoCard title="Roles & access" subtitle="Configured permission groups" headerRight={<Lock className="w-4 h-4 text-t3" />}>
+    <BentoCard title="Roles & access" subtitle="Tenant-defined permission groups; built-in staff roles are managed from Team & Users" headerRight={<Lock className="w-4 h-4 text-t3" />}>
       {roles.actionFailure && <ResourceErrorNotice title="That role change was not saved" failure={roles.actionFailure} className="mb-3" />}
       <ResourceSection
         label="Roles"
@@ -416,8 +551,8 @@ function RolesSection() {
         onRetry={roles.reload}
         empty={{
           icon: <Lock className="w-5 h-5" />,
-          title: 'No roles configured',
-          description: 'The role list loaded successfully and this workspace has no role definitions.',
+          title: 'No custom roles configured',
+          description: 'Built-in staff roles remain available. This workspace has no tenant-defined role overrides.',
         }}
       >
         {rows => (
@@ -427,7 +562,7 @@ function RolesSection() {
                 <span className={`text-[10px] font-bold px-2 py-1 rounded-lg shrink-0 ${accentBadge[r.accent] ?? 'badge badge-blue'}`}>{r.name}</span>
                 <p className="flex-1 min-w-0 text-[11px] text-t2">{r.description}</p>
                 <span className="text-[10px] text-t3 shrink-0">{r.userCount} users</span>
-                <button type="button" disabled={roles.busy} onClick={() => roles.remove(r.id)} className="text-t3 hover:text-red-v opacity-0 group-hover:opacity-100 disabled:opacity-40 shrink-0" aria-label="Delete role"><Trash2 className="w-3.5 h-3.5" /></button>
+                <button type="button" disabled={roles.busy} onClick={() => roles.remove(r.id)} className="text-t3 hover:text-red-v opacity-0 group-hover:opacity-100 focus-visible:opacity-100 disabled:opacity-40 shrink-0" aria-label="Delete role"><Trash2 className="w-3.5 h-3.5" /></button>
               </div>
             ))}
           </div>
@@ -590,8 +725,7 @@ function ChangePasswordCard() {
 
 /* ------------------------------------------------------------------ Security */
 
-function SecuritySection() {
-  const posture = useResource<SecurityPosture>('/v1/security/posture');
+function SecuritySection({ posture }: { posture: UseResourceResult<SecurityPosture> }) {
   const sessions = useResource<SessionRow[]>('/v1/security/sessions');
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [actionFailure, setActionFailure] = useState<ResourceFailure | null>(null);
@@ -611,10 +745,6 @@ function SecuritySection() {
 
   return (
     <div className="space-y-4">
-      {/* Self-service password change: available to EVERY authenticated user.
-          This is the only self-service password path in the product, so it must
-          not sit behind an admin-only gate. */}
-      <ChangePasswordCard />
       {actionFailure && <ResourceErrorNotice title="Those sessions were not revoked" failure={actionFailure} />}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
@@ -636,7 +766,7 @@ function SecuritySection() {
         <ResourceSection label="Security posture" state={posture.state} onRetry={posture.reload} lines={4} rowClassName="h-11 rounded-xl">
           {p => (
             <>
-              <p className="text-[11px] text-t3 mb-2">Auth mode: {p.authMode}</p>
+              <p className="text-[11px] text-t3 mb-2">Sign-in mode: {authModeLabel(p)}</p>
               <div className="grid sm:grid-cols-2 gap-2">
                 {[
                   { label: 'Role-based access control', ok: p.rbacEnabled },

@@ -297,6 +297,25 @@ describe('pilot import flow', () => {
     expect(publicStatus.statusCode).toBe(200);
     const publicStatusBody = publicStatus.json() as { checklist: { readinessScore: number } };
     expect(publicStatusBody.checklist.readinessScore).toBeGreaterThan(0);
+
+    const revoked = await app.inject({
+      method: 'DELETE',
+      url: `/v1/platform/tenants/${tenantId}/pilot-status-links/${shareBody.id}`,
+      headers: operationHeaders('revoke-share'),
+    });
+    expect(revoked.statusCode).toBe(200);
+    expect(revoked.json()).toMatchObject({ id: shareBody.id, active: false, alreadyInactive: false });
+    expect((await app.inject({ method: 'GET', url: `/v1/pilot/share/${shareBody.token}` })).statusCode).toBe(404);
+    expect(await db.auditEvent.count({ where: { tenantId, action: 'pilot.status_link.revoked', resourceId: shareBody.id } })).toBe(1);
+
+    const revokeRetry = await app.inject({
+      method: 'DELETE',
+      url: `/v1/platform/tenants/${tenantId}/pilot-status-links/${shareBody.id}`,
+      headers: operationHeaders('revoke-share-retry'),
+    });
+    expect(revokeRetry.statusCode).toBe(200);
+    expect(revokeRetry.json()).toMatchObject({ id: shareBody.id, active: false, alreadyInactive: true });
+    expect(await db.auditEvent.count({ where: { tenantId, action: 'pilot.status_link.revoked', resourceId: shareBody.id } })).toBe(1);
   });
 
   it('does not disclose or mark a public pilot share viewed when durable platform intent fails', async () => {

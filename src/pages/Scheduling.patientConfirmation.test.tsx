@@ -91,7 +91,9 @@ function respondWith(options: {
     }
     if (path.startsWith('/v1/providers/overview')) return Promise.resolve([]);
     if (path.startsWith('/v1/patients')) return Promise.resolve([]);
-    if (path.startsWith('/v1/branches')) return Promise.resolve([]);
+    if (path.startsWith('/v1/branches')) {
+      return Promise.resolve([{ id: 'branch-1', name: 'Bright Health Arlington', timezone: 'America/New_York' }]);
+    }
     if (path.startsWith('/v1/revenue-protection/appointment-queue')) return Promise.resolve({ appointments: [] });
     if (path === GROWTH_POLICY_PATH) return Promise.resolve({ source: 'default', noShowRiskHigh: 50 });
     return Promise.reject(new Error(`Unexpected request in test: ${path}`));

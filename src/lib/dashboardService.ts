@@ -74,6 +74,7 @@ export interface PriorityAction {
   id: string; title: string; description: string;
   category: ActionCategory; severity: Severity;
   revenueImpact: number | null; confidence: number | null; owner: string; dueDate: string | null;
+  updatedAt: string | null;
   cta: { label: string; route: string };
 }
 
@@ -179,7 +180,12 @@ export function campaignRoiFromRow(c: Record<string, unknown>): CampaignROI {
 
 /** Pure view mapping. It never manufactures confidence or financial values. */
 export function buildPriorityActions(opps: Array<Record<string, unknown>>, leaks: Array<Record<string, unknown>>): PriorityAction[] {
-    const sevFromScore = (s: number): Severity => s >= 80 ? 'critical' : s >= 60 ? 'high' : s >= 40 ? 'medium' : 'low';
+    const persistedSeverity = (value: unknown): Severity => {
+      const normalized = String(value ?? '').toLowerCase();
+      if (normalized === 'critical' || normalized === 'urgent') return 'critical';
+      if (normalized === 'high' || normalized === 'medium' || normalized === 'low') return normalized;
+      return 'medium';
+    };
     const catFromSource = (src: string): ActionCategory => {
       const s = src.toLowerCase();
       if (s.includes('no-show') || s.includes('no_show')) return 'no_shows';
@@ -204,25 +210,35 @@ export function buildPriorityActions(opps: Array<Record<string, unknown>>, leaks
     }[cat]);
     const actions: PriorityAction[] = [];
     for (const o of opps) {
-      const score = optionalNum(o.score ?? o.priority);
+      // The persisted Opportunity contract uses confidence/expectedRevenue,
+      // recommendedAction and an included ownerUser object. Read that real
+      // shape first; legacy aliases remain accepted for older API fixtures.
       const cat = catFromSource(String(o.source ?? o.type ?? o.category ?? 'revenue'));
+      const opportunityOwner = o.ownerUser && typeof o.ownerUser === 'object'
+        ? String((o.ownerUser as { displayName?: unknown }).displayName ?? '')
+        : '';
       actions.push({
         id: `opp-${String(o.id)}`, title: String(o.title ?? o.name ?? 'Revenue opportunity'),
-        description: String(o.description ?? o.summary ?? ''), category: cat, severity: score == null ? 'medium' : sevFromScore(score),
-        revenueImpact: num(o.estimatedValue ?? o.value ?? o.impact) || null,
-        confidence: optionalNum(o.confidence), owner: String(o.owner ?? 'Unassigned'),
-        dueDate: (o.dueAt as string) ?? null, cta: ctaFor(cat),
+        description: String(o.recommendedAction ?? o.trigger ?? o.description ?? o.summary ?? ''), category: cat, severity: persistedSeverity(o.urgency ?? o.severity),
+        revenueImpact: num(o.expectedRevenue ?? o.estimatedValue ?? o.value ?? o.impact) || null,
+        confidence: optionalNum(o.confidence), owner: opportunityOwner || String(o.owner ?? 'Unassigned'),
+        dueDate: (o.dueAt as string) ?? null, updatedAt: (o.updatedAt as string) ?? (o.createdAt as string) ?? null, cta: ctaFor(cat),
       });
     }
     for (const l of leaks) {
       const cat = catFromSource(String(l.source ?? l.category ?? 'revenue'));
       const value = num(l.estimatedValue ?? l.amount ?? l.value);
+      const leakOwner = l.ownerUser && typeof l.ownerUser === 'object'
+        ? String((l.ownerUser as { displayName?: unknown }).displayName ?? '')
+        : '';
       actions.push({
         id: `leak-${String(l.id)}`, title: String(l.source ?? l.title ?? 'Revenue leak'),
         description: String(l.evidence ?? l.description ?? ''), category: cat,
-        severity: value > 10000 ? 'critical' : value > 4000 ? 'high' : 'medium',
-        revenueImpact: value || null, confidence: optionalNum(l.confidence), owner: 'Unassigned',
-        dueDate: null, cta: ctaFor(cat),
+        // A dollar estimate is impact, not urgency. Until the record persists
+        // an explicit severity, show the neutral medium state.
+        severity: persistedSeverity(l.severity),
+        revenueImpact: value || null, confidence: optionalNum(l.confidence), owner: leakOwner || 'Unassigned',
+        dueDate: null, updatedAt: (l.updatedAt as string) ?? (l.createdAt as string) ?? null, cta: ctaFor(cat),
       });
     }
     return actions.sort((a, b) => (b.revenueImpact ?? 0) - (a.revenueImpact ?? 0)).slice(0, 8);

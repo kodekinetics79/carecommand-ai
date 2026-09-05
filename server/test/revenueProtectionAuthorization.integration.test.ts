@@ -36,6 +36,10 @@ async function makeTenant() {
     db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `provider-${id.slice(0, 8)}@revenue.test`, displayName: 'Provider' } }),
     db.user.create({ data: { tenantId: id, branchId: branchA.id, role: 'BILLING', active: true, email: `billing-${id.slice(0, 8)}@revenue.test`, displayName: 'Billing' } }),
   ]);
+  await Promise.all([
+    db.userClinicAccess.create({ data: { tenantId: id, userId: provider.id, branchId: branchA.id, isPrimary: true } }),
+    db.userClinicAccess.create({ data: { tenantId: id, userId: billing.id, branchId: branchA.id, isPrimary: true } }),
+  ]);
   const [paymentA, paymentB] = await Promise.all([
     db.paymentRequest.create({ data: { tenantId: id, branchId: branchA.id, amount: 25, currency: 'USD', status: 'pending', reason: 'Allowed', mode: 'mock', paymentUrl: 'https://pay.example.test/allowed' } }),
     db.paymentRequest.create({ data: { tenantId: id, branchId: branchB.id, amount: 75, currency: 'USD', status: 'pending', reason: 'Restricted', mode: 'mock', paymentUrl: 'https://pay.example.test/restricted' } }),
@@ -43,8 +47,11 @@ async function makeTenant() {
   return { id, branchA, branchB, provider, billing, paymentA, paymentB };
 }
 
-function headers(tenantId: string, userId: string) {
-  return { authorization: `Bearer ${app.jwt.sign({ tenantId, userId, role: 'OWNER', type: 'access' })}` };
+function headers(tenantId: string, userId: string, clinicId: string) {
+  return {
+    authorization: `Bearer ${app.jwt.sign({ tenantId, userId, role: 'OWNER', type: 'access' })}`,
+    'x-carecommand-clinic-id': clinicId,
+  };
 }
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);
@@ -57,14 +64,14 @@ afterAll(async () => {
 describe('revenue-protection authorization and access accounting', () => {
   it('denies a role without billing:read, then honors a tenant permission override and audits the read', async () => {
     const t = await makeTenant();
-    const denied = await app.inject({ method: 'GET', url: '/v1/revenue-protection/overview', headers: headers(t.id, t.provider.id) });
+    const denied = await app.inject({ method: 'GET', url: '/v1/revenue-protection/overview', headers: headers(t.id, t.provider.id, t.branchA.id) });
     expect(denied.statusCode).toBe(403);
     expect(denied.json()).toMatchObject({ error: 'insufficient_permission', permission: 'billing:read' });
 
     await db.roleDefinition.create({
       data: { tenantId: t.id, name: 'Provider', description: 'Scoped billing reader', permissions: ['billing:read'] },
     });
-    const allowed = await app.inject({ method: 'GET', url: '/v1/revenue-protection/overview', headers: headers(t.id, t.provider.id) });
+    const allowed = await app.inject({ method: 'GET', url: '/v1/revenue-protection/overview', headers: headers(t.id, t.provider.id, t.branchA.id) });
     expect(allowed.statusCode).toBe(200);
 
     const event = await db.auditEvent.findFirst({
@@ -77,7 +84,7 @@ describe('revenue-protection authorization and access accounting', () => {
 
   it('limits branch-bound payment lists and rejects an explicit cross-branch query', async () => {
     const t = await makeTenant();
-    const scoped = await app.inject({ method: 'GET', url: '/v1/revenue-protection/payments', headers: headers(t.id, t.billing.id) });
+    const scoped = await app.inject({ method: 'GET', url: '/v1/revenue-protection/payments', headers: headers(t.id, t.billing.id, t.branchA.id) });
     expect(scoped.statusCode).toBe(200);
     expect(scoped.json().paymentRequests.map((row: { id: string }) => row.id)).toEqual([t.paymentA.id]);
     expect(JSON.stringify(scoped.json())).not.toContain(t.paymentB.paymentUrl!);
@@ -88,7 +95,7 @@ describe('revenue-protection authorization and access accounting', () => {
     expect(paymentReadAudit).not.toBeNull();
     expect(JSON.stringify(paymentReadAudit?.metadata ?? {})).not.toContain('pay.example.test');
 
-    const denied = await app.inject({ method: 'GET', url: `/v1/revenue-protection/payments?branchId=${t.branchB.id}`, headers: headers(t.id, t.billing.id) });
+    const denied = await app.inject({ method: 'GET', url: `/v1/revenue-protection/payments?branchId=${t.branchB.id}`, headers: headers(t.id, t.billing.id, t.branchA.id) });
     expect(denied.statusCode).toBe(403);
   });
 
@@ -97,7 +104,7 @@ describe('revenue-protection authorization and access accounting', () => {
     const allowed = await app.inject({
       method: 'PATCH',
       url: `/v1/revenue-protection/payment/${t.paymentA.id}/status`,
-      headers: { ...headers(t.id, t.billing.id), 'content-type': 'application/json' },
+      headers: { ...headers(t.id, t.billing.id, t.branchA.id), 'content-type': 'application/json' },
       payload: { status: 'cancelled' },
     });
     expect(allowed.statusCode).toBe(200);
@@ -106,7 +113,7 @@ describe('revenue-protection authorization and access accounting', () => {
     const denied = await app.inject({
       method: 'PATCH',
       url: `/v1/revenue-protection/payment/${t.paymentB.id}/status`,
-      headers: { ...headers(t.id, t.billing.id), 'content-type': 'application/json' },
+      headers: { ...headers(t.id, t.billing.id, t.branchA.id), 'content-type': 'application/json' },
       payload: { status: 'cancelled' },
     });
     expect(denied.statusCode).toBe(403);
@@ -118,7 +125,7 @@ describe('revenue-protection authorization and access accounting', () => {
     const patientDenied = await app.inject({
       method: 'POST',
       url: '/v1/revenue-protection/payment/request',
-      headers: { ...headers(t.id, t.billing.id), 'content-type': 'application/json' },
+      headers: { ...headers(t.id, t.billing.id, t.branchA.id), 'content-type': 'application/json' },
       payload: { patientId: foreignPatient.id, amount: 10, reason: 'Cross branch attempt' },
     });
     expect(patientDenied.statusCode).toBe(403);
@@ -141,7 +148,7 @@ describe('revenue-protection authorization and access accounting', () => {
     const ruleDenied = await app.inject({
       method: 'POST',
       url: '/v1/revenue-protection/payment/request',
-      headers: { ...headers(t.id, t.billing.id), 'content-type': 'application/json' },
+      headers: { ...headers(t.id, t.billing.id, t.branchA.id), 'content-type': 'application/json' },
       payload: { patientId: localPatient.id, depositRuleId: foreignRule.id, amount: 10, reason: 'Cross branch rule' },
     });
     expect(ruleDenied.statusCode).toBe(403);

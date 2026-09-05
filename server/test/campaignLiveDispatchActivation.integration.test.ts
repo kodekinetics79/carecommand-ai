@@ -34,6 +34,8 @@ const originalEnv = {
   SMTP_USER: env.SMTP_USER,
   SMTP_PASS: env.SMTP_PASS,
   EMAIL_HTTP_API_URL: env.EMAIL_HTTP_API_URL,
+  EMAIL_HTTP_API_KEY: env.EMAIL_HTTP_API_KEY,
+  EMAIL_FROM_ADDRESS: env.EMAIL_FROM_ADDRESS,
 };
 
 /** Twilio configured with real-looking (non-"mock") credentials → live_supported. */
@@ -52,19 +54,26 @@ function clearEmailProvider() {
   e.SMTP_USER = undefined;
   e.SMTP_PASS = undefined;
   e.EMAIL_HTTP_API_URL = undefined;
+  e.EMAIL_HTTP_API_KEY = undefined;
+  e.EMAIL_FROM_ADDRESS = undefined;
 }
 
 async function makeTenant() {
   const id = randomUUID();
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `activation-${id.slice(0, 6)}`, slug: `activation-${id.slice(0, 8)}` } });
+  const branch = await db.branch.create({ data: { tenantId: id, name: 'Main clinic', location: 'Test' } });
   for (const featureKey of ['campaign_automation', 'patient_crm']) {
     await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey, enabled: true, source: 'test' } });
   }
   const users = {} as Record<Role, string>;
   for (const role of ['OWNER', 'ADMIN', 'MANAGER', 'AUDITOR'] as const) {
     const user = await db.user.create({
-      data: { tenantId: id, role, active: true, email: `${role}-${id.slice(0, 8)}@activation.test`, displayName: role },
+      data: {
+        tenantId: id, role, active: true,
+        ...(role === 'MANAGER' ? { branchId: branch.id } : {}),
+        email: `${role}-${id.slice(0, 8)}@activation.test`, displayName: role,
+      },
     });
     users[role] = user.id;
   }
@@ -140,14 +149,14 @@ describe('live campaign dispatch activation endpoint', () => {
     });
     expect(refused.statusCode).toBe(409);
     expect(refused.json()).toMatchObject({ error: 'provider_not_configured', channel: 'email' });
-    // The refusal states HOW FAR from ready we are — a count of the three keys
+    // The refusal states HOW FAR from ready we are — a count of the two keys
     // this test just cleared — and names none of them. Naming them would put
     // CareCommand's sending supplier and its server variables on a clinic's
     // screen, where nobody can act on either (8af601d). The operator-only
     // detail stays in the Control Tower.
-    expect(refused.json().missingConfigCount).toBe(3);
+    expect(refused.json().missingConfigCount).toBe(2);
     expect(refused.json().missing).toBeUndefined();
-    for (const leak of ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS', 'smtp']) {
+    for (const leak of ['EMAIL_HTTP_API_URL', 'EMAIL_HTTP_API_KEY', 'http-email']) {
       expect(JSON.stringify(refused.json())).not.toContain(leak);
     }
     expect(await db.campaignLiveDispatchActivation.count({ where: { tenantId: tenant.id } })).toBe(0);

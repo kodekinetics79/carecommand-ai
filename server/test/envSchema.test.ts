@@ -49,6 +49,7 @@ const productionProfile = {
   NODE_ENV: 'production' as const,
   PLATFORM_DATABASE_URL: 'postgresql://app_platform:pass@db.carecommand.example.com:5432/db',
   PUBLIC_API_URL: 'https://api.pilot.carecommand.example.com',
+  PUBLIC_APP_URL: 'https://pilot.carecommand.example.com',
   CORS_ORIGINS: 'https://pilot.carecommand.example.com',
   COOKIE_SAMESITE: 'none' as const,
   METRICS_TOKEN: 'metrics-test-token',

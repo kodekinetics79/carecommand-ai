@@ -240,7 +240,10 @@ describe('D13 — the kind histogram is computed in SQL and still agrees with th
   it('honours the branch scope the queue uses', async () => {
     const f = await makeFixture();
     const other = await db.branch.create({ data: { tenantId: f.tenantId, name: 'Other', location: 'y', timezone: 'UTC' } });
-    await fileTask(f, f.a, 'message', { message: 'Branch A.' }, `call-${randomUUID()}`);
+    // Use the clinic's recorded call so the task resolves to the same branch
+    // the scoped queue is proving. An unknown call id is deliberately filed
+    // unscoped and must not leak into a clinic-specific queue.
+    await fileTask(f, f.a, 'message', { message: 'Branch A.' });
     await db.staffTask.create({
       data: {
         tenantId: f.tenantId, branchId: other.id, title: 'Elsewhere', priority: 'high',

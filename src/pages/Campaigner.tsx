@@ -12,6 +12,9 @@ import ResourceSection from '../components/ui/ResourceSection';
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import ConfirmationModal from '../components/workflow/ConfirmationModal';
 import { useResource } from '../hooks/useResource';
+import { useApiResource } from '../hooks/useApiResource';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 import { receivedData } from '../lib/resourceState';
 import {
   crmApi, AUDIENCE_TYPES, CAMPAIGN_TYPES, CAMPAIGN_GOALS, CAMPAIGN_STATUS_META, DELIVERY_STATUS_META,
@@ -54,6 +57,7 @@ function displayLabel(value: string | null): string {
 // source, so this must not be re-created on every render.
 const loadCampaigns = (signal: AbortSignal): Promise<Campaign[]> => crmApi.listCampaigns(signal);
 const loadAttribution = (signal: AbortSignal): Promise<CampaignAttributionSummary> => crmApi.attributionSummary(signal);
+type BranchOption = { id: string; name: string };
 
 const STATUS_FILTERS = [
   { id: 'all', label: 'All', match: () => true },
@@ -66,6 +70,9 @@ const STATUS_FILTERS = [
 export default function Campaigner() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user } = useSession();
+  const canManage = hasPermission(user, 'campaign:manage');
+  const { data: branchOptions, error: branchError } = useApiResource<BranchOption, BranchOption>('/v1/branches?limit=100', [], row => row);
 
   // The decision the user already made, wherever they made it. Read once per
   // navigation: a handoff is an instruction to open the creator, not a filter
@@ -137,9 +144,11 @@ export default function Campaigner() {
             <button type="button" onClick={() => navigate('/revenue')} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] transition">
               Revenue reporting
             </button>
-            <button type="button" onClick={() => openCreator({})} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-              <Plus className="w-4 h-4" /> New campaign
-            </button>
+            {canManage && (
+              <button type="button" onClick={() => openCreator({})} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+                <Plus className="w-4 h-4" /> New campaign
+              </button>
+            )}
           </div>
         }
       />
@@ -201,7 +210,7 @@ export default function Campaigner() {
       {/* Goal selector — every objective here maps to a campaign type AND to an
           audience the server can actually preview, so choosing one opens the
           creator already carrying that decision rather than asking again. */}
-      <BentoCard title="Campaign Goal Selector" subtitle="Each goal opens a draft with its audience source selected" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
+      {canManage ? <BentoCard title="Campaign Goal Selector" subtitle="Each goal opens a draft with its audience source selected" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {GOAL_ORDER.map(goalId => {
             const goal = CAMPAIGN_GOALS[goalId];
@@ -228,7 +237,11 @@ export default function Campaigner() {
           })}
         </div>
         <p className="mt-3 text-[11px] text-t3">Starting a draft does not authorize an audience, schedule delivery, or contact anyone. Recipient consent, suppression, channel eligibility and jurisdiction are checked when the exact preview is authorized and again at dispatch.</p>
-      </BentoCard>
+      </BentoCard> : (
+        <div role="status" className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-4 py-3 text-sm text-t2">
+          Read-only campaign access. An owner, administrator, or campaign manager must create, edit, approve, or dispatch outreach.
+        </div>
+      )}
 
       <div className="grid gap-4 xl:grid-cols-[360px_1fr] items-start">
         {/* Library */}
@@ -306,9 +319,12 @@ export default function Campaigner() {
 
         {/* Creator / detail */}
         <div className="space-y-4">
-          {creatorDefaults && (
+          {creatorDefaults && canManage && (
             <CampaignCreator
               defaults={creatorDefaults}
+              branches={branchOptions}
+              branchError={branchError}
+              user={user}
               onCancel={() => setCreatorDefaults(null)}
               onCreated={id => { setCreatorDefaults(null); campaigns.reload(); setChosenId(id); }}
             />
@@ -317,6 +333,7 @@ export default function Campaigner() {
             <CampaignDetail
               key={selected.id}
               campaign={selected}
+              canManage={canManage}
               onChanged={campaigns.reload}
               onDeleted={() => { setChosenId(null); campaigns.reload(); }}
             />
@@ -445,14 +462,22 @@ function AttributionBasisNote({ basis, windows }: { basis: CampaignAttributionBa
  * unchosen and blocks creation until the operator picks one, because that field
  * decides who gets contacted.
  */
-function CampaignCreator({ defaults, onCreated, onCancel }: {
-  defaults: CampaignHandoff; onCreated: (id: string) => void; onCancel: () => void;
+function CampaignCreator({ defaults, branches, branchError, user, onCreated, onCancel }: {
+  defaults: CampaignHandoff;
+  branches: BranchOption[];
+  branchError: string | null;
+  user: ReturnType<typeof useSession>['user'];
+  onCreated: (id: string) => void;
+  onCancel: () => void;
 }) {
   const resolved = resolveHandoffDefaults(defaults);
   const [name, setName] = useState(resolved.name);
   const [campaignType, setType] = useState<CampaignType | ''>(resolved.campaignType ?? '');
   const [audienceType, setAudience] = useState<AudienceType | ''>(resolved.audienceType ?? '');
   const [channel, setChannel] = useState<CommChannel>(resolved.channel);
+  const tenantWideScope = user?.role === 'OWNER' || user?.role === 'ADMIN';
+  const assignedBranchId = user?.branchId ?? user?.clinicAccesses?.find(row => row.isPrimary)?.id ?? '';
+  const [branchId, setBranchId] = useState(tenantWideScope ? '' : assignedBranchId);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -468,6 +493,7 @@ function CampaignCreator({ defaults, onCreated, onCancel }: {
         campaignType: campaignType as CampaignType,
         audienceType: audienceType as AudienceType,
         channel,
+        ...(branchId ? { branchId } : {}),
       });
       onCreated(row.id);
     } catch (e) {
@@ -502,6 +528,19 @@ function CampaignCreator({ defaults, onCreated, onCancel }: {
         <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Channel</span>
           <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>{CHANNELS.map(c => <option key={c} value={c}>{displayLabel(c)}</option>)}</select></label>
       </div>
+      {tenantWideScope ? (
+        <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Clinic scope</span>
+          <select aria-label="Clinic scope" className={inputCls} value={branchId} onChange={event => setBranchId(event.target.value)}>
+            <option value="">All clinics in this workspace</option>
+            {branches.map(branch => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
+          </select>
+          {branchError && <span className="block text-[11px] text-red-v">Clinic choices are unavailable. Do not create a clinic-specific campaign until they reload.</span>}
+        </label>
+      ) : (
+        <p className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-[11px] text-t2">
+          Clinic scope: {branches.find(branch => branch.id === assignedBranchId)?.name ?? 'your currently assigned clinic'}. The server locks this campaign to that clinic.
+        </p>
+      )}
       <p className="text-[11px] text-t3">The audience decides who is contacted, so it is never assumed. The draft is created as approval-required; nothing is sent until an exact server preview is authorized.</p>
       {err && <p className="text-xs text-red-v">{err}</p>}
       <div className="flex gap-2">
@@ -512,7 +551,7 @@ function CampaignCreator({ defaults, onCreated, onCancel }: {
   );
 }
 
-function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign; onChanged: () => void; onDeleted: () => void }) {
+function CampaignDetail({ campaign, canManage, onChanged, onDeleted }: { campaign: Campaign; canManage: boolean; onChanged: () => void; onDeleted: () => void }) {
   const [preview, setPreview] = useState<AudiencePreview | null>(null);
   const [draft, setDraft] = useState<CampaignDraft | null>(null);
   const [launch, setLaunch] = useState<LaunchResult | null>(null);
@@ -536,7 +575,7 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
 
   const loadAux = useCallback(async () => {
     const [audienceResult, deliveryResult, attributionResult] = await Promise.allSettled([
-      crmApi.previewAudience(audienceType, channel),
+      crmApi.previewCampaignAudience(campaign.id),
       crmApi.listDeliveries(campaign.id),
       crmApi.campaignAttribution(campaign.id),
     ]);
@@ -564,13 +603,13 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
       setAttributionError('Attribution evidence is unavailable. Do not infer that this campaign produced no bookings or no revenue.');
       setAttributionLoaded(false);
     }
-  }, [audienceType, channel, campaign.id]);
+  }, [campaign.id]);
 
   useEffect(() => {
     let active = true;
     void (async () => {
       const [audienceResult, deliveryResult, attributionResult] = await Promise.allSettled([
-        crmApi.previewAudience(audienceType, channel),
+        crmApi.previewCampaignAudience(campaign.id),
         crmApi.listDeliveries(campaign.id),
         crmApi.campaignAttribution(campaign.id),
       ]);
@@ -603,7 +642,7 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
     try { await fn(); } catch (e) { setError(e instanceof Error ? e.message : 'Action failed'); } finally { setBusy(false); }
   }
 
-  const actions = campaign.allowedActions;
+  const actions = canManage ? campaign.allowedActions : [];
 
   async function prepareConfirmation(kind: 'approve' | 'launch') {
     await run(async () => {
@@ -647,6 +686,7 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
           <span className="badge badge-blue">{displayLabel(campaign.campaignType)}</span>
           <span className="badge badge-violet">{displayLabel(campaign.audienceType)}</span>
           <span className="badge badge-blue">{displayLabel(campaign.channel)}</span>
+          <span className="badge badge-blue">{campaign.branchId ? 'Single-clinic scope' : 'All-clinic scope'}</span>
           {campaign.requiresApprovalPending && <span className="badge badge-amber">Approval required</span>}
           {campaign.dispatchAuthorizationRecorded && <span className="badge badge-emerald">Dispatch authorization recorded</span>}
         </div>
@@ -682,7 +722,7 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
           {actions.includes('cancel') && (
             <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.cancel(campaign.id); setNotice('Campaign canceled.'); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-amber-v/30 text-amber-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-amber-v/5 disabled:opacity-50"><Ban className="w-3.5 h-3.5" /> Cancel campaign</button>
           )}
-          <button type="button" disabled={busy} onClick={() => setConfirmDelete(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-red-v/30 text-red-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-red-v/5 disabled:opacity-50"><Trash2 className="w-3.5 h-3.5" /> Archive</button>
+          {canManage && <button type="button" disabled={busy} onClick={() => setConfirmDelete(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-red-v/30 text-red-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-red-v/5 disabled:opacity-50"><Trash2 className="w-3.5 h-3.5" /> Archive</button>}
         </div>
         {confirmDelete && (
           <div className="flex items-center justify-between gap-3 rounded-lg border border-red-v/30 bg-red-v/5 px-3 py-2 text-[11px]">

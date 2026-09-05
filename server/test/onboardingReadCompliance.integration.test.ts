@@ -128,7 +128,11 @@ describe('staff tasks — permission and lifecycle safety', () => {
     const denied = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.AUDITOR)), payload: { status: 'COMPLETED' } });
     expect(denied.statusCode).toBe(403);
 
-    const completed = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.FRONT_DESK)), payload: { status: 'COMPLETED' } });
+    const completed = await app.inject({
+      method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`,
+      headers: auth(tok(t.id, t.users.FRONT_DESK)),
+      payload: { status: 'COMPLETED', outcomeCode: 'reached' },
+    });
     const reopened = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.ADMIN)), payload: { status: 'OPEN' } });
     expect(completed.statusCode).toBe(200);
     expect(reopened.statusCode).toBe(409);

@@ -19,6 +19,7 @@ import {
 } from '../../lib/security';
 import { generateTotpSecret, verifyTotp, totpAuthUri } from '../../lib/totp';
 import { getRequestPermissions } from '../../lib/permissions';
+import { deliverPasswordReset } from '../../lib/passwordResetDelivery';
 
 const loginSchema = z.object({
   email: z.string().email().trim().toLowerCase(),
@@ -31,6 +32,11 @@ const csrfCookieName = 'cc_csrf';
 const refreshCookiePath = '/v1/auth';
 const csrfCookiePath = '/';
 const refreshTokenTtlSeconds = 60 * 60 * 24 * 30;
+const clinicScopedRoles = new Set(['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING']);
+
+function missingRequiredClinicScope(user: { role: string; branchId: string | null }) {
+  return clinicScopedRoles.has(user.role) && !user.branchId;
+}
 const accessTokenTtl = '15m';
 const accessTokenTtlMinutes = 15;
 const authErrorMessage = 'Session expired. Please sign in again.';
@@ -207,14 +213,28 @@ async function issueMfaFlowToken(
 async function resolveSessionUser(userId: string) {
   return db.user.findFirst({
     where: { id: userId, active: true },
-    include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
+    include: {
+      tenant: { select: { id: true, name: true, slug: true, status: true } },
+      branch: { select: { id: true, name: true, location: true } },
+      clinicAccesses: {
+        where: { branch: { active: true } },
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        select: { isPrimary: true, branch: { select: { id: true, name: true, location: true } } },
+      },
+    },
   });
 }
 
 function serializeUser(user: SessionResolvedUser | LoginUser) {
+  const tenantWide = user.role === 'OWNER' || user.role === 'ADMIN';
+  const clinicAccesses = !tenantWide && 'clinicAccesses' in user
+    ? user.clinicAccesses.map(access => ({ ...access.branch, isPrimary: access.isPrimary }))
+    : undefined;
   return {
     id: user.id, email: user.email, displayName: user.displayName, role: user.role,
-    branchId: user.branchId, branch: user.branch,
+    branchId: tenantWide ? null : user.branchId,
+    branch: tenantWide ? null : user.branch,
+    ...(clinicAccesses ? { clinicAccesses } : {}),
     tenant: { id: user.tenant.id, name: user.tenant.name, slug: user.tenant.slug },
     active: user.active,
     mfaEnabled: user.mfaEnabled,
@@ -238,6 +258,31 @@ async function auditAuth(
       tenantId, actorUserId: userId ?? undefined, action, resource: 'session',
       resourceId: userId ?? undefined,
       requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+      metadata: metadata as never,
+    },
+  });
+}
+
+async function auditPasswordRecoveryRequest(
+  request: FastifyRequest,
+  tenantId: string,
+  subjectUserId: string,
+  action: string,
+  metadata: Record<string, unknown>,
+  client: Prisma.TransactionClient | typeof db = db,
+) {
+  await client.auditEvent.create({
+    data: {
+      tenantId,
+      // The public requester has not authenticated as the affected user. Keep
+      // actor attribution empty and represent that user only as the subject.
+      actorUserId: undefined,
+      action,
+      resource: 'password_reset',
+      resourceId: subjectUserId,
+      requestId: request.id,
+      ipAddress: request.ip,
+      userAgent: request.headers['user-agent'],
       metadata: metadata as never,
     },
   });
@@ -361,6 +406,14 @@ export const authRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.unauthorized(genericAuthError);
     }
 
+    if (missingRequiredClinicScope(user)) {
+      await auditAuth(request, user.tenantId, user.id, 'auth.login.denied', { reason: 'missing_clinic_scope' });
+      return reply.code(403).send({
+        status: 'clinic_assignment_required',
+        message: 'This operational account has no clinic assignment. Contact your administrator before signing in.',
+      });
+    }
+
     // Password expiry → require reset (no session issued).
     if (policy?.passwordExpiryDays && policy.passwordExpiryDays > 0 && user.passwordChangedAt) {
       const expiresAt = new Date(user.passwordChangedAt.getTime() + policy.passwordExpiryDays * 86400000);
@@ -428,7 +481,15 @@ export const authRoutes: FastifyPluginAsync = async app => {
     });
     const user = await db.user.findFirst({
       where: { id: resolved.resourceId, refreshTokenHash, refreshTokenExpiresAt: { gt: new Date() }, active: true },
-      include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
+      include: {
+        tenant: { select: { id: true, name: true, slug: true, status: true } },
+        branch: { select: { id: true, name: true, location: true } },
+        clinicAccesses: {
+          where: { branch: { active: true } },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          select: { isPrimary: true, branch: { select: { id: true, name: true, location: true } } },
+        },
+      },
     });
     if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
     if (tenantBlocksSessions(user.tenant.status)) {
@@ -438,6 +499,17 @@ export const authRoutes: FastifyPluginAsync = async app => {
       });
       clearAuthCookies(reply);
       return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+    }
+    if (missingRequiredClinicScope(user)) {
+      await db.$transaction(async tx => {
+        await tx.user.update({ where: { id: user.id }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
+        await auditAuth(request, user.tenantId, user.id, 'auth.refresh.denied', { reason: 'missing_clinic_scope' }, tx);
+      });
+      clearAuthCookies(reply);
+      return reply.code(403).send({
+        status: 'clinic_assignment_required',
+        message: 'This operational account has no clinic assignment. Contact your administrator before signing in.',
+      });
     }
     const policy = await tenantPolicy(user.tenantId);
     if (policy?.requireMfa && !user.mfaEnabled) {
@@ -491,7 +563,13 @@ export const authRoutes: FastifyPluginAsync = async app => {
     const permissions = [...await getRequestPermissions(request)].sort();
     return {
       user: serializeUser(user),
-      access: { tenantId: user.tenantId, branchId: user.branchId, role: user.role, permissions },
+      access: {
+        tenantId: user.tenantId,
+        branchId: request.auth.branchId ?? null,
+        branchIds: request.auth.branchIds,
+        role: user.role,
+        permissions,
+      },
     };
   });
 
@@ -509,23 +587,35 @@ export const authRoutes: FastifyPluginAsync = async app => {
   });
 
   // ===== Password reset ===================================================
-  app.post('/password-reset/request', rateSensitive, async request => {
-    const { email } = z.object({ email: z.string().email().trim().toLowerCase() }).parse(request.body);
-    // Always return a generic response (no account-existence leak).
-    const generic = { status: 'ok', message: 'If exactly one active account exists for that email, continue with the local reset token.' } as Record<string, unknown>;
-    // Production has no password-reset delivery adapter. Do not mint an
-    // unusable secret or imply that a reset message was sent.
-    if (isProduction()) return {
+  app.post('/password-reset/request', rateSensitive, async (request, reply) => {
+    const responseStartedAt = Date.now();
+    const { email, tenantSlug } = z.object({
+      email: z.string().email().trim().toLowerCase(),
+      tenantSlug: z.string().trim().toLowerCase().min(2).max(80).optional(),
+    }).parse(request.body);
+    // Every outcome is deliberately identical. This response must not reveal
+    // account existence, tenant status, workspace ambiguity, provider setup,
+    // delivery success, or the resend cooldown.
+    const generic = {
       status: 'ok',
-      message: 'Self-service password reset is not configured. Contact your clinic administrator for account recovery.',
-      resetAvailable: false,
-      emailDelivered: false,
+      message: `If an active account matches, we’ll email a reset link. It expires in ${env.PASSWORD_RESET_TTL_MINUTES} minutes.`,
+    } as Record<string, unknown>;
+    reply.header('Cache-Control', 'no-store');
+    const finish = async (body: Record<string, unknown> = generic) => {
+      // The provider call is capped below this floor. Matching public response
+      // timing prevents a remote probe from distinguishing known accounts from
+      // unknown, inactive, ambiguous, or globally unconfigured outcomes.
+      if (isProduction()) {
+        const remaining = 3000 - (Date.now() - responseStartedAt);
+        if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
+      }
+      return reply.send(body);
     };
-    const candidates = await resolveAuthLoginCandidates(email);
-    // Password-reset URLs do not currently carry a workspace selector. Fail
-    // closed for an ambiguous multi-workspace email instead of resetting an
-    // arbitrary account.
-    if (candidates.length !== 1 || tenantBlocksSessions(candidates[0].tenant.status)) return generic;
+
+    const candidates = await resolveAuthLoginCandidates(email, tenantSlug);
+    // An email may legitimately exist in several customer workspaces. Require
+    // the optional workspace selector rather than choosing an arbitrary tenant.
+    if (candidates.length !== 1 || tenantBlocksSessions(candidates[0].tenant.status)) return finish();
     const candidate = candidates[0];
     enterTenantContext({
       tenantId: candidate.tenantId,
@@ -535,29 +625,78 @@ export const authRoutes: FastifyPluginAsync = async app => {
       requestId: request.id,
     });
     const user = await db.user.findFirst({ where: { id: candidate.id, email, active: true } });
-    if (!user) return generic;
+    if (!user) return finish();
 
     const rawToken = createResetToken();
     const tokenHash = hashResetToken(rawToken);
     const expiresAt = new Date(Date.now() + env.PASSWORD_RESET_TTL_MINUTES * 60000);
-    // Invalidate any prior unused tokens for this user, then issue one.
-    await db.$transaction(async tx => {
-      await tx.passwordResetToken.updateMany({ where: { userId: user.id, usedAt: null }, data: { usedAt: new Date() } });
-      await tx.passwordResetToken.create({ data: { tenantId: user.tenantId, userId: user.id, tokenHash, expiresAt } });
-      await auditAuth(request, user.tenantId, user.id, 'auth.password.reset.requested', { ttlMinutes: env.PASSWORD_RESET_TTL_MINUTES }, tx);
+    const passwordVersionAtIssuance = user.passwordChangedAt?.getTime() ?? null;
+    // Serialize issuance per user. A short resend cooldown prevents email
+    // bombing and guarantees concurrent clicks do not send several valid links.
+    const issued = await db.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth-password-reset-user:${user.id}`}::text, 0))::text AS locked`;
+      const recent = await tx.passwordResetToken.findFirst({
+        where: { userId: user.id, usedAt: null, expiresAt: { gt: new Date() }, createdAt: { gt: new Date(Date.now() - 120_000) } },
+        select: { id: true },
+      });
+      if (recent) {
+        await auditPasswordRecoveryRequest(request, user.tenantId, user.id, 'auth.password.reset.requested', { reused: true }, tx);
+        return null;
+      }
+      const token = await tx.passwordResetToken.create({
+        data: { tenantId: user.tenantId, userId: user.id, tokenHash, expiresAt, activatedAt: isProduction() ? null : new Date() },
+        select: { id: true },
+      });
+      await auditPasswordRecoveryRequest(request, user.tenantId, user.id, 'auth.password.reset.requested', { ttlMinutes: env.PASSWORD_RESET_TTL_MINUTES, reused: false }, tx);
+      return token;
     });
+    if (!issued) return finish();
 
-    // No email provider is integrated. In non-production we return the token so
-    // the flow is testable; in production the raw token is NEVER exposed.
-    if (!isProduction()) {
+    // Local/test keeps the existing one-time echo for deterministic automated
+    // coverage. Production never returns or logs the raw credential.
+    if (env.NODE_ENV === 'test' || env.E2E_TEST_MODE) {
       request.log.info({ userId: user.id }, 'password reset token issued (dev-only echo)');
-      return { ...generic, resetAvailable: true, devToken: rawToken, emailDelivered: false, note: 'Dev mode: token returned for testing only. No email provider integrated.' };
+      return finish({ ...generic, devToken: rawToken });
     }
-    return { ...generic, resetAvailable: false, emailDelivered: false };
+
+    const delivery = await deliverPasswordReset({ email: user.email, tenantName: candidate.tenant.name, token: rawToken, deliveryId: issued.id });
+    if (!delivery.ok) {
+      await db.$transaction(async tx => {
+        await tx.passwordResetToken.deleteMany({ where: { id: issued.id, userId: user.id, activatedAt: null } });
+        await auditPasswordRecoveryRequest(request, user.tenantId, user.id, 'auth.password.reset.delivery_failed', { mode: delivery.mode, status: delivery.status }, tx);
+      }).catch(error => request.log.error({ err: error, tenantId: user.tenantId, userId: user.id }, 'password reset failure cleanup failed'));
+      request.log.warn({ tenantId: user.tenantId, userId: user.id, mode: delivery.mode, status: delivery.status }, 'password reset delivery failed');
+      return finish();
+    }
+
+    await db.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth-password-reset-user:${user.id}`}::text, 0))::text AS locked`;
+      const currentUser = await tx.user.findFirst({ where: { id: user.id, tenantId: user.tenantId, active: true }, select: { passwordChangedAt: true } });
+      const currentPasswordVersion = currentUser?.passwordChangedAt?.getTime() ?? null;
+      if (!currentUser || currentPasswordVersion !== passwordVersionAtIssuance) {
+        await tx.passwordResetToken.deleteMany({ where: { id: issued.id, activatedAt: null } });
+        return false;
+      }
+      await tx.passwordResetToken.updateMany({
+        where: { userId: user.id, id: { not: issued.id }, usedAt: null },
+        data: { usedAt: new Date() },
+      });
+      const activated = await tx.passwordResetToken.updateMany({
+        where: { id: issued.id, userId: user.id, activatedAt: null, usedAt: null, expiresAt: { gt: new Date() } },
+        data: { activatedAt: new Date() },
+      });
+      if (activated.count !== 1) return false;
+      await auditPasswordRecoveryRequest(request, user.tenantId, user.id, 'auth.password.reset.delivered', { mode: delivery.mode }, tx);
+      return true;
+    }).then(activated => {
+      if (!activated) request.log.error({ tenantId: user.tenantId, userId: user.id }, 'password reset credential was delivered but not activated');
+    }).catch(error => request.log.error({ err: error, tenantId: user.tenantId, userId: user.id }, 'password reset credential activation failed'));
+    return finish();
   });
 
   app.post('/password-reset/confirm', rateSensitive, async (request, reply) => {
-    const { token, newPassword } = z.object({ token: z.string().min(10).max(200), newPassword: z.string().min(1).max(200) }).parse(request.body);
+    reply.header('Cache-Control', 'no-store');
+    const { token, newPassword } = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{43}$/), newPassword: z.string().min(1).max(200) }).parse(request.body);
     const policyCheck = validatePassword(newPassword);
     if (!policyCheck.ok) throw app.httpErrors.badRequest(policyCheck.message ?? 'Password does not meet policy.');
 
@@ -573,18 +712,18 @@ export const authRoutes: FastifyPluginAsync = async app => {
     });
     const passwordHash = await generatePasswordHash(newPassword);
     await db.$transaction(async tx => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth-password-reset:${resolved.tokenId}`}::text, 0))::text AS locked`;
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth-password-reset-user:${resolved.userId}`}::text, 0))::text AS locked`;
       const transitionAt = new Date();
       const record = await tx.passwordResetToken.findFirst({
-        where: { id: resolved.tokenId, tenantId: resolved.tenantId, userId: resolved.userId, tokenHash, usedAt: null, expiresAt: { gt: transitionAt } },
+        where: { id: resolved.tokenId, tenantId: resolved.tenantId, userId: resolved.userId, tokenHash, activatedAt: { not: null }, usedAt: null, expiresAt: { gt: transitionAt } },
         select: { id: true, tenantId: true, userId: true },
       });
       if (!record) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
       const consumed = await tx.passwordResetToken.updateMany({
-        where: { id: record.id, tokenHash, usedAt: null, expiresAt: { gt: transitionAt } },
+        where: { tenantId: record.tenantId, userId: record.userId, usedAt: null },
         data: { usedAt: transitionAt },
       });
-      if (consumed.count !== 1) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
+      if (consumed.count < 1) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
       await lockUserAuthState(tx, record.tenantId, record.userId);
       await tx.user.update({ where: { id: record.userId }, data: { passwordHash, passwordChangedAt: transitionAt, failedLoginCount: 0, lockedUntil: null, refreshTokenHash: null, refreshTokenExpiresAt: null } });
       await auditAuth(request, record.tenantId, record.userId, 'auth.session.revoked', { reason: 'password_reset' }, tx);
@@ -593,9 +732,8 @@ export const authRoutes: FastifyPluginAsync = async app => {
     return reply.send({ status: 'ok', message: 'Your password has been reset. Please sign in.' });
   });
 
-  // Self-service change for a signed-in user. There is no delivery adapter to
-  // mail a reset token, so possession of the current password is the proof, and
-  // it is verified before anything is written.
+  // Self-service change for a signed-in user. Possession of the current
+  // password is the proof, and it is verified before anything is written.
   app.post('/password-change', { preHandler: app.authenticate, ...rateSensitive }, async (request, reply) => {
     const { currentPassword, newPassword } = z.object({
       currentPassword: z.string().min(1).max(200),
@@ -745,7 +883,8 @@ export const authRoutes: FastifyPluginAsync = async app => {
     // Login-flow tokens complete the sign-in by issuing a real session.
     if (session) {
       setAuthCookies(reply, session.refreshToken, session.csrfToken);
-      const sessionUser = justEnabled ? { ...user, mfaEnabled: true, mfaEnrolledAt: enrolledAt } : user;
+      const sessionUser = await resolveSessionUser(user.id);
+      if (!sessionUser) throw app.httpErrors.unauthorized(authErrorMessage);
       return { status: 'ok', accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(sessionUser) };
     }
     return { status: 'ok', enabled: true };

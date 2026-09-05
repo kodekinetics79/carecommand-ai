@@ -53,7 +53,7 @@ function stripeSig(body: string) {
 }
 
 interface Clinic {
-  id: string; branchId: string; providerId: string; patientId: string; accountId: string;
+  id: string; branchId: string; providerId: string; patientId: string; accountId: string; deviceId: string;
   adminId: string; payerId: string; policyId: string; externalRef: string; ip: string; portalToken: string;
 }
 
@@ -68,12 +68,13 @@ async function provisionClinic(seq: number): Promise<Clinic> {
   const provUser = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@sim.test`, displayName: 'Dr Sim' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care', rating: 4.7, reviewCount: 9 } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Sim', lastName: `Patient${seq}`, lifecycleStage: 'NEW' } });
+  const device = await db.device.create({ data: { tenantId: id, branchId: branch.id, name: 'Sim glucose meter', deviceType: 'glucose_meter', active: true, status: 'online' } });
   const payer = await db.insurancePayer.create({ data: { tenantId: id, name: 'Aetna', sourceProvider: 'stedi', active: true } });
   const policy = await db.patientInsurancePolicy.create({ data: { tenantId: id, branchId: branch.id, patientId: patient.id, payerId: payer.id, planName: 'Aetna PPO', memberId: 'AET-110293', coverageOrder: 1, active: true } });
   const account = await db.patientPortalAccount.create({ data: { tenantId: id, patientId: patient.id, status: 'active', email: `sp-${id.slice(0, 8)}@sim.test` } });
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `ad-${id.slice(0, 8)}@sim.test`, displayName: 'Admin' } });
   const portalToken = await issuePortalSession(app, account, db);
-  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, adminId: admin.id, payerId: payer.id, policyId: policy.id, externalRef: `EXT-${id.slice(0, 8)}`, ip: `203.0.113.${(seq % 240) + 10}`, portalToken };
+  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, deviceId: device.id, adminId: admin.id, payerId: payer.id, policyId: policy.id, externalRef: `EXT-${id.slice(0, 8)}`, ip: `203.0.113.${(seq % 240) + 10}`, portalToken };
 }
 
 type StepResult = { ok: boolean; detail: string };
@@ -138,7 +139,7 @@ async function runJourney(c: Clinic): Promise<Record<string, StepResult>> {
     create: { tenantId: c.id, providerKey: 'withings', displayName: 'Withings', category: 'DIRECT_API', mode: 'sandbox', status: 'SANDBOX', encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret: deviceSecret })), webhookConfigured: true },
     update: { encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret: deviceSecret })), webhookConfigured: true },
   });
-  await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: c.patientId, providerKey: 'withings', externalRef: c.externalRef } });
+  await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: c.patientId, providerKey: 'withings', externalRef: c.externalRef, deviceId: c.deviceId } });
   const deviceRaw = JSON.stringify({ readings: [{ patientExternalRef: c.externalRef, readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] });
   const deviceSig = createHmac('sha256', deviceSecret).update(deviceRaw).digest('hex');
   const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${c.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json', 'x-cc-signature': deviceSig }, payload: deviceRaw });

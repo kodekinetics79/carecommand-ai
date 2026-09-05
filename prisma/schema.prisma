@@ -2971,6 +2971,7 @@ model PasswordResetToken {
   userId    String    @db.Uuid
   tokenHash String    @unique
   expiresAt DateTime
+  activatedAt DateTime?
   usedAt    DateTime?
   createdAt DateTime  @default(now())
   tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)

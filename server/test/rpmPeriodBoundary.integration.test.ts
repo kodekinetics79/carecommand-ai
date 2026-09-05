@@ -16,6 +16,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
+const { encryptSecret } = await import('../lib/security');
 const { rpmPeriodBounds } = await import('../lib/connectedCare/rpmEvidence');
 const { resolveRpmTimeZone } = await import('../lib/connectedCare/rpmReadinessService');
 const { runWithTenantContext } = await import('../lib/tenantContext');
@@ -36,6 +37,13 @@ async function makeTenant(timezone: string) {
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `a-${id.slice(0, 8)}@t.test`, displayName: 'Admin' } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Boundary', lastName: 'Patient', lifecycleStage: 'NEW' } });
   const device = await db.device.create({ data: { tenantId: id, branchId: branch.id, name: 'Cuff', deviceType: 'vitals_monitor', active: true } });
+  await db.deviceProvider.create({
+    data: {
+      tenantId: id, providerKey: 'withings', displayName: 'Withings', category: 'DIRECT_API',
+      mode: 'sandbox', status: 'SANDBOX', webhookConfigured: true,
+      encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret: `whsec-${id}` })),
+    },
+  });
   return { id, branchId: branch.id, adminId: admin.id, patientId: patient.id, deviceId: device.id };
 }
 

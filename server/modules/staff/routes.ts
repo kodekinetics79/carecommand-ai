@@ -32,7 +32,22 @@ const taskAssignmentInput = z.object({
   assignedToId: z.string().uuid().nullable(),
 });
 
+const clinicScopedTaskRoles = new Set(['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING']);
+
 export const staffRoutes: FastifyPluginAsync = async app => {
+  function assertTaskAccess(request: FastifyRequest, branchId: string | null) {
+    if (branchId) {
+      assertBranchAccess(request, branchId);
+      return;
+    }
+    // An unscoped safety/escalation task can be resolved by a tenant-wide
+    // owner/admin, but it must never become an ID-based back door around the
+    // active-clinic boundary for operational users.
+    if (clinicScopedTaskRoles.has(request.auth.role)) {
+      throw app.httpErrors.forbidden('This task is not assigned to an accessible clinic');
+    }
+  }
+
   /** Every task reply goes through the same masking the queue list uses. */
   async function projectForRequest(request: FastifyRequest, task: TaskRowWithRelations) {
     const permissions = await getRequestPermissions(request);
@@ -60,7 +75,14 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       },
     });
 
-    return cursorPage(rows, query.limit);
+    return {
+      ...cursorPage(rows, query.limit),
+      measurement: {
+        source: 'persisted_staff_profile_snapshot',
+        automatedAggregation: false,
+        limitation: 'These values are stored profile snapshots. No automated measurement or ranking pipeline is configured, so use them for context only—not staff evaluation or coaching.',
+      },
+    };
   });
 
   app.patch('/tasks/:id/status', { preHandler: requirePermission('staff:task-status') }, async (request, reply) => {
@@ -70,7 +92,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
-      if (existing.branchId) assertBranchAccess(request, existing.branchId);
+      assertTaskAccess(request, existing.branchId);
       if ((existing.status === 'COMPLETED' || existing.status === 'CANCELED') && existing.status !== input.status) {
         return { kind: 'terminal' as const };
       }
@@ -83,14 +105,20 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       const parse = parseReceptionistTaskDetailed(existing);
       const receptionist = parse?.meta ?? null;
       const terminal = input.status === 'COMPLETED' || input.status === 'CANCELED';
-      // Cancelling always needs a reason; completing a receptionist task does
-      // too, because "done" with no outcome tells the next person nothing.
-      if (input.status === 'CANCELED' && !input.outcomeCode) return { kind: 'outcome_required' as const };
-      if (input.status === 'COMPLETED' && receptionist && !input.outcomeCode) return { kind: 'outcome_required' as const };
+      // Every terminal transition needs an outcome. Generic insurance/ops work
+      // is just as irreversible as a caller task; "Complete" with no evidence
+      // left the next shift unable to tell whether anything was actually done.
+      if (terminal && !input.outcomeCode) return { kind: 'outcome_required' as const };
       if (input.outcomeCode === 'booked') {
         if (!input.appointmentId) return { kind: 'appointment_required' as const };
         const appointment = await tx.appointment.findFirst({
-          where: { id: input.appointmentId, tenantId: request.auth.tenantId, deletedAt: null },
+          where: {
+            id: input.appointmentId,
+            tenantId: request.auth.tenantId,
+            deletedAt: null,
+            ...(existing.branchId ? { branchId: existing.branchId } : {}),
+            ...(existing.patientId ? { patientId: existing.patientId } : {}),
+          },
           select: { id: true },
         });
         if (!appointment) return { kind: 'appointment_invalid' as const };
@@ -128,7 +156,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
     if (result.kind === 'terminal') throw app.httpErrors.conflict('Completed or canceled tasks are final and cannot be reopened');
     if (result.kind === 'outcome_required') throw app.httpErrors.badRequest('Record what happened: an outcome code is required to close this task');
     if (result.kind === 'appointment_required') throw app.httpErrors.badRequest('An outcome of "booked" requires the appointment it was booked into');
-    if (result.kind === 'appointment_invalid') throw app.httpErrors.badRequest('The appointment does not exist in this tenant');
+    if (result.kind === 'appointment_invalid') throw app.httpErrors.badRequest('The appointment does not match this task\'s tenant, clinic, or patient');
     return reply.send(await projectForRequest(request, result.task));
   });
 
@@ -143,7 +171,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       include: taskListInclude,
     });
     if (!row) throw app.httpErrors.notFound('Task not found');
-    if (row.branchId) assertBranchAccess(request, row.branchId);
+    assertTaskAccess(request, row.branchId);
     const permissions = await getRequestPermissions(request);
     const canReadArtifacts = permissions.has('receptionist:call-artifacts:read');
     const projected = projectTaskRow(row, { canReadArtifacts, canReadPatient: permissions.has('patient:read') });
@@ -173,7 +201,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
-      if (existing.branchId) assertBranchAccess(request, existing.branchId);
+      assertTaskAccess(request, existing.branchId);
       if (!(LIVE_TASK_STATUSES as readonly string[]).includes(existing.status)) return { kind: 'terminal' as const };
       if (existing.acknowledgedAt) {
         const unchanged = await tx.staffTask.findFirstOrThrow({ where: { id: existing.id, tenantId: request.auth.tenantId }, include: taskListInclude });
@@ -222,7 +250,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
-      if (existing.branchId) assertBranchAccess(request, existing.branchId);
+      assertTaskAccess(request, existing.branchId);
       if (!(LIVE_TASK_STATUSES as readonly string[]).includes(existing.status)) return { kind: 'terminal' as const };
       // D4: a note on a task this module did not file must NOT rewrite its
       // metadata as a synthetic receptionist blob. That destroys the origin
@@ -267,7 +295,11 @@ export const staffRoutes: FastifyPluginAsync = async app => {
         active: true,
         // A branch-restricted caller may only hand work to someone who can see
         // that branch: their own branch, or a tenant-wide (unscoped) user.
-        ...(request.auth.branchId ? { OR: [{ branchId: request.auth.branchId }, { branchId: null }] } : {}),
+        ...(request.auth.branchId ? { OR: [
+          { role: { notIn: ['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING'] } },
+          { branchId: request.auth.branchId },
+          { clinicAccesses: { some: { branchId: request.auth.branchId } } },
+        ] } : {}),
       },
       orderBy: [{ displayName: 'asc' }],
       take: 200,
@@ -290,7 +322,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
-      if (existing.branchId) assertBranchAccess(request, existing.branchId);
+      assertTaskAccess(request, existing.branchId);
       if (existing.status === 'COMPLETED' || existing.status === 'CANCELED') return { kind: 'terminal' as const };
 
       const claimingSelf = input.assignedToId === request.auth.userId;
@@ -300,12 +332,14 @@ export const staffRoutes: FastifyPluginAsync = async app => {
       if (input.assignedToId) {
         const assignee = await tx.user.findFirst({
           where: { id: input.assignedToId, tenantId: request.auth.tenantId, active: true },
-          select: { id: true, branchId: true },
+          select: { id: true, branchId: true, role: true, clinicAccesses: { select: { branchId: true } } },
         });
         if (!assignee) return { kind: 'invalid_assignee' as const };
         // A branch-scoped user's own queue filters to their branch, so assigning
         // them another branch's task would file work they can never see.
-        if (assignee.branchId && existing.branchId && assignee.branchId !== existing.branchId) {
+        const scopedRole = ['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING'].includes(assignee.role);
+        const assignedClinicIds = new Set([assignee.branchId, ...assignee.clinicAccesses.map(access => access.branchId)].filter(Boolean));
+        if (scopedRole && existing.branchId && !assignedClinicIds.has(existing.branchId)) {
           return { kind: 'branch_mismatch' as const };
         }
       }

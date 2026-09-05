@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router';
 import {
   AlertTriangle,
@@ -20,6 +20,9 @@ import ModuleTabs from '../components/ui/ModuleTabs';
 import ConfirmationModal from '../components/workflow/ConfirmationModal';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
+import { useSession } from '../hooks/useSession';
+import { clinicSelectionEventName, getSelectedClinicId, selectClinic } from '../lib/session';
+import { canOpenPath, hasPermission } from '../lib/access';
 import {
   checkEligibility,
   createDepositRule,
@@ -85,6 +88,25 @@ function riskBadgeClass(status: string) {
   return 'badge badge-emerald';
 }
 
+function canRecordCollection(status: string) {
+  return !['paid', 'collected', 'refunded', 'waived'].includes(status.toLowerCase());
+}
+
+function canFlagPaymentFollowUp(status: string) {
+  return ['pending', 'failed', 'link_sent', 'requires_action'].includes(status.toLowerCase());
+}
+
+function formatClinicAppointment(iso: string, timeZone: string) {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+      timeZone, timeZoneName: 'short',
+    }).format(new Date(iso));
+  } catch {
+    return `${new Date(iso).toLocaleString()} · clinic timezone unavailable`;
+  }
+}
+
 // Our words, not a supplier's. This strip used to print the clearinghouse and
 // the card processor by name with their operating modes, or "Mock Mode" when
 // either was unset — three strings a practice manager cannot act on, naming two
@@ -116,6 +138,16 @@ function CapabilityNotice({ capability }: { capability: TenantCapability }) {
   );
 }
 
+function EmptyTableRow({ colSpan, children }: { colSpan: number; children: string }) {
+  return (
+    <tr>
+      <td colSpan={colSpan} className="px-4 py-8 text-center text-sm text-t3">
+        {children}
+      </td>
+    </tr>
+  );
+}
+
 function estimateForVerification(overview: RevenueProtectionOverview | null, verification: EligibilityVerification) {
   return overview?.patientResponsibilityEstimates.find(item => item.eligibilityVerificationId === verification.id) ?? null;
 }
@@ -127,59 +159,90 @@ function estimateForQueueRow(overview: RevenueProtectionOverview | null, row: Ap
 function useRevenueProtectionData(selectedClinicId: 'all' | string) {
   const [overview, setOverview] = useState<RevenueProtectionOverview | null>(null);
   const [capabilities, setCapabilities] = useState<RevenueProtectionCapabilities | null>(null);
+  const [loadedScope, setLoadedScope] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [errorState, setErrorState] = useState<{ scope: string; message: string } | null>(null);
   const [reloadIndex, setReloadIndex] = useState(0);
 
   useEffect(() => {
     let active = true;
-    Promise.all([
-      fetchRevenueProtectionOverview(selectedClinicId === 'all' ? undefined : selectedClinicId),
-      fetchRevenueProtectionCapabilities(),
-    ])
-      .then(([nextOverview, nextCapabilities]) => {
+    void (async () => {
+      setLoading(true);
+      setErrorState(null);
+      try {
+        const [nextOverview, nextCapabilities] = await Promise.all([
+          fetchRevenueProtectionOverview(selectedClinicId === 'all' ? undefined : selectedClinicId),
+          fetchRevenueProtectionCapabilities(),
+        ]);
         if (!active) return;
         setOverview(nextOverview);
         setCapabilities(nextCapabilities);
-      })
-      .catch(loadError => {
+        setLoadedScope(selectedClinicId);
+      } catch (loadError) {
         if (!active) return;
-        setError(loadError instanceof Error ? loadError.message : 'Unable to load revenue protection');
-      })
-      .finally(() => {
-        if (!active) return;
-        setLoading(false);
-      });
+        setErrorState({ scope: selectedClinicId, message: loadError instanceof Error ? loadError.message : 'Unable to load revenue protection' });
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
     return () => {
       active = false;
     };
   }, [selectedClinicId, reloadIndex]);
 
+  const currentError = errorState?.scope === selectedClinicId ? errorState.message : null;
+
   return {
-    overview,
+    overview: loadedScope === selectedClinicId && errorState?.scope !== selectedClinicId ? overview : null,
     capabilities,
-    loading,
-    error,
+    loading: !currentError && (loading || loadedScope !== selectedClinicId),
+    error: currentError,
+    reloadIndex,
     reload: useCallback(() => {
       setLoading(true);
-      setError(null);
+      setErrorState(null);
       setReloadIndex(current => current + 1);
     }, []),
   };
 }
 
+function subscribeToClinicSelection(onStoreChange: () => void) {
+  window.addEventListener(clinicSelectionEventName, onStoreChange);
+  return () => window.removeEventListener(clinicSelectionEventName, onStoreChange);
+}
+
 export default function RevenueProtection() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const canMutate = hasPermission(user, 'billing:write');
+  const clinicScopedRole = ['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING'].includes(user?.role ?? '');
+  const canAskAdvisors = canOpenPath(user, '/advisory');
+  const canOpenCrm = canOpenPath(user, '/crm');
+  const canOpenOpportunities = canOpenPath(user, '/opportunities');
   const { data: branchOptions } = useApiResource<ClinicOption, ClinicOption>('/v1/branches?limit=100', [], row => row);
-  const [selectedClinicId, setSelectedClinicId] = useState<'all' | string>('all');
+  // A clinic-scoped user's requests are narrowed by the authorization header.
+  // Start the visible selector at that same clinic and remove the network-wide
+  // option; showing “All clinics” above Fairfax-only totals is a false scope
+  // claim even when the server correctly refuses cross-clinic data.
+  const activeClinicId = useSyncExternalStore(subscribeToClinicSelection, getSelectedClinicId, () => null);
+  const [networkSelectedClinicId, setNetworkSelectedClinicId] = useState<'all' | string>('all');
+  // The global clinic selector is an external store shared with the request
+  // layer. Reading it through useSyncExternalStore keeps the visible selector,
+  // breadcrumb, and authorization header on the same value even when the
+  // workspace remounts while this page's own session hook is rehydrating.
+  const selectedClinicId: 'all' | string = clinicScopedRole
+    ? activeClinicId ?? user?.branchId ?? branchOptions[0]?.id ?? 'all'
+    : networkSelectedClinicId;
   const [section, setSection] = useState<'insurance' | 'payments'>('insurance');
-  const { overview, capabilities, loading, error, reload } = useRevenueProtectionData(selectedClinicId);
+  const { overview, capabilities, loading, error, reload, reloadIndex } = useRevenueProtectionData(selectedClinicId);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [appointmentQueue, setAppointmentQueue] = useState<AppointmentVerificationQueueRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
-  const [queueError, setQueueError] = useState<string | null>(null);
+  const [queueErrorState, setQueueErrorState] = useState<{ scope: string; message: string } | null>(null);
+  const [queueLoadedScope, setQueueLoadedScope] = useState<string | null>(null);
+  const [queueTruncated, setQueueTruncated] = useState(false);
   const [waiverTarget, setWaiverTarget] = useState<DepositRequirement | null>(null);
   const [ruleDraft, setRuleDraft] = useState({
     name: 'Same-day deposit',
@@ -189,24 +252,33 @@ export default function RevenueProtection() {
   });
 
   const paymentLinkCount = overview?.paymentRequests.filter(item => item.status === 'link_sent').length ?? 0;
-  const activeCoverageCount = appointmentQueue.filter(item => item.coverageActive).length;
+  const scopedAppointmentQueue = queueLoadedScope === selectedClinicId && queueErrorState?.scope !== selectedClinicId ? appointmentQueue : [];
+  const queueError = queueErrorState?.scope === selectedClinicId ? queueErrorState.message : null;
+  const queueReady = queueLoadedScope === selectedClinicId && !queueLoading && !queueError;
+  const queueActiveCoverageCount = scopedAppointmentQueue.filter(item => item.coverageActive).length;
+  const recordedActiveCoverageCount = overview?.eligibilityVerifications.filter(item => item.coverageActive).length ?? 0;
   const verifiedPolicies = overview?.patientInsurancePolicies.filter(item => item.verificationStatus === 'verified').length ?? 0;
   const openAlerts = overview?.revenueProtectionAlerts.filter(item => item.status !== 'resolved').length ?? 0;
   const depositCollectedCount = overview?.depositRequirements.filter(item => item.status === 'collected').length ?? 0;
   const depositWaivedCount = overview?.depositRequirements.filter(item => item.status === 'waived').length ?? 0;
+  const failedPaymentRequests = overview?.paymentRequests.filter(item => item.status === 'failed') ?? [];
+  const dataReady = Boolean(overview) && !loading && !error;
 
   useEffect(() => {
     let active = true;
     void (async () => {
       setQueueLoading(true);
-      setQueueError(null);
+      setQueueErrorState(null);
+      setQueueTruncated(false);
       try {
         const result = await fetchAppointmentVerificationQueue(selectedClinicId === 'all' ? undefined : selectedClinicId);
         if (!active) return;
         setAppointmentQueue(result.appointments);
+        setQueueTruncated(Boolean(result.truncated));
+        setQueueLoadedScope(selectedClinicId);
       } catch (loadError) {
         if (!active) return;
-        setQueueError(loadError instanceof Error ? loadError.message : 'Unable to load insurance verification queue');
+        setQueueErrorState({ scope: selectedClinicId, message: loadError instanceof Error ? loadError.message : 'Unable to load insurance verification queue' });
       } finally {
         if (active) setQueueLoading(false);
       }
@@ -214,7 +286,7 @@ export default function RevenueProtection() {
     return () => {
       active = false;
     };
-  }, [selectedClinicId, reload]);
+  }, [selectedClinicId, reloadIndex]);
 
   // Several endpoints refuse work truthfully with HTTP 200 and a status envelope
   // (e.g. {status:'setup_required'}). apiRequest only throws on !response.ok, so
@@ -380,15 +452,15 @@ export default function RevenueProtection() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className={`badge ph-badge-${capabilities && (capabilities.eligibility.usable || capabilities.cardPayments.usable) ? 'emerald' : 'amber'}`}>{capabilityLine(capabilities)}</span>
         <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
+          {canAskAdvisors && <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
             <Sparkles className="w-4 h-4 text-t3" /> Ask Advisors
-          </button>
-          <button type="button" onClick={() => navigate('/crm')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
+          </button>}
+          {canOpenCrm && <button type="button" onClick={() => navigate('/crm')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
             <ExternalLink className="w-4 h-4 text-t3" /> Open CRM
-          </button>
-          <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90 transition">
+          </button>}
+          {canOpenOpportunities && <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90 transition">
             <AlertTriangle className="w-4 h-4" /> Revenue Leaks
-          </button>
+          </button>}
         </div>
       </div>
 
@@ -396,12 +468,16 @@ export default function RevenueProtection() {
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-4 py-2.5">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
           <span className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-t1"><ShieldCheck className="w-4 h-4 text-indigo" /> Revenue protection</span>
-          <span className="text-[12px] text-t3">{capabilityLine(capabilities)} · {openAlerts} open alert{openAlerts === 1 ? '' : 's'}</span>
+          <span className="text-[12px] text-t3">{capabilityLine(capabilities)} · {loading ? 'loading scoped alert evidence' : error ? 'scoped alerts unavailable' : `${openAlerts} open alert${openAlerts === 1 ? '' : 's'}`}</span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <select value={selectedClinicId} onChange={e => setSelectedClinicId(e.target.value)} aria-label="Clinic scope"
+          <select value={selectedClinicId} onChange={event => {
+            const nextClinicId = event.target.value;
+            if (clinicScopedRole && user && nextClinicId !== 'all') selectClinic(user.tenant.id, nextClinicId);
+            else setNetworkSelectedClinicId(nextClinicId);
+          }} aria-label="Clinic scope"
             className="rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs text-t1 outline-none">
-            {[...clinicOptions, ...branchOptions].map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
+            {(clinicScopedRole ? branchOptions : [...clinicOptions, ...branchOptions]).map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
           </select>
           <button type="button" onClick={() => void reload()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition">
             <RefreshCw className="w-3.5 h-3.5" /> Refresh
@@ -412,15 +488,18 @@ export default function RevenueProtection() {
       {(message || error || actionError) && (
         <p className={`text-xs font-semibold ${error || actionError ? 'text-red-v' : 'text-indigo'}`}>{actionError ?? error ?? message}</p>
       )}
+      {!canMutate && (
+        <p className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2.5 text-xs text-t3">Read-only revenue access. Payment, eligibility, deposit-rule, and recovery-task changes require billing write access.</p>
+      )}
 
       <div className="grid gap-3 grid-cols-2 xl:grid-cols-7">
-        <StatCard title="Payments Due Today" value={overview?.summary.paymentsDueToday ?? 0} subtitle="Copay / deposit queue" icon={<CreditCard className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Open Payment Requests" value={formatCurrency(overview?.summary.copaysExpected ?? 0)} subtitle="Not final patient balances" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Deposits Recorded" value={formatCurrency(overview?.summary.depositsCollected ?? 0)} subtitle="Provider or staff status" icon={<Wallet className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Unpaid Balances" value={formatCurrency(overview?.summary.unpaidBalances ?? 0)} subtitle="At risk balances" icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Failed Payments" value={overview?.summary.failedPayments ?? 0} subtitle="Needs follow-up" icon={<FileBadge2 className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Net Recorded Collections" value={formatCurrency(overview?.summary.revenueProtected ?? 0)} subtitle="Transactions plus manual deposits" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="At Risk" value={formatCurrency(overview?.summary.revenueAtRisk ?? 0)} subtitle="Open alerts" icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Payments Due Today" value={dataReady ? overview?.summary.paymentsDueToday ?? 0 : '—'} subtitle={dataReady ? 'Copay / deposit queue' : 'Loading scoped records'} icon={<CreditCard className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Open Payment Requests" value={dataReady ? formatCurrency(overview?.summary.copaysExpected ?? 0) : '—'} subtitle={dataReady ? 'Not final patient balances' : 'Loading scoped records'} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Deposits Recorded" value={dataReady ? formatCurrency(overview?.summary.depositsCollected ?? 0) : '—'} subtitle={dataReady ? 'Provider or staff status' : 'Loading scoped records'} icon={<Wallet className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Unpaid Balances" value={dataReady ? formatCurrency(overview?.summary.unpaidBalances ?? 0) : '—'} subtitle={dataReady ? 'At risk balances' : 'Loading scoped records'} icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Failed Payments" value={dataReady ? overview?.summary.failedPayments ?? 0 : '—'} subtitle={dataReady ? 'Needs follow-up' : 'Loading scoped records'} icon={<FileBadge2 className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Net Recorded Collections" value={dataReady ? formatCurrency(overview?.summary.revenueProtected ?? 0) : '—'} subtitle={dataReady ? 'Transactions plus manual deposits' : 'Loading scoped records'} icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="At Risk" value={dataReady ? formatCurrency(overview?.summary.revenueAtRisk ?? 0) : '—'} subtitle={dataReady ? 'Open alerts' : 'Loading scoped records'} icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
       </div>
 
       <div className="w-fit">
@@ -432,14 +511,19 @@ export default function RevenueProtection() {
         />
       </div>
 
-      <div>
+      {(loading || error) && (
+        <div role="status" className={`rounded-2xl border p-6 text-sm ${error ? 'border-red-200 bg-red-50 text-red-700' : 'border-[var(--b1)] bg-[var(--s2)] text-t3'}`}>
+          {error ? 'Scoped revenue records are unavailable. Use Refresh to try again.' : 'Loading revenue and insurance records for the selected clinic scope…'}
+        </div>
+      )}
+      <div className={loading || error ? 'hidden' : ''}>
         <div className={`space-y-3 ${section === 'insurance' ? '' : 'hidden'}`}>
           <BentoCard title="Appointment Eligibility Queue" subtitle="Appointments awaiting a payer response or staff review">
             {queueError && <p className="mb-3 text-xs text-red-v">{queueError}</p>}
             <div className="grid gap-3 md:grid-cols-3">
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <p className="text-xs font-bold uppercase tracking-widest text-t3">Queue status</p>
-                <p className="mt-2 text-sm font-semibold text-t1">{queueLoading ? 'Loading queue…' : `${activeCoverageCount}/${appointmentQueue.length} with an active response`}</p>
+                <p className="mt-2 text-sm font-semibold text-t1">{queueError ? 'Queue unavailable' : !queueReady ? 'Loading queue…' : `${queueActiveCoverageCount}/${scopedAppointmentQueue.length} with an active response`}</p>
                 <p className="mt-1 text-xs text-t3">This table reflects the same saved insurance workflow used in Scheduling and Patient Profile.</p>
               </div>
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
@@ -471,7 +555,7 @@ export default function RevenueProtection() {
                     </tr>
                   </thead>
                   <tbody>
-                    {appointmentQueue.map(row => {
+                    {scopedAppointmentQueue.map(row => {
                       const estimate = estimateForQueueRow(overview, row);
                       return (
                         <tr key={row.id} className="border-t border-[var(--b1)] bg-[var(--s2)]">
@@ -480,7 +564,7 @@ export default function RevenueProtection() {
                             <p className="text-xs text-t3">{row.branchName}</p>
                           </td>
                           <td className="px-4 py-3 text-t2">
-                            <p className="font-semibold">{new Date(row.appointmentTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</p>
+                            <p className="font-semibold">{formatClinicAppointment(row.appointmentTime, row.clinicTimezone)}</p>
                             <p className="text-xs text-t3">{row.serviceType}</p>
                           </td>
                           <td className="px-4 py-3 text-t2">{row.payerName}</td>
@@ -496,7 +580,8 @@ export default function RevenueProtection() {
                             <div className="flex flex-wrap gap-2">
                               <button
                                 type="button"
-                                disabled={actionBusy === `verify-${row.id}`}
+                                disabled={!canMutate || actionBusy === `verify-${row.id}`}
+                                title={canMutate ? undefined : 'Billing write access is required'}
                                 onClick={() => void handleVerifyInsurance(row)}
                                 className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                               >
@@ -515,7 +600,7 @@ export default function RevenueProtection() {
                         </tr>
                       );
                     })}
-                    {!queueLoading && appointmentQueue.length === 0 && (
+                    {queueReady && scopedAppointmentQueue.length === 0 && (
                       <tr>
                         <td colSpan={9} className="px-4 py-8 text-center text-sm text-t3">
                           No appointments are waiting for verification in this clinic scope.
@@ -526,6 +611,7 @@ export default function RevenueProtection() {
                 </table>
               </div>
             </div>
+            {queueTruncated && queueReady && <p role="status" className="mt-3 rounded-xl bg-[var(--amber-soft)] px-3 py-2 text-xs font-semibold text-amber-v">Showing the first 100 appointments in this scope. Narrow the clinic before concluding that an appointment is absent.</p>}
           </BentoCard>
 
           <BentoCard title="Insurance Workflow Overview" subtitle="Payers, policy records, and latest response status">
@@ -533,9 +619,9 @@ export default function RevenueProtection() {
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <div className="flex items-center justify-between gap-2 mb-2">
                   <p className="text-xs font-bold uppercase tracking-widest text-t3">Latest payer responses</p>
-                  <span className="badge badge-emerald">{activeCoverageCount}/{overview?.eligibilityVerifications.length ?? 0} active responses</span>
+                  <span className="badge badge-emerald">{recordedActiveCoverageCount}/{overview?.eligibilityVerifications.length ?? 0} active responses</span>
                 </div>
-                <ProgressBar value={Math.min(100, Math.round((activeCoverageCount / Math.max(overview?.eligibilityVerifications.length ?? 1, 1)) * 100))} color="emerald" />
+                <ProgressBar value={Math.min(100, Math.round((recordedActiveCoverageCount / Math.max(overview?.eligibilityVerifications.length ?? 1, 1)) * 100))} color="emerald" />
                 <p className="mt-2 text-xs text-t3">Policies with a recorded verification status: {verifiedPolicies}. Eligibility is not a payment guarantee.</p>
               </div>
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
@@ -577,12 +663,15 @@ export default function RevenueProtection() {
                         <td className="px-4 py-3 text-t2">{policy.payerName}</td>
                         <td className="px-4 py-3"><span className={riskBadgeClass(policy.verificationStatus)}>{policy.verificationStatus}</span></td>
                         <td className="px-4 py-3">
-                          <button type="button" disabled={actionBusy === `eligibility-${policy.id}`} onClick={() => void handleRunEligibility(policy)} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--indigo-soft)] transition disabled:opacity-50">
+                          <button type="button" disabled={!canMutate || actionBusy === `eligibility-${policy.id}`} title={canMutate ? undefined : 'Billing write access is required'} onClick={() => void handleRunEligibility(policy)} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--indigo-soft)] transition disabled:opacity-50">
                             <RefreshCw className="w-3.5 h-3.5" /> {actionBusy === `eligibility-${policy.id}` ? 'Running…' : 'Run Eligibility Check'}
                           </button>
                         </td>
                       </tr>
                     ))}
+                    {(overview?.patientInsurancePolicies.length ?? 0) === 0 && (
+                      <EmptyTableRow colSpan={5}>No insurance policies are stored in this clinic scope.</EmptyTableRow>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -619,10 +708,10 @@ export default function RevenueProtection() {
                           <td className="px-4 py-3 text-t2">{formatCurrency(row.deductibleRemaining)}</td>
                           <td className="px-4 py-3">
                             <div className="flex flex-wrap gap-2">
-                              <button type="button" disabled={actionBusy === `verified-${row.id}`} onClick={() => void handleMarkVerified(row)} className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50">
+                              <button type="button" disabled={!canMutate || actionBusy === `verified-${row.id}`} title={canMutate ? undefined : 'Billing write access is required'} onClick={() => void handleMarkVerified(row)} className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50">
                                 {actionBusy === `verified-${row.id}` ? 'Saving…' : 'Record Staff Review'}
                               </button>
-                              <button type="button" disabled={actionBusy === `deposit-${row.id}`} onClick={() => void handleRequestDeposit(row)} className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50">
+                              <button type="button" disabled={!canMutate || actionBusy === `deposit-${row.id}`} title={canMutate ? undefined : 'Billing write access is required'} onClick={() => void handleRequestDeposit(row)} className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50">
                                 {actionBusy === `deposit-${row.id}` ? 'Creating…' : 'Create Payment Link'}
                               </button>
                               <button type="button" onClick={() => navigate(`/patients/${row.patientId}`)} className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition">
@@ -638,6 +727,9 @@ export default function RevenueProtection() {
                         </tr>
                       );
                     })}
+                    {(overview?.eligibilityVerifications.length ?? 0) === 0 && (
+                      <EmptyTableRow colSpan={5}>No payer responses have been recorded in this clinic scope.</EmptyTableRow>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -673,7 +765,8 @@ export default function RevenueProtection() {
                               <button
                                 key={status}
                                 type="button"
-                                disabled={actionBusy === `pa-${row.id}-${status}`}
+                                disabled={!canMutate || actionBusy === `pa-${row.id}-${status}`}
+                                title={canMutate ? undefined : 'Billing write access is required'}
                                 onClick={() => void handlePriorAuthStatus(row, status)}
                                 className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50"
                               >
@@ -684,6 +777,9 @@ export default function RevenueProtection() {
                         </td>
                       </tr>
                     ))}
+                    {(overview?.priorAuthorizations.length ?? 0) === 0 && (
+                      <EmptyTableRow colSpan={5}>No prior-authorization cases are stored in this clinic scope.</EmptyTableRow>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -718,7 +814,8 @@ export default function RevenueProtection() {
                         <td className="px-4 py-3">
                           <button
                             type="button"
-                            disabled={actionBusy === `link-${row.id}`}
+                            disabled={!canMutate || actionBusy === `link-${row.id}`}
+                            title={canMutate ? undefined : 'Billing write access is required'}
                             onClick={() => void handleSendPaymentLink(row)}
                             className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                           >
@@ -727,6 +824,9 @@ export default function RevenueProtection() {
                         </td>
                       </tr>
                     ))}
+                    {(overview?.patientResponsibilityEstimates.length ?? 0) === 0 && (
+                      <EmptyTableRow colSpan={4}>No patient-responsibility estimates are stored in this clinic scope.</EmptyTableRow>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -760,8 +860,10 @@ export default function RevenueProtection() {
             </div>
 
             <div className="mt-4 space-y-2">
-              {(overview?.paymentRequests ?? []).map(row => (
-                <div key={row.id} className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
+              {(overview?.paymentRequests ?? []).map(row => {
+                const collectionAllowed = canRecordCollection(row.status);
+                const followUpAllowed = canFlagPaymentFollowUp(row.status);
+                return <div key={row.id} className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
                       <div className="flex items-center gap-2">
@@ -779,15 +881,17 @@ export default function RevenueProtection() {
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       type="button"
-                      disabled={actionBusy === `collected-${row.id}`}
+                      disabled={!canMutate || !collectionAllowed || actionBusy === `collected-${row.id}`}
+                      title={!canMutate ? 'Billing write access is required' : !collectionAllowed ? `This request is already ${row.status}` : undefined}
                       onClick={() => void handleMarkPaymentCollected(row, 'payment')}
                       className="rounded-xl bg-[var(--emerald)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                     >
-                      {actionBusy === `collected-${row.id}` ? 'Saving…' : 'Record Staff-Confirmed Collection'}
+                      {actionBusy === `collected-${row.id}` ? 'Saving…' : collectionAllowed ? 'Record Staff-Confirmed Collection' : `Collection ${row.status}`}
                     </button>
                     <button
                       type="button"
-                      disabled={actionBusy === `followup-${row.id}`}
+                      disabled={!canMutate || !followUpAllowed || actionBusy === `followup-${row.id}`}
+                      title={!canMutate ? 'Billing write access is required' : !followUpAllowed ? `Follow-up is not applicable to a ${row.status} request` : undefined}
                       onClick={() => void handleFlagFollowUp(row)}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50"
                     >
@@ -803,21 +907,24 @@ export default function RevenueProtection() {
                       Open Link
                     </button>
                   </div>
-                </div>
-              ))}
+                </div>;
+              })}
+              {(overview?.paymentRequests.length ?? 0) === 0 && (
+                <p className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-8 text-center text-sm text-t3">No payment requests are stored in this clinic scope.</p>
+              )}
             </div>
           </BentoCard>
 
           <BentoCard title="Deposit Rule Engine" subtitle="Define when deposits are required and how much to collect">
             <div className="grid gap-3">
               <div className="grid gap-2 sm:grid-cols-2">
-                <input aria-label="Deposit rule name" value={ruleDraft.name} onChange={e => setRuleDraft(prev => ({ ...prev, name: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule name" />
-                <input aria-label="Deposit rule type" value={ruleDraft.ruleType} onChange={e => setRuleDraft(prev => ({ ...prev, ruleType: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule type" />
+                <input aria-label="Deposit rule name" disabled={!canMutate} value={ruleDraft.name} onChange={e => setRuleDraft(prev => ({ ...prev, name: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none disabled:opacity-60" placeholder="Rule name" />
+                <input aria-label="Deposit rule type" disabled={!canMutate} value={ruleDraft.ruleType} onChange={e => setRuleDraft(prev => ({ ...prev, ruleType: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none disabled:opacity-60" placeholder="Rule type" />
               </div>
-              <input aria-label="Deposit rule description" value={ruleDraft.description} onChange={e => setRuleDraft(prev => ({ ...prev, description: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Description" />
+              <input aria-label="Deposit rule description" disabled={!canMutate} value={ruleDraft.description} onChange={e => setRuleDraft(prev => ({ ...prev, description: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none disabled:opacity-60" placeholder="Description" />
               <div className="grid gap-2 sm:grid-cols-[1fr_140px]">
-                <input aria-label="Deposit amount" type="number" min="0" value={ruleDraft.amountValue} onChange={e => setRuleDraft(prev => ({ ...prev, amountValue: Number(e.target.value) }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Amount" />
-                <button type="button" disabled={actionBusy === 'create-rule'} onClick={() => void handleCreateRule()} className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-50">
+                <input aria-label="Deposit amount" disabled={!canMutate} type="number" min="0" value={ruleDraft.amountValue} onChange={e => setRuleDraft(prev => ({ ...prev, amountValue: Number(e.target.value) }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none disabled:opacity-60" placeholder="Amount" />
+                <button type="button" disabled={!canMutate || actionBusy === 'create-rule'} title={canMutate ? undefined : 'Billing write access is required'} onClick={() => void handleCreateRule()} className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-50">
                   {actionBusy === 'create-rule' ? 'Saving…' : 'Create Rule'}
                 </button>
               </div>
@@ -845,7 +952,8 @@ export default function RevenueProtection() {
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       type="button"
-                      disabled={actionBusy === `toggle-${row.id}`}
+                      disabled={!canMutate || actionBusy === `toggle-${row.id}`}
+                      title={canMutate ? undefined : 'Billing write access is required'}
                       onClick={() => void handleToggleRule(row)}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50"
                     >
@@ -854,11 +962,43 @@ export default function RevenueProtection() {
                   </div>
                 </div>
               ))}
+              {(overview?.depositRules.length ?? 0) === 0 && (
+                <p className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-6 text-center text-sm text-t3">No deposit rules exist yet. Use the form above to create the first clinic policy.</p>
+              )}
             </div>
           </BentoCard>
 
           <BentoCard title="Payment Work Queue" subtitle="Deposit requests, staff-recorded statuses, and follow-up work">
             <div className="space-y-2">
+              {failedPaymentRequests.map(row => (
+                <div key={`failed-${row.id}`} className="rounded-2xl border border-amber-v/40 bg-[var(--amber-soft)] p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm font-bold text-t1">{row.patientName}</p>
+                        <span className={riskBadgeClass(row.status)}>{row.status}</span>
+                      </div>
+                      <p className="mt-1 text-xs text-t3">{row.branchName} · {row.appointmentService ?? row.reason}</p>
+                      <p className="mt-2 text-xs font-semibold text-t2">Payment attempt needs a documented staff follow-up.</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-xl font-bold text-t1">{formatCurrency(row.amount)}</p>
+                      <p className="text-xs text-t3">{row.currency}</p>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={!canMutate || actionBusy === `followup-${row.id}`}
+                      title={canMutate ? undefined : 'Billing write access is required'}
+                      onClick={() => void handleFlagFollowUp(row)}
+                      className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
+                    >
+                      {actionBusy === `followup-${row.id}` ? 'Saving…' : 'Flag Front Desk Follow-Up'}
+                    </button>
+                  </div>
+                </div>
+              ))}
               {(overview?.depositRequirements ?? []).map(row => (
                 <div key={row.id} className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -878,7 +1018,8 @@ export default function RevenueProtection() {
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       type="button"
-                      disabled={actionBusy === `waive-${row.id}`}
+                      disabled={!canMutate || !canRecordCollection(row.status) || actionBusy === `waive-${row.id}`}
+                      title={!canMutate ? 'Billing write access is required' : !canRecordCollection(row.status) ? `This deposit is already ${row.status}` : undefined}
                       onClick={() => setWaiverTarget(row)}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50"
                     >
@@ -886,6 +1027,8 @@ export default function RevenueProtection() {
                     </button>
                     <button
                       type="button"
+                      disabled={!canMutate || !canRecordCollection(row.status)}
+                      title={!canMutate ? 'Billing write access is required' : !canRecordCollection(row.status) ? `This deposit is already ${row.status}` : undefined}
                       onClick={() => void handleSendPaymentLink({
                         id: row.id,
                         branchId: row.branchId,
@@ -904,12 +1047,14 @@ export default function RevenueProtection() {
                         providerReference: undefined,
                         dueAt: row.dueAt ?? undefined,
                       })}
-                      className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition"
+                      className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                     >
                       Create Payment Link
                     </button>
                     <button
                       type="button"
+                      disabled={!canMutate || !canRecordCollection(row.status)}
+                      title={!canMutate ? 'Billing write access is required' : !canRecordCollection(row.status) ? `This deposit is already ${row.status}` : undefined}
                       onClick={() => void handleMarkPaymentCollected({
                         id: row.id,
                         branchId: row.branchId,
@@ -928,13 +1073,16 @@ export default function RevenueProtection() {
                         providerReference: null,
                         dueAt: row.dueAt,
                       }, 'deposit')}
-                      className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition"
+                      className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50"
                     >
                       Record Staff-Confirmed Collection
                     </button>
                   </div>
                 </div>
               ))}
+              {failedPaymentRequests.length === 0 && (overview?.depositRequirements.length ?? 0) === 0 && (
+                <p className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-8 text-center text-sm text-t3">No failed payment or deposit case needs staff action in this clinic scope.</p>
+              )}
             </div>
           </BentoCard>
 
@@ -959,26 +1107,30 @@ export default function RevenueProtection() {
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       type="button"
-                      disabled={actionBusy === `alert-${row.id}`}
+                      disabled={!canMutate || actionBusy === `alert-${row.id}`}
+                      title={canMutate ? undefined : 'Billing write access is required'}
                       onClick={() => void handleUpdateAlert(row)}
                       className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                     >
                       {actionBusy === `alert-${row.id}` ? 'Saving…' : 'Convert Leak to Recovery Task'}
                     </button>
-                    <button
+                    {canOpenPath(user, row.actionLink ?? '/opportunities') && <button
                       type="button"
                       onClick={() => navigate(row.actionLink ?? '/opportunities')}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition"
                     >
                       Open Related Module
-                    </button>
+                    </button>}
                   </div>
                 </div>
               ))}
+              {(overview?.revenueProtectionAlerts.length ?? 0) === 0 && (
+                <p className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-8 text-center text-sm text-t3">No revenue-protection alerts are open in this clinic scope.</p>
+              )}
             </div>
           </BentoCard>
 
-          <BentoCard title="AI Advisory Prompts" subtitle="Ask the built-in advisory team with this revenue context">
+          {canAskAdvisors && <BentoCard title="AI Advisory Prompts" subtitle="Ask the built-in advisory team with this revenue context">
             <div className="grid gap-2 md:grid-cols-2">
               {advisorPrompts.map(prompt => (
                 <button
@@ -995,7 +1147,7 @@ export default function RevenueProtection() {
                 </button>
               ))}
             </div>
-          </BentoCard>
+          </BentoCard>}
         </div>
       </div>
       {waiverTarget && (

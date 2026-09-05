@@ -39,6 +39,7 @@ async function makeTenant() {
   const id = randomUUID();
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `growth-${id.slice(0, 6)}`, slug: `growth-${id.slice(0, 8)}` } });
+  await db.branch.create({ data: { tenantId: id, name: 'Growth test clinic', location: 'Synthetic' } });
   const users = {} as Record<Role, string>;
   for (const role of ROLES) {
     const user = await db.user.create({

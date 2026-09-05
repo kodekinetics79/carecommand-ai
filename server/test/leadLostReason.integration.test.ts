@@ -35,8 +35,9 @@ async function makeTenant() {
   const id = randomUUID();
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `lead-${id.slice(0, 6)}`, slug: `lead-${id.slice(0, 8)}` } });
+  const branch = await db.branch.create({ data: { tenantId: id, name: 'Main clinic', location: 'Test' } });
   const user = await db.user.create({
-    data: { tenantId: id, role: 'MANAGER', active: true, email: `mgr-${id.slice(0, 8)}@lead.test`, displayName: 'Manager' },
+    data: { tenantId: id, branchId: branch.id, role: 'MANAGER', active: true, email: `mgr-${id.slice(0, 8)}@lead.test`, displayName: 'Manager' },
   });
   return { id, userId: user.id };
 }

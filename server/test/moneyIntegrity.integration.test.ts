@@ -105,6 +105,22 @@ describe('#1 revenue overview totals are DB aggregates (correct past the 50-row 
     // Sanity: these are strictly greater than the truncated (50-row) figures.
     expect(summary.copaysExpected).toBeGreaterThan(500);
   });
+
+  it('counts visible failed payment requests even without a transaction row', async () => {
+    const t = await makeTenant();
+    await db.paymentRequest.createMany({
+      data: [
+        { tenantId: t.id, branchId: t.branchId, amount: 80, currency: 'USD', status: 'failed', reason: 'Deposit', mode: 'mock' },
+        { tenantId: t.id, branchId: t.branchId, amount: 140, currency: 'USD', status: 'failed', reason: 'Visit', mode: 'mock' },
+      ],
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/v1/revenue-protection/overview', headers: auth(t, t.ownerId) });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().summary.failedPayments).toBe(2);
+    expect(res.json().paymentRequests.filter((row: { status: string }) => row.status === 'failed')).toHaveLength(2);
+  });
 });
 
 describe('#3 provider test buttons are honest (no fabricated success)', () => {
@@ -194,6 +210,9 @@ describe('#3 provider test buttons are honest (no fabricated success)', () => {
     expect(body.insuranceRails).toBeUndefined();
     expect(body.financeRails).toBeUndefined();
     expect(body.summary.mockIntegrations).toBeUndefined();
+    expect(body.summary.productionReadinessScore).toBeLessThan(100);
+    expect(body.securityPosture.scoreLabel).toBe('Configured control inventory');
+    expect(body.securityPosture.scoreLimitations).toContain('Mock and sandbox');
   });
 
   /**

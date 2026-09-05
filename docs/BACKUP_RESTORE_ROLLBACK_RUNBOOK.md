@@ -17,6 +17,23 @@ actual pilot hosting stack.
 
 ## Restore Drill
 
+For the repository-proven local drill, use a PostgreSQL owner URL for
+`DATABASE_MIGRATION_URL` and the same local URL with `options=-c role=app_rls`
+for `DATABASE_URL`, then run:
+
+```sh
+NODE_ENV=test \
+RELEASE_DB_LIFECYCLE_ACK=CREATE_DROP_LOCAL_RELEASE_TEST_DATABASES \
+DATABASE_MIGRATION_URL='postgresql://<local-owner>@127.0.0.1:<port>/<admin-database>?schema=public' \
+DATABASE_URL='postgresql://<local-owner>@127.0.0.1:<port>/<admin-database>?schema=public&options=-c%20role%3Dapp_rls' \
+npm run verify:db-lifecycle
+```
+
+The verifier refuses production mode, non-loopback PostgreSQL hosts and
+unrecognized database names. It creates and destroys only its own
+`carecommand_test_rc_*` databases and supplies local-only synthetic signing
+material internally; never copy deployed JWT secrets into this drill.
+
 1. Record source environment, commit SHA, migration version, backup ID, and time.
 2. Create an isolated restore environment.
 3. Restore the database backup into the isolated database.

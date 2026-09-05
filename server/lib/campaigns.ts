@@ -1,5 +1,6 @@
 import { db } from './db';
 import { env } from '../config/env';
+import { providerConfig } from './providerCredentials';
 import { runWithTenantContext, type TenantTxClient } from './tenantContext';
 import type { CampaignLiveDispatchActivation, ReceptionistOptOutChannel } from '../generated/prisma/client';
 import { canonicalDncDestination, isDestinationOptedOutTx } from './receptionist/dncFence';
@@ -243,14 +244,23 @@ export interface ChannelStatus { channel: CommChannel; provider: string; configu
 
 export function channelStatus(channel: CommChannel): ChannelStatus {
   if (channel === 'sms' || channel === 'whatsapp') {
-    const missing = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_FROM_NUMBER'].filter(k => !env[k as keyof typeof env]);
+    const { values } = providerConfig('sms');
+    const missing = [
+      ['accountSid', 'TWILIO_ACCOUNT_SID'],
+      ['authToken', 'TWILIO_AUTH_TOKEN'],
+      ['fromNumber', 'TWILIO_FROM_NUMBER'],
+    ].filter(([field]) => !values[field]).map(([, envKey]) => envKey);
     const configured = missing.length === 0;
-    return { channel, provider: 'twilio', configured, mock: (env.TWILIO_ACCOUNT_SID ?? '').startsWith('mock'), setupRequired: !configured, missing };
+    return { channel, provider: 'twilio', configured, mock: (values.accountSid ?? '').startsWith('mock'), setupRequired: !configured, missing };
   }
   if (channel === 'email') {
-    const missing = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'].filter(k => !env[k as keyof typeof env]);
+    const { values } = providerConfig('email');
+    const missing = [
+      ['apiUrl', 'EMAIL_HTTP_API_URL'],
+      ['apiKey', 'EMAIL_HTTP_API_KEY'],
+    ].filter(([field]) => !values[field]).map(([, envKey]) => envKey);
     const configured = missing.length === 0;
-    return { channel, provider: 'smtp', configured, mock: (env.SMTP_HOST ?? '').startsWith('mock'), setupRequired: !configured, missing };
+    return { channel, provider: 'http-email', configured, mock: (values.apiUrl ?? '').startsWith('mock'), setupRequired: !configured, missing };
   }
   // voice reuses the Retell receptionist configuration.
   const missing = ['RETELL_API_KEY', 'RETELL_FROM_NUMBER'].filter(k => !env[k as keyof typeof env]);
@@ -268,7 +278,7 @@ export function providerModeFor(channel: CommChannel): ProviderMode {
   // SMS/WhatsApp have a real Twilio sender wired; email is live only with an HTTP
   // email API; voice campaign sending is not wired (Retell is receptionist-only).
   if (channel === 'sms' || channel === 'whatsapp') return 'live_supported';
-  if (channel === 'email') return env.EMAIL_HTTP_API_URL ? 'live_supported' : 'configured_pending_provider';
+  if (channel === 'email') return providerConfig('email').values.apiUrl ? 'live_supported' : 'configured_pending_provider';
   return 'configured_pending_provider';
 }
 

@@ -23,10 +23,15 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 //     npm run demo:verify
 // ===========================================================================
 
-if (!process.env.RLS_DISPOSABLE_DB) {
+// A full Vitest run shares one disposable database across files and executes
+// them concurrently. This suite seeds the entire database, so it must run in
+// its own lifecycle (`npm run demo:verify`) rather than racing other fixtures.
+const dedicatedDemoLifecycle = process.env.DEMO_READINESS_EXCLUSIVE === '1';
+
+if (!process.env.RLS_DISPOSABLE_DB || !dedicatedDemoLifecycle) {
   describe('demo readiness execution guard', () => {
-    it('requires the explicit disposable-database lifecycle', () => {
-      expect(process.env.RLS_DISPOSABLE_DB).toBeUndefined();
+    it('requires its dedicated disposable-database lifecycle', () => {
+      expect(dedicatedDemoLifecycle).toBe(false);
     });
   });
 } else {

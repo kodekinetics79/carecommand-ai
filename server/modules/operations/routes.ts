@@ -24,6 +24,7 @@ import { projectTaskRow, taskListInclude } from '../../lib/receptionist/taskProj
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
 const listLimit = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50) });
+const pagedList = listLimit.extend({ cursor: uuid.optional(), page: z.literal('true').optional() });
 const OPERATIONAL_REPLY_TERMS = 'operational_reply_to_recorded_inbound_conversation' as const;
 const OPERATIONAL_REPLY_TERMS_SOURCE = 'carecommand_operational_reply_policy_v1' as const;
 // Route guards are classified by data class + action. Avoid a shared "staff"
@@ -71,12 +72,21 @@ async function requireTenantPatient(request: FastifyRequest, patientId: string, 
   }
 }
 
-async function requireTenantAssignee(request: FastifyRequest, assignedToId: string) {
+async function requireTenantAssignee(request: FastifyRequest, assignedToId: string, branchId: string) {
   const user = await db.user.findFirst({
-    where: { id: assignedToId, tenantId: request.auth.tenantId, active: true },
+    where: {
+      id: assignedToId,
+      tenantId: request.auth.tenantId,
+      active: true,
+      OR: [
+        { role: { notIn: ['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING'] } },
+        { branchId },
+        { clinicAccesses: { some: { tenantId: request.auth.tenantId, branchId } } },
+      ],
+    },
     select: { id: true },
   });
-  if (!user) throw request.server.httpErrors.badRequest('Assignee must be an active user in the authenticated tenant');
+  if (!user) throw request.server.httpErrors.badRequest('Assignee must be active and authorized for the selected clinic');
 }
 
 // Map a conversation channel + patient contact to a real outbound send target.
@@ -162,7 +172,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
       take: query.limit,
       orderBy: [{ googleRating: 'asc' }, { reviewVolume: 'desc' }],
-      include: { branch: { select: { name: true } }, insights: { orderBy: { complaintCount: 'desc' } } },
+      include: { branch: { select: { id: true, name: true } }, insights: { orderBy: { complaintCount: 'desc' } } },
     });
   });
 
@@ -474,8 +484,16 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
   });
 
   app.get('/inventory', { preHandler: inventoryRead }, async request => {
-    const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
-    return db.inventoryItem.findMany({ where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) }, take: query.limit, orderBy: { name: 'asc' } });
+    const query = pagedList.extend({ branchId: uuid.optional() }).parse(request.query);
+    const rows = await db.inventoryItem.findMany({
+      where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
+      cursor: query.cursor ? { id: query.cursor } : undefined,
+      skip: query.cursor ? 1 : 0,
+      take: query.limit + 1,
+      orderBy: [{ name: 'asc' }, { id: 'asc' }],
+    });
+    const result = cursorPage(rows, query.limit);
+    return query.page === 'true' || query.cursor ? result : result.data;
   });
   // Inventory creation preserves the former OWNER/ADMIN/MANAGER gate; stock
   // updates preserve the former FRONT_DESK operational membership separately.
@@ -497,34 +515,46 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       currentStock: z.coerce.number().int().min(0).optional(),
       restockBy: z.coerce.number().int().min(1).optional(),
       reorderLevel: z.coerce.number().int().min(0).optional(),
+    }).superRefine((value, ctx) => {
+      if (value.currentStock !== undefined && value.restockBy !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['restockBy'], message: 'Choose either an absolute stock count or a received quantity, not both.' });
+      }
     }).parse(request.body);
-    const existing = await db.inventoryItem.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Inventory item not found');
-    assertBranchAccess(request, existing.branchId);
-    const nextStock = input.currentStock ?? (input.restockBy ? existing.currentStock + input.restockBy : existing.currentStock);
-    const row = await db.inventoryItem.update({
-      where: { id },
-      data: { currentStock: nextStock, reorderLevel: input.reorderLevel ?? existing.reorderLevel },
+    const result = await db.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`inventory-update:${request.auth.tenantId}:${id}`})::bigint)`;
+      const existing = await tx.inventoryItem.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Inventory item not found');
+      assertBranchAccess(request, existing.branchId);
+      const nextStock = input.currentStock ?? (input.restockBy ? existing.currentStock + input.restockBy : existing.currentStock);
+      const row = await tx.inventoryItem.update({
+        where: { id },
+        data: { currentStock: nextStock, reorderLevel: input.reorderLevel ?? existing.reorderLevel },
+      });
+      return { row, from: existing.currentStock, to: nextStock };
     });
-    await audit(request, { action: 'inventory.restocked', resource: 'inventoryItem', resourceId: id, metadata: { from: existing.currentStock, to: nextStock } });
-    return row;
+    await audit(request, { action: 'inventory.restocked', resource: 'inventoryItem', resourceId: id, metadata: { from: result.from, to: result.to, received: input.restockBy ?? null } });
+    return result.row;
   });
 
   // Partner-report policy: read OWNER/ADMIN/MANAGER/PROVIDER; create preserves
   // OWNER/ADMIN/MANAGER/FRONT_DESK; clinical review is OWNER/ADMIN/PROVIDER only.
   // operations:write does not satisfy any of these clinical guards.
   app.get('/partner-reports', { preHandler: partnerReportRead }, async request => {
-    const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
-    return db.partnerReport.findMany({
+    const query = pagedList.extend({ branchId: uuid.optional() }).parse(request.query);
+    const rows = await db.partnerReport.findMany({
       where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
-      take: query.limit,
-      orderBy: { orderedAt: 'desc' },
+      cursor: query.cursor ? { id: query.cursor } : undefined,
+      skip: query.cursor ? 1 : 0,
+      take: query.limit + 1,
+      orderBy: [{ orderedAt: 'desc' }, { id: 'asc' }],
       include: {
         branch: { select: { name: true } },
         patient: { select: { firstName: true, lastName: true } },
         reviewedByUser: { select: { displayName: true } },
       },
     });
+    const result = cursorPage(rows, query.limit);
+    return query.page === 'true' || query.cursor ? result : result.data;
   });
   app.post('/partner-reports', { preHandler: partnerReportWrite }, async (request, reply) => {
     const input = z.object({
@@ -542,28 +572,32 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
   app.patch('/partner-reports/:id/review', { preHandler: partnerReportReview }, async request => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
-      status: z.enum(['ordered', 'sample-collected', 'pending-result', 'result-received', 'doctor-reviewed']).default('doctor-reviewed'),
+      status: z.literal('doctor-reviewed').default('doctor-reviewed'),
       summary: z.string().max(4000).optional(),
     }).parse(request.body);
-    const row = await db.partnerReport.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
-    if (!row) throw request.server.httpErrors.notFound('Partner report not found');
-    if (row.branchId) assertBranchAccess(request, row.branchId);
-    const updated = await db.partnerReport.update({
-      where: { id: row.id },
-      data: {
-        status: body.status,
-        reviewedAt: new Date(),
-        reviewedByUserId: request.auth.userId,
-        summary: body.summary ?? row.summary,
-      },
-      include: {
+    const result = await db.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`partner-report-review:${request.auth.tenantId}:${params.id}`})::bigint)`;
+      const row = await tx.partnerReport.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
+      if (!row) throw request.server.httpErrors.notFound('Partner report not found');
+      if (row.branchId) assertBranchAccess(request, row.branchId);
+      const include = {
         branch: { select: { name: true } },
         patient: { select: { firstName: true, lastName: true } },
         reviewedByUser: { select: { displayName: true } },
-      },
+      } as const;
+      if (row.status === 'doctor-reviewed') {
+        return { changed: false, row: await tx.partnerReport.findUniqueOrThrow({ where: { id: row.id }, include }) };
+      }
+      if (row.status !== 'result-received') throw request.server.httpErrors.conflict('Only a received result can be marked clinically reviewed.');
+      const updated = await tx.partnerReport.update({
+        where: { id: row.id },
+        data: { status: body.status, reviewedAt: new Date(), reviewedByUserId: request.auth.userId, summary: body.summary ?? row.summary },
+        include,
+      });
+      return { changed: true, row: updated };
     });
-    await audit(request, { action: 'partnerReport.reviewed', resource: 'partnerReport', resourceId: row.id });
-    return updated;
+    if (result.changed) await audit(request, { action: 'partnerReport.reviewed', resource: 'partnerReport', resourceId: result.row.id });
+    return result.row;
   });
 
   /**
@@ -640,7 +674,9 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
 
   function taskVisibility(request: FastifyRequest, branchId?: string): Prisma.StaffTaskWhereInput {
     const scope = request.auth.branchId ?? branchId;
-    return scope ? { OR: [{ branchId: scope }, { branchId: null }] } : {};
+    // A null clinic is tenant-wide legacy work, not shared clinic work. Showing
+    // it in every branch queue leaked ambiguous tasks across locations.
+    return scope ? { branchId: scope } : {};
   }
 
   /**
@@ -746,7 +782,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
         WHERE t."tenantId" = ${request.auth.tenantId}::uuid
           AND t."status" IN ('OPEN', 'IN_PROGRESS')
           AND t."metadata"->>'workflow' = ${RECEPTIONIST_TASK_WORKFLOW}
-          ${branchScopeId ? Prisma.sql`AND (t."branchId" = ${branchScopeId}::uuid OR t."branchId" IS NULL)` : Prisma.empty}
+          ${branchScopeId ? Prisma.sql`AND t."branchId" = ${branchScopeId}::uuid` : Prisma.empty}
           ${query.clinicId ? Prisma.sql`AND (t."metadata"->>'clinicId' = ${query.clinicId} OR c."clinicId" = ${query.clinicId}::uuid)` : Prisma.empty}
         GROUP BY 1
       `,
@@ -824,15 +860,16 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       branchId: uuid.optional(), assignedToId: uuid.optional(), title: z.string().min(2).max(240),
       priority: z.string().min(2).max(40), dueAt: z.coerce.date().optional(),
     }).parse(request.body);
-    if (input.branchId) await requireTenantBranch(request, input.branchId);
-    if (input.assignedToId) await requireTenantAssignee(request, input.assignedToId);
+    const branchId = input.branchId ?? request.auth.branchId;
+    if (!branchId) throw app.httpErrors.badRequest('Select a clinic before creating a staff task');
+    await requireTenantBranch(request, branchId);
+    if (input.assignedToId) await requireTenantAssignee(request, input.assignedToId, branchId);
     // D10: one vocabulary. 'CRITICAL' typed here used to file a row the critical
     // banner could not see.
     const priority = normalizeTaskPriority(input.priority) ?? input.priority;
     // GET /tasks scopes a branch-restricted caller to their own branch, so a task
     // created without one would be invisible to the queue that just created it.
     // Default to the creator's branch rather than filing work nobody can see.
-    const branchId = input.branchId ?? request.auth.branchId ?? undefined;
     const row = await db.staffTask.create({
       data: { tenantId: request.auth.tenantId, ...input, priority, branchId },
       include: { branch: { select: { name: true } }, assignedTo: { select: { displayName: true } } },

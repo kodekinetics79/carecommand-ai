@@ -70,7 +70,9 @@ describe('independent content QA challenge', () => {
 
     expect(commandDeck).toContain('Review campaigns');
     expect(commandDeck).not.toContain('Launch Campaign');
-    expect(dashboard).toContain('associated-value fields; causation not established');
+    // The redesigned dashboard is an operational briefing and no longer
+    // publishes value fields. Keep its executive proof claim evidence-bounded.
+    expect(dashboard).toContain('Readiness evidence only; this view does not claim certification or customer outcomes.');
     expect(campaigns).toContain('Create campaign draft');
     // This pin has legitimately INVERTED. It banned "attributed" when no
     // attribution machinery existed, so "associated" was the honest hedge.

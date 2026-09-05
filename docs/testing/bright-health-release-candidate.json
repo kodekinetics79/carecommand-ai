@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "candidate": "bright-health-2026-09-05",
+  "state": "COMMITTED_RELEASE_CANDIDATE",
+  "baseHead": "409a56812282ac8a1ca013a18915ab97064afd29",
+  "branch": "feat/today-workspace-redesign",
+  "repositoryContentFingerprint": "56ac8edb10ef4a165dee9fb24f8588fb0deeb2f6e6b2097e4fbee2cbb29f3c9a",
+  "excludedPaths": [
+    "docs/testing/BRIGHT_HEALTH_PREPILOT_CERTIFICATION_2026-09-02.md",
+    "docs/testing/bright-health-release-candidate.json"
+  ],
+  "excludedPrefixes": [
+    "test-results/"
+  ],
+  "requiredArtifacts": [
+    "docs/testing/BRIGHT_HEALTH_PREPILOT_CERTIFICATION_2026-09-02.md",
+    "docs/testing/BRIGHT_HEALTH_PILOT_OPERATIONS_PACKET_2026-09-02.md",
+    "prisma/migrations/20260902123000_public_intake_submitted_context/migration.sql",
+    "prisma/migrations/20260905113000_password_reset_delivery_activation/migration.sql",
+    "docs/ops/TENANT_PASSWORD_RECOVERY.md",
+    "server/lib/passwordResetDelivery.ts",
+    "server/test/passwordResetDelivery.unit.test.ts",
+    "src/pages/Login.test.tsx",
+    "server/scripts/benchmarkLocalApi.ts",
+    "server/scripts/verifyDeployedRelease.ts",
+    "server/scripts/verifyDeployedReleaseCore.ts",
+    "server/scripts/verifyBrightHealthEvidenceIndex.ts",
+    "server/scripts/verifyBrightHealthEvidenceIndexCore.ts",
+    "server/scripts/verifyReleaseDatabaseLifecycle.ts",
+    "server/lib/releaseIdentity.ts",
+    "server/test/receptionistRetentionWorker.test.ts",
+    "server/test/releaseIdentity.unit.test.ts",
+    "server/test/operationalListPagination.integration.test.ts",
+    "server/test/verifyDeployedRelease.unit.test.ts",
+    "server/test/verifyBrightHealthEvidenceIndex.unit.test.ts",
+    "src/lib/portalTime.ts",
+    "src/lib/portalTime.test.ts",
+    "src/pages/client/ClientSections.test.tsx",
+    "src/pages/IntakeQueue.test.tsx"
+  ],
+  "certificationReport": "docs/testing/BRIGHT_HEALTH_PREPILOT_CERTIFICATION_2026-09-02.md",
+  "verificationEvidence": {
+    "fullDisposableRegression": "Composite exact-tree pass: 291/291 files; 3,758 passed; 5 expected fail; 10 skipped; 3,773 total. The initial run's five Redis/config-affected files were rerun with the correct Redis endpoint after the sole stale health-contract expectation was repaired; targeted retest 11/11 files, 100/100 tests",
+    "productionCheck": "Prisma valid; server typecheck, lint and production build passed; 2,532 modules",
+    "databaseLifecycle": "128 migrations; exact snapshot parity; 136 forced-RLS tables; 571 policies; 121 tenant-integrity foreign keys",
+    "deployedReleaseVerifier": "11/11 deployment/release unit scenarios; Vercel/Render identity; HTTPS/canonical-host/GET-only guard; exact SHA, readiness, metrics access boundary, authenticated Prometheus and effective security-header checks",
+    "localApiBurst": "500/500 HTTP 200; concurrency 25; p95 182.66 ms; p99 198.44 ms",
+    "retentionWorker": "11/11 focused tests",
+    "finalRepairedModuleRegression": "9 files; 75/75 tests",
+    "evidenceIndex": "12/12 referenced artifacts present, non-empty, repository-contained and hashed; 9/9 verifier unit tests"
+  }
+}

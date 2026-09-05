@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { UserPlus, Plus, Loader2, Pause, Play, Square, ShieldCheck, RefreshCw, AlertTriangle } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
@@ -8,9 +8,10 @@ import ConsentModal from '../components/connectedCare/ConsentModal';
 import { useResource } from '../hooks/useResource';
 import { apiRequest } from '../lib/api';
 import { crmService, type CrmPatient } from '../lib/crmService';
+import { useSession } from '../hooks/useSession';
 
 interface Enrollment { id: string; patientId: string; patientName: string; providerKey: string; programType: string; status: string; externalRef: string | null; enrolledAt: string; endedAt: string | null }
-interface DeviceProvider { key: string; displayName: string; status: string; category: string }
+interface DeviceProvider { key: string; displayName: string; status: string; category: string; configured: boolean; webhookConfigured: boolean }
 interface DeviceRow { id: string; name: string; deviceType: string; serialNumber: string | null; connectivity: string; branchId: string | null }
 interface Page { enrollments: Enrollment[]; patients: CrmPatient[]; providers: DeviceProvider[]; devices: DeviceRow[] }
 
@@ -28,12 +29,31 @@ const loadPage = async (): Promise<Page> => {
 
 export default function PatientEnrollments() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const canManage = Boolean(user && ['OWNER', 'ADMIN', 'MANAGER'].includes(user.role));
   const { state, reload } = useResource<Page>(loadPage);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [form, setForm] = useState({ patientId: '', providerKey: '', deviceId: '', programType: 'rpm' });
   const [showForm, setShowForm] = useState(false);
   const [consentFor, setConsentFor] = useState<{ id: string; name: string } | null>(null);
+  const [patientSearch, setPatientSearch] = useState('');
+  const [patientOptions, setPatientOptions] = useState<CrmPatient[]>([]);
+  const [patientSearchError, setPatientSearchError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!showForm || state.status !== 'ready') return;
+    const signal = { cancelled: false };
+    const timer = setTimeout(() => void (async () => {
+      try {
+        const page = await crmService.listPatients({ search: patientSearch });
+        if (!signal.cancelled) { setPatientOptions(page.patients); setPatientSearchError(null); }
+      } catch (error) {
+        if (!signal.cancelled) setPatientSearchError(error instanceof Error ? error.message : 'Patient search failed');
+      }
+    })(), patientSearch ? 250 : 0);
+    return () => { signal.cancelled = true; clearTimeout(timer); };
+  }, [patientSearch, showForm, state.status]);
 
   const enroll = useCallback(async () => {
     if (!form.patientId || !form.providerKey) return;
@@ -80,6 +100,10 @@ export default function PatientEnrollments() {
     return [...list].sort((a, b) => (a.key === 'manual' ? 1 : 0) - (b.key === 'manual' ? 1 : 0));
   }, [state]);
   const selectedProviderIsManual = form.providerKey === 'manual';
+  const selectedProvider = orderedProviders.find(provider => provider.key === form.providerKey);
+  const selectedProviderReady = selectedProviderIsManual || Boolean(selectedProvider?.configured && selectedProvider.webhookConfigured);
+  const rpmDeviceMissing = form.programType === 'rpm' && !selectedProviderIsManual && !form.deviceId;
+  const canEnroll = Boolean(form.patientId && form.providerKey && selectedProviderReady && !rpmDeviceMissing);
 
   return (
     <div className="space-y-6 pb-8">
@@ -91,9 +115,11 @@ export default function PatientEnrollments() {
             <button type="button" onClick={reload} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
               <RefreshCw className="w-3.5 h-3.5 text-t3" /> Refresh
             </button>
-            <button type="button" onClick={() => setShowForm(v => !v)} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
-              <Plus className="w-4 h-4" /> Enrol patient
-            </button>
+            {canManage && (
+              <button type="button" onClick={() => setShowForm(v => !v)} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
+                <Plus className="w-4 h-4" /> Enrol patient
+              </button>
+            )}
           </div>
         }
       />
@@ -102,13 +128,23 @@ export default function PatientEnrollments() {
 
       {showForm && state.status === 'ready' && (
         <div className="rounded-xl border border-[var(--b2)] bg-[var(--s2)] p-4 space-y-3">
-          <div className="grid gap-2.5 sm:grid-cols-3">
+          <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
+            <label className="block space-y-1">
+              <span className="text-[11px] font-semibold text-t2">Program</span>
+              <select aria-label="Monitoring program" value={form.programType} onChange={e => setForm(f => ({ ...f, programType: e.target.value }))} className={inputCls}>
+                <option value="rpm">Remote patient monitoring</option>
+                <option value="ccm">Chronic care management</option>
+                <option value="general">General monitoring</option>
+              </select>
+            </label>
             <label className="block space-y-1">
               <span className="text-[11px] font-semibold text-t2">Patient</span>
+              <input type="search" aria-label="Search patients for enrolment" value={patientSearch} onChange={event => { setPatientSearch(event.target.value); setForm(current => ({ ...current, patientId: '' })); }} placeholder="Search name, phone, or email…" className={`${inputCls} mb-1.5`} />
               <select aria-label="Patient" value={form.patientId} onChange={e => setForm(f => ({ ...f, patientId: e.target.value }))} className={inputCls}>
                 <option value="">Select…</option>
-                {state.data.patients.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                {patientOptions.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
+              {patientSearchError && <span role="alert" className="text-[10px] text-amber-v">{patientSearchError}</span>}
             </label>
             <label className="block space-y-1">
               <span className="text-[11px] font-semibold text-t2">Device provider</span>
@@ -133,13 +169,20 @@ export default function PatientEnrollments() {
             </label>
           </div>
 
-          {!form.deviceId && (
+          {rpmDeviceMissing && (
             <p className="inline-flex items-start gap-1.5 text-[11px] text-amber-v">
               <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
               Without a bound device, readings cannot be traced to this enrolment and will not count toward device-days.
               {state.data.devices.length === 0 && (
                 <button type="button" onClick={() => navigate('/devices')} className="font-semibold underline">Register a device first</button>
               )}
+            </p>
+          )}
+          {form.providerKey && !selectedProviderReady && (
+            <p role="alert" className="inline-flex items-start gap-1.5 text-[11px] text-amber-v">
+              <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+              This provider is not ready to receive verified patient readings. Configure its credentials and signed webhook before enrolling anyone.
+              <button type="button" onClick={() => navigate('/devices')} className="font-semibold underline">Open device setup</button>
             </p>
           )}
           {selectedProviderIsManual && (
@@ -150,7 +193,7 @@ export default function PatientEnrollments() {
           )}
 
           <div className="flex gap-2">
-            <button type="button" disabled={busy === 'new' || !form.patientId || !form.providerKey} onClick={() => void enroll()}
+            <button type="button" disabled={busy === 'new' || !canEnroll} onClick={() => void enroll()}
               className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 disabled:opacity-50">
               {busy === 'new' ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-4 h-4" />} Enrol
             </button>
@@ -171,7 +214,7 @@ export default function PatientEnrollments() {
             icon: <UserPlus className="w-5 h-5" />,
             title: 'No patients enrolled yet',
             description: 'Enrolling a patient records their consent, starts their billing period, and opens their monitoring record.',
-            cta: { label: 'Enrol a patient', onClick: () => setShowForm(true) },
+            ...(canManage ? { cta: { label: 'Enrol a patient', onClick: () => setShowForm(true) } } : {}),
           }}
         >
           {page => (
@@ -198,21 +241,21 @@ export default function PatientEnrollments() {
                             className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)]">
                             <ShieldCheck className="w-3 h-3" /> Consent
                           </button>
-                          {e.status === 'active' && (
+                          {canManage && e.status === 'active' && (
                             <button type="button" disabled={busy === e.id} onClick={() => void setStatus(e, 'paused')}
                               aria-label={`Pause monitoring for ${e.patientName}`} title="Pause — readings stop being ingested, including alerts"
                               className="inline-flex items-center justify-center w-9 h-9 rounded-lg border border-[var(--b1)] text-t3 hover:bg-[var(--s3)] disabled:opacity-50">
                               <Pause className="w-3.5 h-3.5" />
                             </button>
                           )}
-                          {e.status === 'paused' && (
+                          {canManage && e.status === 'paused' && (
                             <button type="button" disabled={busy === e.id} onClick={() => void setStatus(e, 'active')}
                               aria-label={`Resume monitoring for ${e.patientName}`} title="Resume"
                               className="inline-flex items-center justify-center w-9 h-9 rounded-lg border border-[var(--b1)] text-t3 hover:bg-[var(--s3)] disabled:opacity-50">
                               <Play className="w-3.5 h-3.5" />
                             </button>
                           )}
-                          {e.status !== 'ended' && (
+                          {canManage && e.status !== 'ended' && (
                             <button type="button" disabled={busy === e.id} onClick={() => void setStatus(e, 'ended')}
                               aria-label={`End enrolment for ${e.patientName}`} title="End enrolment"
                               className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2 py-1 text-[11px] font-semibold text-t2 hover:text-red-v hover:border-red-v/30 disabled:opacity-50">
@@ -234,6 +277,7 @@ export default function PatientEnrollments() {
         <ConsentModal
           patientId={consentFor.id}
           patientName={consentFor.name}
+          canWrite={canManage}
           onClose={() => setConsentFor(null)}
           onSaved={reload}
         />

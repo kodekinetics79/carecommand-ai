@@ -10,9 +10,13 @@ import { useApiResource } from '../hooks/useApiResource';
 import { apiRequest } from '../lib/api';
 import { mapConversation, type ApiConversation } from '../lib/apiAdapters';
 import type { CallLog } from '../lib/receptionist';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 
 interface ConversationCard {
   id: string;
+  branchId: string;
+  branchName: string;
   name: string;
   channel: string;
   message: string;
@@ -29,6 +33,10 @@ interface ConversationCard {
   lastAgentMessageAt?: string;
   replyReadiness: ApiConversation['replyReadiness'];
 }
+
+interface BranchOption { id: string; name: string; active: boolean }
+const EMPTY_CONVERSATIONS: ConversationCard[] = [];
+const EMPTY_CALL_LOGS: CallLog[] = [];
 
 interface ConversationReplyResult {
   delivered?: boolean;
@@ -81,6 +89,9 @@ function humanizeToken(value: string) {
 
 export default function AIReceptionist() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const canReply = hasPermission(user, 'crm:write');
+  const canOpenStudio = hasPermission(user, 'receptionist:manage');
   const [activeChannel, setActiveChannel] = useState('all');
   const [selectedId, setSelectedId] = useState<string>('');
   const [replyText, setReplyText] = useState('');
@@ -89,17 +100,31 @@ export default function AIReceptionist() {
   const [sendNotice, setSendNotice] = useState<string | null>(null);
   const [confirmReplyOpen, setConfirmReplyOpen] = useState(false);
   const [clientAttemptKey, setClientAttemptKey] = useState('');
-  const { data: conversationRecords, source, error, reload } = useApiResource<ApiConversation, ReturnType<typeof mapConversation>>(
-    '/v1/conversations?limit=100',
+  const [selectedBranch, setSelectedBranch] = useState('all');
+  const conversationPath = selectedBranch === 'all'
+    ? '/v1/conversations?limit=100'
+    : `/v1/conversations?limit=100&branchId=${encodeURIComponent(selectedBranch)}`;
+  const callLogPath = selectedBranch === 'all'
+    ? '/v1/receptionist/call-logs?limit=100'
+    : `/v1/receptionist/call-logs?limit=100&branchId=${encodeURIComponent(selectedBranch)}`;
+  const { data: loadedConversationRecords, source, error: conversationError, errorPath: conversationErrorPath, loadedPath: conversationsLoadedPath, reload } = useApiResource<ApiConversation, ReturnType<typeof mapConversation>>(
+    conversationPath,
     [],
     mapConversation,
   );
-  const { data: receptionistCallLogs, source: callLogSource, error: callLogError } = useApiResource<CallLog, CallLog>(
-    '/v1/receptionist/call-logs?limit=100',
+  const { data: loadedReceptionistCallLogs, source: callLogSource, error: callLogRequestError, errorPath: callLogErrorPath, loadedPath: callLogsLoadedPath, reload: reloadCallLogs } = useApiResource<CallLog, CallLog>(
+    callLogPath,
     [],
     row => row,
+    { allPages: true, maxPages: 10 },
   );
+  const { data: branchOptions, error: branchError, reload: reloadBranches } = useApiResource<BranchOption, BranchOption>('/v1/branches?limit=100', [], row => row);
+  const conversationRecords = conversationsLoadedPath === conversationPath ? loadedConversationRecords : EMPTY_CONVERSATIONS;
+  const receptionistCallLogs = callLogsLoadedPath === callLogPath ? loadedReceptionistCallLogs : EMPTY_CALL_LOGS;
+  const error = conversationErrorPath === conversationPath ? conversationError : null;
+  const callLogError = callLogErrorPath === callLogPath ? callLogRequestError : null;
   const loadError = error || callLogError;
+  const recordsReady = conversationsLoadedPath === conversationPath && callLogsLoadedPath === callLogPath && !loadError;
   const effectiveSelectedId = selectedId || conversationRecords[0]?.id || '';
   const selectedConv = conversationRecords.find(item => item.id === effectiveSelectedId) ?? conversationRecords[0];
   const replyPreview = buildReplyDraft(selectedConv);
@@ -125,6 +150,8 @@ export default function AIReceptionist() {
     ? Math.round(receptionistCallLogs.reduce((sum, call) => sum + call.durationSeconds, 0) / receptionistCallLogs.length)
     : null;
   const unresolved = conversationRecords.filter(item => item.channel !== 'call' && item.status !== 'replied').length;
+  const branchNames = useMemo(() => new Map(branchOptions.map(branch => [branch.id, branch.name])), [branchOptions]);
+  const selectedScopeName = selectedBranch === 'all' ? `All ${branchOptions.length} clinics` : branchNames.get(selectedBranch) ?? 'Selected clinic';
 
   async function sendReply(status: 'replied' | 'escalated' = 'replied') {
     if (!selectedConv) return;
@@ -171,28 +198,52 @@ export default function AIReceptionist() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="AI Front Desk"
-        subtitle="Conversation records, missed-call follow-up, and staff-reviewed front-desk reply workflows."
-        badge={loadError ? 'Data unavailable' : `Unread: ${unresolved} · ${source === 'live' && callLogSource === 'live' ? 'Stored clinic records' : 'Loading'}`}
-        badgeColor={loadError ? 'red' : 'red'}
+        title="Communications"
+        subtitle="One governed inbox for patient messages, voice-call review, and accountable staff follow-up."
+        badge={loadError || branchError ? 'Data unavailable' : recordsReady && source === 'live' && callLogSource === 'live' ? `Open: ${unresolved} · Stored clinic records` : 'Loading clinic records'}
+        badgeColor={loadError || branchError ? 'red' : unresolved > 0 ? 'amber' : 'emerald'}
         actions={
-          <button type="button" onClick={() => navigate('/settings')} className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-            <Bot className="w-4 h-4" /> CareDesk AI Settings
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={() => navigate('/settings')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)] transition">
+              Settings
+            </button>
+            {canOpenStudio && (
+              <button type="button" onClick={() => navigate('/receptionist-studio')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+                <Bot className="w-4 h-4" /> Open receptionist studio
+              </button>
+            )}
+          </div>
         }
       />
 
-      {loadError && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Front-desk records could not be fully loaded from the clinic API: {loadError}
+      {(loadError || branchError) && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <span>Communications records could not be fully loaded: {loadError || branchError}</span>
+          <button type="button" onClick={() => { reload(); reloadCallLogs(); reloadBranches(); }} className="rounded-lg border border-current px-3 py-1.5 text-xs font-semibold">Try again</button>
         </div>
       )}
 
+      <section aria-label="Communication scope" className="glass-card overflow-hidden p-4 sm:p-5">
+        <div className="relative z-[1] flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-indigo">Communication scope</p>
+            <p className="mt-1 text-sm font-bold text-t1">{selectedScopeName}</p>
+            <p className="mt-1 text-xs text-t3">Messages follow the selected clinic. Calls on a shared line without durable per-call location evidence appear only in All clinics, never in a branch-scoped view.</p>
+          </div>
+          <div className="flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-white/70 bg-white/60 p-1 shadow-sm">
+            <button type="button" onClick={() => { setSelectedBranch('all'); setSelectedId(''); }} className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-semibold ${selectedBranch === 'all' ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>All clinics</button>
+            {branchOptions.filter(branch => branch.active).map(branch => (
+              <button key={branch.id} type="button" onClick={() => { setSelectedBranch(branch.id); setSelectedId(''); }} className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-semibold ${selectedBranch === branch.id ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{branch.name}</button>
+            ))}
+          </div>
+        </div>
+      </section>
+
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Stored voice calls" value={String(receptionistCallLogs.length)} subtitle="Latest 100 canonical receptionist call logs" icon={<Phone className="w-4 h-4" />} accent="red" />
-        <StatCard title="Reviewed voice calls" value={`${reviewedCallCount}/${receptionistCallLogs.length}`} subtitle="Reviewed or manager-signed call records" icon={<Bot className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Avg voice duration" value={avgCallSeconds === null ? 'n/a' : `${Math.floor(avgCallSeconds / 60)}m ${avgCallSeconds % 60}s`} subtitle="From canonical receptionist call logs" icon={<Clock className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Open Conversations" value={String(unresolved)} subtitle="Needs review or action" icon={<Calendar className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Stored voice calls" value={recordsReady ? String(receptionistCallLogs.length) : '—'} subtitle={recordsReady ? 'All loaded canonical call logs in scope' : 'Loading scoped call evidence'} icon={<Phone className="w-4 h-4" />} accent="red" />
+        <StatCard title="Reviewed voice calls" value={recordsReady ? `${reviewedCallCount}/${receptionistCallLogs.length}` : '—'} subtitle={recordsReady ? 'Reviewed or manager-signed call records' : 'Loading scoped call evidence'} icon={<Bot className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Avg voice duration" value={!recordsReady ? '—' : avgCallSeconds === null ? 'n/a' : `${Math.floor(avgCallSeconds / 60)}m ${avgCallSeconds % 60}s`} subtitle={recordsReady ? 'From canonical receptionist call logs' : 'Loading scoped call evidence'} icon={<Clock className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Open conversations" value={recordsReady ? String(unresolved) : '—'} subtitle={recordsReady ? 'Latest 100 records · needs action' : 'Loading scoped message evidence'} icon={<Calendar className="w-4 h-4" />} accent="violet" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
@@ -205,17 +256,21 @@ export default function AIReceptionist() {
                   <h3 className="text-sm font-bold text-t1">{activeChannel === 'call' ? 'Canonical voice call records' : 'Stored messaging enquiries'}</h3>
                 </div>
                 <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-v bg-[var(--emerald-soft)] px-2.5 py-1 rounded-full border border-[var(--b1)]">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {source === 'live' && callLogSource === 'live' ? 'Stored front-desk records' : 'Loading'}
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {recordsReady && source === 'live' && callLogSource === 'live' ? 'Stored front-desk records' : 'Loading'}
                 </span>
               </div>
               <ModuleTabs tabs={channelTabs} activeTab={activeChannel} onChange={setActiveChannel} variant="pills" />
             </div>
             <div className="divide-y divide-[var(--b0)]">
-              {activeChannel === 'call' ? (
+              {loadError ? (
+                <p role="status" className="px-4 py-6 text-sm text-t3">Scoped records are unavailable. Use Try again to retry both sources.</p>
+              ) : !recordsReady ? (
+                <p role="status" className="px-4 py-6 text-sm text-t3">Loading records for {selectedScopeName.toLowerCase()}…</p>
+              ) : activeChannel === 'call' ? (
                 receptionistCallLogs.length === 0
                   ? <p className="px-4 py-6 text-sm text-t3">No canonical receptionist call logs were returned.</p>
                   : receptionistCallLogs.map(call => (
-                    <button key={call.id} type="button" onClick={() => navigate(`/receptionist-studio?tab=activity&clinicId=${encodeURIComponent(call.clinicId)}&callId=${encodeURIComponent(call.id)}`)} className="w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-[var(--s3)] transition-colors">
+                    <button key={call.id} type="button" disabled={!canOpenStudio} title={canOpenStudio ? 'Open manager call review' : 'Manager call-review access is required'} onClick={() => canOpenStudio && navigate(`/receptionist-studio?tab=activity&clinicId=${encodeURIComponent(call.clinicId)}&callId=${encodeURIComponent(call.id)}`)} className="w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-[var(--s3)] transition-colors disabled:cursor-default disabled:hover:bg-transparent">
                       <div className="w-8 h-8 rounded-xl border flex items-center justify-center shrink-0 bg-[var(--blue-soft)] border-[var(--b1)]"><Phone className="w-3.5 h-3.5 text-indigo" /></div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center justify-between gap-2">
@@ -225,13 +280,21 @@ export default function AIReceptionist() {
                         <p className="mt-0.5 truncate text-xs text-t3">{call.direction} · {humanizeToken(call.outcome)} · {call.durationSeconds}s</p>
                         <div className="mt-1 flex items-center gap-2">
                           <span className={`badge ${call.outcome === 'FAILED' ? 'badge-red' : call.outcome === 'BOOKED' ? 'badge-emerald' : 'badge-blue'}`}>{humanizeToken(call.outcome)}</span>
+                          <span className="truncate text-[10px] font-semibold text-t3">{call.clinic?.name ?? 'Receptionist clinic unavailable'}</span>
                           <span className="ml-auto text-[10px] font-semibold text-t3">Review: {humanizeToken(call.reviewStatus ?? 'unreviewed')}</span>
                         </div>
                       </div>
                     </button>
                   ))
               ) : filtered.length === 0 ? (
-                <p className="px-4 py-6 text-sm text-t3">No stored {activeChannel === 'all' ? 'non-voice conversation' : activeChannel} records were returned.</p>
+                <div className="px-4 py-6">
+                  <p className="text-sm text-t3">No stored {activeChannel === 'all' ? 'non-voice conversation' : activeChannel} records were returned.</p>
+                  {activeChannel === 'all' && receptionistCallLogs.length > 0 && (
+                    <button type="button" onClick={() => setActiveChannel('call')} className="mt-3 inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--blue-soft)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)]">
+                      <Phone className="h-3.5 w-3.5" /> Review {receptionistCallLogs.length} stored voice {receptionistCallLogs.length === 1 ? 'call' : 'calls'}
+                    </button>
+                  )}
+                </div>
               ) : filtered.map((conv) => {
                 const status = statusConfig[conv.status] ?? statusConfig.pending;
                 const isSelected = selectedConv?.id === conv.id;
@@ -262,6 +325,7 @@ export default function AIReceptionist() {
                       </p>
                       <div className="flex items-center gap-2 mt-1">
                         <span className={status.badgeClass}>{status.label}</span>
+                        <span className="truncate text-[10px] font-semibold text-t3">{conv.branchName}</span>
                         <span className="ml-auto text-right text-[10px] font-bold text-emerald-v">
                           Recorded est. {conv.value}<span className="block font-medium text-t3">source not verified</span>
                         </span>
@@ -271,6 +335,9 @@ export default function AIReceptionist() {
                 );
               })}
             </div>
+            {conversationRecords.length === 100 && activeChannel !== 'call' && (
+              <p role="status" className="border-t border-[var(--b1)] bg-[var(--amber-soft)] px-4 py-2 text-[11px] font-semibold text-amber-v">Showing the latest 100 conversation records. Narrow the clinic scope before concluding that an older message is absent.</p>
+            )}
           </div>
         </div>
 
@@ -279,9 +346,13 @@ export default function AIReceptionist() {
             {activeChannel === 'call' ? (
               <div className="space-y-3">
                 <p className="text-sm text-t2">Voice rows now come from the canonical voice-line call log instead of the generic conversation inbox.</p>
-                <button type="button" onClick={() => navigate('/receptionist-studio?tab=activity')} className="w-full rounded-xl border border-dashed border-[var(--b2)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)]">
-                  Open call review, recordings and provider evidence
-                </button>
+                {canOpenStudio ? (
+                  <button type="button" onClick={() => navigate('/receptionist-studio?tab=activity')} className="w-full rounded-xl border border-dashed border-[var(--b2)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)]">
+                    Open call review, recordings and provider evidence
+                  </button>
+                ) : (
+                  <p className="rounded-xl border border-dashed border-[var(--b2)] px-3 py-2 text-xs text-t3">Detailed call review and recordings require receptionist manager access.</p>
+                )}
               </div>
             ) : selectedConv ? (
               <div className="space-y-3">
@@ -369,7 +440,7 @@ export default function AIReceptionist() {
                     </button>
                   </div>
                 )}
-                <div className="space-y-1.5">
+                {canReply ? <div className="space-y-1.5">
                   <p className="text-[10px] font-bold text-t3 uppercase tracking-widest">Rule-based draft · staff review required</p>
                   <textarea
                     key={selectedConv?.id ?? 'none'}
@@ -406,18 +477,24 @@ export default function AIReceptionist() {
                       <AlertCircle className="w-3 h-3" /> Escalate
                     </button>
                   </div>
-                </div>
+                </div> : (
+                  <p className="rounded-xl border border-dashed border-[var(--b2)] bg-[var(--s3)] p-3 text-xs text-t3">This role can review the conversation but cannot submit replies or escalations.</p>
+                )}
               </div>
             ) : (
-              <p className="text-sm text-t3">No conversation selected yet.</p>
+            <p className="text-sm text-t3">{loadError ? 'Conversation evidence is unavailable.' : recordsReady ? 'No conversation selected yet.' : 'Loading scoped conversation evidence…'}</p>
             )}
           </BentoCard>
 
           <BentoCard title="Voice Call Review Queue" subtitle="Canonical receptionist call records" headerRight={
-            <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{reviewedCallCount}/{receptionistCallLogs.length} reviewed</span>
+            <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{recordsReady ? `${reviewedCallCount}/${receptionistCallLogs.length} reviewed` : 'Loading'}</span>
           }>
             <div className="space-y-3">
-              {receptionistCallLogs.length === 0 ? (
+              {loadError ? (
+                <p role="status" className="text-xs text-t3">Scoped call evidence is unavailable. Use Try again above.</p>
+              ) : !recordsReady ? (
+                <p role="status" className="text-xs text-t3">Loading scoped call evidence…</p>
+              ) : receptionistCallLogs.length === 0 ? (
                 <p className="text-xs text-t3">No canonical receptionist call records are available yet.</p>
               ) : receptionistCallLogs.slice(0, 5).map((call, index) => {
                 const hasReviewEvidence = call.reviewStatus === 'REVIEWED' || call.reviewStatus === 'SIGNED_OFF';
@@ -443,14 +520,17 @@ export default function AIReceptionist() {
                         <span className="text-t3">·</span>
                         <span className="text-[10px] text-t3">{humanizeToken(call.outcome)} · {call.direction}</span>
                       </div>
+                      <p className="mt-0.5 truncate text-[10px] font-semibold text-t3">{call.clinic?.name ?? 'Receptionist line unavailable'}</p>
                     </div>
                   </div>
                 );
               })}
             </div>
-            <button type="button" onClick={() => navigate('/receptionist-studio?tab=activity')} className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-[var(--b2)] text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition-colors">
-              <ArrowRight className="w-3 h-3" /> View full call log
-            </button>
+            {canOpenStudio && (
+              <button type="button" onClick={() => navigate('/receptionist-studio?tab=activity')} className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-[var(--b2)] text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition-colors">
+                <ArrowRight className="w-3 h-3" /> View full call log
+              </button>
+            )}
           </BentoCard>
 
           <BentoCard title="After-Hours Activity" subtitle="Not implemented — requires validated hours, closures and on-call logic">

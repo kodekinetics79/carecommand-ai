@@ -1,4 +1,4 @@
-import { apiRequest } from './api';
+import { apiRequest, publicApiRequest } from './api';
 
 // --- Types -----------------------------------------------------------------
 
@@ -97,8 +97,8 @@ export const intakeApi = {
   forAppointment: (appointmentId: string) => apiRequest<IntakePacket | { exists: false }>(`${base}/appointment/${appointmentId}`),
 
   // Public (token) — no auth.
-  publicGet: (token: string) => apiRequest<PublicIntakeView>(`${base}/public/${token}`),
+  publicGet: (token: string) => publicApiRequest<PublicIntakeView>(`${base}/public/${token}`),
   publicSubmitSection: (token: string, sectionType: string, data: Record<string, unknown>) =>
-    apiRequest<PublicIntakeView>(`${base}/public/${token}/sections`, { method: 'POST', body: JSON.stringify({ sectionType, data }) }),
-  publicSubmit: (token: string) => apiRequest<{ submitted: boolean; status: string; alreadySubmitted: boolean; message: string }>(`${base}/public/${token}/submit`, { method: 'POST' }),
+    publicApiRequest<PublicIntakeView>(`${base}/public/${token}/sections`, { method: 'POST', body: JSON.stringify({ sectionType, data }) }),
+  publicSubmit: (token: string) => publicApiRequest<{ submitted: boolean; status: string; alreadySubmitted: boolean; message: string }>(`${base}/public/${token}/submit`, { method: 'POST' }),
 };

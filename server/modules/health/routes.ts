@@ -1,6 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { env, isIngressProxyConfigurationReady, parseAllowedMockIntegrations } from '../../config/env';
 import { metricsAccess } from '../../lib/metrics';
+import { resolveReleaseIdentity } from '../../lib/releaseIdentity';
+import { providerConfigured } from '../../lib/providerCredentials';
+import { passwordResetDeliveryConfigured } from '../../lib/passwordResetDelivery';
 import { SLOS, errorBudgetMinutes } from '../../lib/slo';
 import { refreshDependencyGauges } from './checks';
 
@@ -37,7 +40,7 @@ export const healthRoutes: FastifyPluginAsync = async app => {
     status: 'ok',
     service: env.OTEL_SERVICE_NAME,
     environment: env.SERVICE_ENV ?? env.NODE_ENV,
-    release: env.RELEASE ?? 'unknown',
+    release: resolveReleaseIdentity(env) ?? 'unknown',
     uptimeSeconds: Math.floor((Date.now() - BOOTED_AT) / 1000),
     time: new Date().toISOString(),
   }));
@@ -58,7 +61,8 @@ export const healthRoutes: FastifyPluginAsync = async app => {
       ai: env.AI_PROVIDER,
       // Channel integrations are presence-derived: 'configured' only means the
       // relevant env credentials are set, not that delivery has been proven.
-      email: env.EMAIL_HTTP_API_URL || env.SMTP_HOST ? 'configured' : 'not_configured',
+      email: providerConfigured('email') ? 'configured' : 'not_configured',
+      tenantPasswordRecovery: passwordResetDeliveryConfigured() ? 'configured' : 'not_configured',
       sms: env.TWILIO_ACCOUNT_SID ? 'configured' : 'not_configured',
       voice: env.RETELL_API_KEY ? 'configured' : 'not_configured',
     },

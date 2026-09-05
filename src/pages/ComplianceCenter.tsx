@@ -17,7 +17,7 @@ import {
   type Risk, type Vendor, type Incident, type SecurityPolicy, type ReportBase, type ReportKey,
 } from '../lib/compliance';
 
-type Section = 'overview' | 'controls' | 'evidence' | 'risks' | 'vendors' | 'incidents' | 'audit-logs' | 'security-policy' | 'reports';
+type Section = 'proof' | 'overview' | 'controls' | 'evidence' | 'risks' | 'vendors' | 'incidents' | 'audit-logs' | 'security-policy' | 'reports';
 
 const TABS: Array<{ id: Section; label: string; icon: React.ElementType }> = [
   { id: 'overview', label: 'Overview', icon: ShieldCheck },
@@ -83,18 +83,19 @@ export default function ComplianceCenter() {
   const navigate = useNavigate();
   const { user } = useSession();
   const canWrite = canWriteCompliance(user?.role);
+  const proofMode = section === 'proof';
   const active: Section = (TABS.find(t => t.id === section)?.id) ?? 'overview';
 
   return (
     <div className="space-y-6 pb-10">
       <PageHeader
-        title="Compliance Readiness Center"
-        subtitle="SOC 2 Readiness, HIPAA Alignment, and internal security baseline — a readiness posture, not a certification."
-        badge={canWrite ? 'Read / write' : 'Read only'}
-        badgeColor={canWrite ? 'violet' : 'blue'}
+        title={proofMode ? 'Pilot Readiness Snapshot' : 'Compliance Readiness Center'}
+        subtitle={proofMode ? 'Aggregate-only evidence prepared for safe buyer review and screen sharing.' : 'SOC 2 Readiness, HIPAA Alignment, and internal security baseline — a readiness posture, not a certification.'}
+        badge={proofMode ? 'PHI-safe summary' : canWrite ? 'Read / write' : 'Read only'}
+        badgeColor={proofMode ? 'emerald' : canWrite ? 'violet' : 'blue'}
       />
 
-      <div className="flex items-center gap-1 overflow-x-auto rounded-xl bg-[var(--s3)] p-1">
+      {!proofMode && <div className="flex items-center gap-1 overflow-x-auto rounded-xl bg-[var(--s3)] p-1">
         {TABS.map(t => {
           const Icon = t.icon;
           return (
@@ -104,18 +105,70 @@ export default function ComplianceCenter() {
             </button>
           );
         })}
-      </div>
+      </div>}
 
-      {active === 'overview' && <OverviewSection />}
-      {active === 'controls' && <ControlsSection canWrite={canWrite} />}
-      {active === 'evidence' && <EvidenceSection canWrite={canWrite} />}
-      {active === 'risks' && <RisksSection canWrite={canWrite} />}
-      {active === 'vendors' && <VendorsSection canWrite={canWrite} />}
-      {active === 'incidents' && <IncidentsSection canWrite={canWrite} />}
-      {active === 'audit-logs' && <AuditLogsSection />}
-      {active === 'security-policy' && <SecurityPolicySection canWrite={canWrite} />}
-      {active === 'reports' && <ReportsSection />}
+      {proofMode ? <BuyerProofSection onOpenInternal={() => navigate('/compliance')} /> : (
+        <>
+          {active === 'overview' && <OverviewSection />}
+          {active === 'controls' && <ControlsSection canWrite={canWrite} />}
+          {active === 'evidence' && <EvidenceSection canWrite={canWrite} />}
+          {active === 'risks' && <RisksSection canWrite={canWrite} />}
+          {active === 'vendors' && <VendorsSection canWrite={canWrite} />}
+          {active === 'incidents' && <IncidentsSection canWrite={canWrite} />}
+          {active === 'audit-logs' && <AuditLogsSection />}
+          {active === 'security-policy' && <SecurityPolicySection canWrite={canWrite} />}
+          {active === 'reports' && <ReportsSection />}
+        </>
+      )}
     </div>
+  );
+}
+
+function BuyerProofSection({ onOpenInternal }: { onOpenInternal: () => void }) {
+  const { data, loading, error, reload } = useAsync(useCallback(() => api.buyerProof(), []));
+  return (
+    <StateBlock loading={loading} error={error}>
+      {data && (
+        <div className="space-y-4">
+          <section className="compliance-brief glass-card" aria-labelledby="buyer-proof-heading">
+            <div className="compliance-brief-heading">
+              <div>
+                <span className="compliance-proof-label"><ShieldCheck aria-hidden="true" /> Aggregate-only · no patient records</span>
+                <h2 id="buyer-proof-heading">{data.tenantName} pilot evidence</h2>
+                <p>A screen-share-safe snapshot of recorded control status, approved evidence coverage, access protection, recovery verification, accountability, and unresolved gaps.</p>
+              </div>
+              <div className="compliance-brief-freshness"><span>Generated</span><strong>{new Date(data.generatedAt).toLocaleString()}</strong><RefreshButton onClick={reload} /></div>
+            </div>
+            <div className="compliance-evidence-grid">
+              <EvidenceSignal icon={<ListChecks />} label="Recorded status completion" value={data.controlStatus.available ? `${data.controlStatus.completionPct}%` : 'Not assessed'} detail="Self-recorded · not an audit opinion" tone={data.controlStatus.available ? 'neutral' : 'warn'} />
+              <EvidenceSignal icon={<FileText />} label="Approved evidence coverage" value={data.controlStatus.available ? `${data.controlStatus.evidenceBackedControls} of ${data.controlStatus.eligibleControls}` : 'Not assessed'} detail={data.controlStatus.available ? 'Current approved evidence only' : 'No eligible control baseline recorded'} tone={data.controlStatus.eligibleControls > 0 && data.controlStatus.evidenceBackedControls === data.controlStatus.eligibleControls ? 'good' : 'warn'} />
+              <EvidenceSignal icon={<Lock />} label="MFA policy" value={data.accessProtection.mfaEnforced ? 'Enforced' : 'Not enforced'} detail={`${data.accessProtection.adoptionPct}% active-user enrollment`} tone={data.accessProtection.mfaEnforced ? 'good' : 'warn'} />
+              <EvidenceSignal icon={<History />} label="Latest backup check" value={data.recoveryEvidence.latestStatus.replace(/_/g, ' ')} detail={data.recoveryEvidence.latestRunAt ? new Date(data.recoveryEvidence.latestRunAt).toLocaleString() : 'No verification record'} tone={data.recoveryEvidence.latestVerified ? 'good' : 'warn'} />
+            </div>
+          </section>
+
+          <div className="grid gap-4 lg:grid-cols-[1.15fr_.85fr]">
+            <section className="cc-card p-5" aria-labelledby="open-gaps-heading">
+              <div className="flex items-start justify-between gap-3"><div><h3 id="open-gaps-heading" className="text-sm font-bold text-t1">Open evidence gaps</h3><p className="mt-1 text-[11px] text-t3">A zero is shown only when the underlying aggregate was queried successfully.</p></div><span className="badge badge-amber">Action register</span></div>
+              {!data.controlStatus.available && <div className="compliance-decision is-blocked" role="status"><AlertTriangle aria-hidden="true" /><div><strong>Missing control baseline</strong><span>Control and evidence-gap counts remain unassessed until an eligible baseline exists.</span></div></div>}
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <StatCard title="Controls without current approved evidence" value={data.controlStatus.available ? data.openGaps.controlsWithoutCurrentApprovedEvidence : '—'} accent="amber" size="sm" />
+                <StatCard title="Not implemented controls" value={data.controlStatus.available ? data.openGaps.notImplementedControls : '—'} accent="red" size="sm" />
+                <StatCard title="Open or mitigating risks" value={data.openGaps.risks} accent="amber" size="sm" />
+                <StatCard title="Open security incidents" value={data.openGaps.incidents} accent="red" size="sm" />
+              </div>
+            </section>
+            <section className="cc-card p-5" aria-labelledby="proof-limits-heading">
+              <div className="flex items-start justify-between gap-3"><div><h3 id="proof-limits-heading" className="text-sm font-bold text-t1">Scope and limitations</h3><p className="mt-1 text-[11px] text-t3">What a buyer may safely conclude from this snapshot.</p></div><span className="badge badge-blue">{data.accountability.auditEventsLast30Days} audit events · 30d</span></div>
+              <ul className="mt-4 space-y-3">
+                {data.limitations.map(limit => <li key={limit} className="flex items-start gap-2 text-[11px] leading-relaxed text-t2"><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-v" />{limit}</li>)}
+              </ul>
+              <button type="button" onClick={onOpenInternal} className="mt-5 inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)]">Open internal control workspace <ExternalLink className="h-3.5 w-3.5" /></button>
+            </section>
+          </div>
+        </div>
+      )}
+    </StateBlock>
   );
 }
 
@@ -124,15 +177,67 @@ function OverviewSection() {
   const { data, loading, error, reload } = useAsync(useCallback(() => api.dashboard(), []));
   return (
     <div className="space-y-4">
-      <div className="flex justify-end"><RefreshButton onClick={reload} /></div>
       <StateBlock loading={loading} error={error}>
         {data && (
           <div className="space-y-4">
+            <section className="compliance-brief glass-card" aria-labelledby="readiness-brief-heading">
+              <div className="compliance-brief-heading">
+                <div>
+                  <span className="compliance-proof-label"><ShieldCheck aria-hidden="true" /> PHI-safe readiness summary</span>
+                  <h2 id="readiness-brief-heading">Evidence for a pilot decision—not a compliance certificate.</h2>
+                  <p>This view summarizes tenant-scoped records and connected control signals. It contains no patient data and does not replace a legal review, external audit, or deployment-specific verification.</p>
+                </div>
+                <div className="compliance-brief-freshness">
+                  <span>Snapshot</span>
+                  <strong>{new Date(data.generatedAt).toLocaleString()}</strong>
+                  <RefreshButton onClick={reload} />
+                </div>
+              </div>
+
+              {!data.readinessAvailable && (
+                <div className="compliance-decision is-blocked" role="status">
+                  <AlertTriangle aria-hidden="true" />
+                  <div><strong>Readiness is not assessed.</strong><span>No eligible control baseline is recorded for this tenant. Percentages stay hidden until controls exist.</span></div>
+                </div>
+              )}
+
+              <div className="compliance-evidence-grid">
+                <EvidenceSignal
+                  icon={<ListChecks />}
+                  label="Control baseline"
+                  value={data.readinessAvailable ? `${data.eligibleControlCount} eligible controls` : 'Not assessed'}
+                  detail={`${data.controlCount} total control records`}
+                  tone={data.readinessAvailable ? 'neutral' : 'warn'}
+                />
+                <EvidenceSignal
+                  icon={<FileText />}
+                  label="Evidence coverage"
+                  value={data.readinessAvailable ? `${data.evidenceLinkedControlCount} of ${data.eligibleControlCount}` : '—'}
+                  detail="Eligible controls with linked evidence"
+                  tone={data.readinessAvailable && data.evidenceLinkedControlCount === data.eligibleControlCount ? 'good' : 'warn'}
+                />
+                <EvidenceSignal
+                  icon={<Lock />}
+                  label="MFA enforcement"
+                  value={data.mfaStatus.enforced ? 'Enforced' : 'Action required'}
+                  detail={`${data.mfaStatus.adoptionPct}% of active users enrolled`}
+                  tone={data.mfaStatus.enforced ? 'good' : 'warn'}
+                />
+                <EvidenceSignal
+                  icon={<History />}
+                  label="Backup verification"
+                  value={data.backupStatus.integrated ? data.backupStatus.status.replace(/_/g, ' ') : 'Unverified'}
+                  detail={data.backupStatus.lastRunAt ? `Last record ${new Date(data.backupStatus.lastRunAt).toLocaleString()}` : 'No verified run is recorded'}
+                  tone={data.backupStatus.integrated ? 'good' : 'warn'}
+                />
+              </div>
+            </section>
+
             <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
-              <StatCard title="Self-Assessed Overall Readiness" value={`${data.overallReadinessScore}%`} subtitle="Calculated from recorded internal control status" accent="violet" />
-              <StatCard title="Self-Assessed SOC 2 Readiness" value={`${data.soc2ReadinessPct}%`} subtitle="Internal mapping · not an audit opinion" accent="blue" />
-              <StatCard title="Self-Assessed HIPAA Alignment" value={`${data.hipaaAlignmentPct}%`} subtitle="Internal mapping · not a legal determination" accent="cyan" />
-              <StatCard title="Self-Assessed Internal Baseline" value={`${data.internalBaselinePct}%`} subtitle="Calculated from recorded control status" accent="emerald" />
+              <StatCard title="Self-Assessed Overall Readiness" value={data.readinessAvailable ? `${data.overallReadinessScore}%` : '—'} subtitle={data.readinessAvailable ? 'Calculated from recorded internal control status' : 'No eligible controls recorded'} accent="violet" />
+              <StatCard title="Self-Assessed SOC 2 Readiness" value={data.readinessAvailable ? `${data.soc2ReadinessPct}%` : '—'} subtitle={data.readinessAvailable ? 'Internal mapping · not an audit opinion' : 'Not assessed · not an audit opinion'} accent="blue" />
+              <StatCard title="Self-Assessed HIPAA Alignment" value={data.readinessAvailable ? `${data.hipaaAlignmentPct}%` : '—'} subtitle={data.readinessAvailable ? 'Internal mapping · not a legal determination' : 'Not assessed · not a legal determination'} accent="cyan" />
+              <StatCard title="Self-Assessed Internal Baseline" value={data.readinessAvailable ? `${data.internalBaselinePct}%` : '—'} subtitle={data.readinessAvailable ? 'Calculated from recorded control status' : 'No eligible controls recorded'} accent="emerald" />
             </div>
             <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
               <StatCard title="Open Risks" value={String(data.openRisks)} accent="amber" />
@@ -188,6 +293,30 @@ function OverviewSection() {
       </StateBlock>
     </div>
   );
+}
+
+function EvidenceSignal({ icon, label, value, detail, tone }: { icon: React.ReactNode; label: string; value: string; detail: string; tone: 'good' | 'warn' | 'neutral' }) {
+  return (
+    <article className={`compliance-evidence-signal tone-${tone}`}>
+      <span className="compliance-evidence-icon" aria-hidden="true">{icon}</span>
+      <div><p>{label}</p><strong>{value}</strong><span>{detail}</span></div>
+    </article>
+  );
+}
+
+function safeEvidenceUrl(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function evidenceHostname(value: string | null): string {
+  const safe = safeEvidenceUrl(value);
+  return safe ? new URL(safe).hostname : 'external evidence';
 }
 
 function StatusRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -296,7 +425,7 @@ function EvidenceSection({ canWrite }: { canWrite: boolean }) {
 
   return (
     <div className="space-y-4">
-      <Note>Evidence file custody is not enabled. Store only an approved external link and content hash. The version chain can reveal later metadata changes; it does not prove that an external file is authentic, complete, or legally sufficient.</Note>
+      <Note>Evidence file custody is not enabled. Store only an approved HTTPS link and content hash. The version history records content hashes and actions; it does not prove that metadata or an external file is authentic, complete, unchanged, or legally sufficient.</Note>
       <div className="flex items-center justify-between gap-2">
         <Toggle checked={includeDeleted} onChange={setIncludeDeleted} label="Include soft-deleted" />
         <div className="flex items-center gap-2">
@@ -320,7 +449,7 @@ function EvidenceSection({ canWrite }: { canWrite: boolean }) {
                     <span className="badge badge-blue">{ev.sourceType}</span>
                   </div>
                   <p className="text-[11px] text-t3 mt-1 truncate">
-                    {ev.externalUrl ? <a href={ev.externalUrl} target="_blank" rel="noreferrer" className="text-indigo inline-flex items-center gap-1">external link <ExternalLink className="w-3 h-3" /></a> : 'no external link'}
+                    {safeEvidenceUrl(ev.externalUrl) ? <a href={safeEvidenceUrl(ev.externalUrl)!} target="_blank" rel="noreferrer" className="text-indigo inline-flex items-center gap-1">{evidenceHostname(ev.externalUrl)} <ExternalLink className="w-3 h-3" /></a> : ev.externalUrl ? 'unsafe legacy link blocked' : 'no external link'}
                     {ev.contentHash ? ` · hash ${ev.contentHash.slice(0, 12)}…` : ''}
                     {ev.expiresAt ? ` · expires ${new Date(ev.expiresAt).toLocaleDateString()}` : ''}
                     {` · ${ev.controlEvidence.length} linked control(s)`}
@@ -642,10 +771,10 @@ function AuditLogsSection() {
         <Field label="To"><TextInput type="date" value={filters.to} onChange={e => setFilters(f => ({ ...f, to: e.target.value }))} /></Field>
         <button type="button" onClick={() => setApplied(filters)} className="rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90">Apply</button>
       </div>
-      <div className="flex justify-end"><RefreshButton onClick={reload} /></div>
-      <StateBlock loading={loading} error={error} empty={(data?.length ?? 0) === 0}>
+      <div className="flex items-center justify-between gap-3"><p className="text-[11px] text-t3">{data ? `Showing ${data.items.length} of ${data.total} matching events · newest first` : 'Newest 100 matching events · total returned after load'}</p><RefreshButton onClick={reload} /></div>
+      <StateBlock loading={loading} error={error} empty={(data?.items.length ?? 0) === 0}>
         <div className="cc-card divide-y divide-[var(--b0)]">
-          {(data ?? []).map(e => (
+          {(data?.items ?? []).map(e => (
             <div key={e.id} className="px-4 py-2.5 flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <p className="text-xs font-semibold text-t1 truncate">{e.action}</p>

@@ -33,9 +33,10 @@ async function makeTenant() {
   const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'AI', lastName: 'Patient', lifecycleStage: 'NEW' } });
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `a-${id.slice(0, 8)}@ai.test`, displayName: 'Admin' } });
+  const provider = await db.user.create({ data: { tenantId: id, branchId: branch.id, role: 'PROVIDER', active: true, email: `p-${id.slice(0, 8)}@ai.test`, displayName: 'Provider' } });
   // Seed an open critical alert so the de-identified snapshot has real evidence.
   await db.readingAlert.create({ data: { tenantId: id, patientId: patient.id, branchId: branch.id, severity: 'critical', alertType: 'abnormal_reading', status: 'open', generatedReason: 'seeded for test' } });
-  return { id, adminId: admin.id };
+  return { id, adminId: admin.id, providerId: provider.id };
 }
 const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
 const auth = (t: string) => ({ authorization: `Bearer ${t}`, 'x-forwarded-for': '203.0.113.9' });
@@ -48,6 +49,20 @@ afterAll(async () => {
 });
 
 describe('AI model gateway (integration, mock provider)', () => {
+  it('fails closed for branch-scoped roles because legacy AI evidence is tenant-wide', async () => {
+    const t = await makeTenant();
+    const provider = auth(tok(t.id, t.providerId));
+    for (const [method, url] of [
+      ['GET', '/v1/ai/recommendations'],
+      ['GET', '/v1/ai/usage'],
+      ['GET', '/v1/ai/evaluations'],
+      ['POST', '/v1/ai/recommendations/generate'],
+      ['POST', '/v1/ai/providers/health-check'],
+    ] as const) {
+      expect((await app.inject({ method, url, headers: provider })).statusCode, `${method} ${url}`).toBe(403);
+    }
+  });
+
   it('generates evidence-backed recommendations and records usage', async () => {
     const t = await makeTenant();
     const admin = tok(t.id, t.adminId);

@@ -243,6 +243,12 @@ export async function submitSectionMutation(
 ): Promise<SectionSubmissionOutcome> {
   const packet = await tx.patientIntakePacket.findFirst({ where: { id: packetId, tenantId }, select: { id: true, patientId: true, leadId: true, status: true, startedAt: true } });
   if (!packet) throw new Error('packet_not_found');
+  // A submitted capability link remains readable so the patient can confirm
+  // receipt and safely retry the final submit request, but it must never turn
+  // into a write-capability for an already submitted or terminal packet.
+  if (!['draft', 'sent', 'link_issued', 'in_progress', 'needs_review'].includes(packet.status)) {
+    throw new Error('packet_not_editable');
+  }
   const section = await tx.patientIntakeSection.findFirst({ where: { packetId, sectionType } });
   if (!section) throw new Error('section_not_found');
   if (sectionType === 'payment_policy') throw new Error('payment_policy_unavailable');

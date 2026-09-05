@@ -305,6 +305,7 @@ export const intakePublicRoutes: FastifyPluginAsync = async app => {
     const { token } = tokenParam.parse(request.params);
     const body = z.object({ sectionType: sectionEnum, data: z.record(z.string(), z.unknown()).default({}) }).parse(request.body);
     const packet = await resolvePacketByToken(app, token, request.id);
+    if (packet.status === 'submitted') throw app.httpErrors.conflict('This intake has already been submitted');
     const ctx = { ipHash: hashValue(request.ip), uaHash: hashValue(typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null), source: 'intake_public' };
     await submitSection(packet.tenantId, packet.id, body.sectionType, body.data, ctx).catch((e: Error) => { throw app.httpErrors.badRequest(e.message); });
     const refreshed = await db.patientIntakePacket.findUniqueOrThrow({ where: { id: packet.id }, include: { sections: true } });

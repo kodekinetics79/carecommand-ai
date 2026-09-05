@@ -126,7 +126,7 @@ describe('slo — objectives are well-formed and discoverable', () => {
     expect(typeof json.integrations.ai).toBe('string');
 
     // Channel integrations are presence-derived flags only.
-    for (const channel of ['email', 'sms', 'voice'] as const) {
+    for (const channel of ['email', 'sms', 'tenantPasswordRecovery', 'voice'] as const) {
       expect(['configured', 'not_configured']).toContain(json.integrations[channel]);
     }
 
@@ -134,7 +134,15 @@ describe('slo — objectives are well-formed and discoverable', () => {
 
     // No secret material: the response is exactly the documented id/flag shape.
     expect(Object.keys(json).sort()).toEqual(['acknowledgedMockIntegrations', 'integrations', 'profile']);
-    expect(Object.keys(json.integrations).sort()).toEqual(['ai', 'email', 'insurance', 'payments', 'sms', 'voice']);
+    expect(Object.keys(json.integrations).sort()).toEqual([
+      'ai',
+      'email',
+      'insurance',
+      'payments',
+      'sms',
+      'tenantPasswordRecovery',
+      'voice',
+    ]);
     const body = res.body;
     for (const secret of [process.env.JWT_SECRET, process.env.STRIPE_SECRET_KEY, process.env.RETELL_API_KEY, process.env.TWILIO_AUTH_TOKEN]) {
       if (secret) expect(body).not.toContain(secret);

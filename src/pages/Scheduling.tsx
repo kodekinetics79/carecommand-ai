@@ -62,6 +62,24 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
 
 interface ApiBranchOption { id: string; name: string; timezone?: string | null }
 
+function clinicTimeInput(startsAt: string, timeZone: string): string {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(new Date(startsAt));
+}
+
+function clinicTimeLabelForAppointment(startsAt: string, timeZone: string, showZone = false): string {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: 'numeric',
+    minute: '2-digit',
+    ...(showZone ? { timeZoneName: 'short' as const } : {}),
+  }).format(new Date(startsAt));
+}
+
 /**
  * The tenant's configured "high no-show risk" threshold, from the same
  * `GET /v1/growth/policy` document ClinicRadar and Reviews band with.
@@ -106,8 +124,9 @@ export default function Scheduling() {
   const [insuranceQueue, setInsuranceQueue] = useState<AppointmentVerificationQueueRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
   const [queueError, setQueueError] = useState<string | null>(null);
+  const [queueTruncated, setQueueTruncated] = useState(false);
   const [queueBusy, setQueueBusy] = useState<string | null>(null);
-  const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
+  const { data: branchRecords, error: branchError, loading: branchesLoading, reload: reloadBranches } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
   // The rule every risk flag on this page is decided by. Same contract as
   // ClinicRadar's policy feed: until it answers, no row is flagged — not even
   // provisionally — and a failed load is named next to the timeline.
@@ -125,6 +144,26 @@ export default function Scheduling() {
     return resolveTimezone(chosen?.timezone ?? branchRecords[0]?.timezone);
   }, [branchRecords, selectedBranch]);
 
+  const branchTimezoneById = useMemo(
+    () => new Map(branchRecords.map(branch => [branch.id, resolveTimezone(branch.timezone)])),
+    [branchRecords],
+  );
+  const timezoneForBranch = useCallback(
+    (branchId: string) => branchTimezoneById.get(branchId) ?? clinicTimezone,
+    [branchTimezoneById, clinicTimezone],
+  );
+
+  const branchDisplayNames = useMemo(() => {
+    const counts = new Map<string, number>();
+    branchRecords.forEach(branch => counts.set(branch.name.trim(), (counts.get(branch.name.trim()) ?? 0) + 1));
+    return new Map(branchRecords.map(branch => {
+      const name = branch.name.trim() || 'Unnamed clinic';
+      const duplicate = (counts.get(branch.name.trim()) ?? 0) > 1;
+      return [branch.id, duplicate ? `${name} · ${resolveTimezone(branch.timezone)}` : name];
+    }));
+  }, [branchRecords]);
+  const scheduleScopeReady = !branchesLoading && !branchError && branchRecords.length > 0;
+
   const todayDate = useMemo(() => todayInZone(clinicTimezone), [clinicTimezone]);
   const activeDate = selectedDate ?? todayDate;
   const dateOptions = useMemo(() => [0, 1, 2].map(offset => {
@@ -141,12 +180,28 @@ export default function Scheduling() {
   // branch) instead of the first 100 rows ordered by id. The window is the
   // clinic's midnight-to-midnight expressed as UTC instants, which is 23 or 25
   // hours long on a DST changeover — a fixed 24h span drops or duplicates an hour.
+  const scopeDayRange = useMemo(() => {
+    const zones = selectedBranch === 'all'
+      ? [...new Set(branchRecords.map(branch => resolveTimezone(branch.timezone)))]
+      : [clinicTimezone];
+    const effectiveZones = zones.length > 0 ? zones : [clinicTimezone];
+    const ranges = effectiveZones.map(zone => clinicDayRangeUtc(activeDate, zone));
+    return {
+      from: new Date(Math.min(...ranges.map(range => range.from.getTime()))),
+      to: new Date(Math.max(...ranges.map(range => range.to.getTime()))),
+    };
+  }, [activeDate, branchRecords, clinicTimezone, selectedBranch]);
+
   const appointmentsPath = useMemo(() => {
-    const { from, to } = clinicDayRangeUtc(activeDate, clinicTimezone);
     const branchParam = selectedBranch === 'all' ? '' : `&branchId=${selectedBranch}`;
-    return `/v1/appointments?limit=100&from=${from.toISOString()}&to=${to.toISOString()}${branchParam}`;
-  }, [activeDate, clinicTimezone, selectedBranch]);
-  const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
+    return `/v1/appointments?limit=100&from=${scopeDayRange.from.toISOString()}&to=${scopeDayRange.to.toISOString()}${branchParam}`;
+  }, [scopeDayRange, selectedBranch]);
+  const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(
+    appointmentsPath,
+    [],
+    mapAppointment,
+    { allPages: true, maxPages: 20, enabled: scheduleScopeReady },
+  );
   const { data: providerRecords, error: providerError, loading: providersLoading, reload: reloadProviders } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   // The booking picker searches on the SERVER. It used to list the first 100
   // patients ordered by UUID, so in a clinic with more than that the caller on
@@ -158,7 +213,7 @@ export default function Scheduling() {
     if (debouncedPatientQuery.trim()) params.set('search', debouncedPatientQuery.trim());
     return `/v1/patients?${params.toString()}`;
   }, [debouncedPatientQuery]);
-  const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>(patientsPath, [], mapPatient);
+  const { data: patientRecords, error: patientError, reload: reloadPatients } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>(patientsPath, [], mapPatient);
   // The service catalog governs booking as soon as it holds one active entry
   // (resolveSchedulingService is fail-closed on a configured catalog), so this
   // screen has to know before it offers a free-text box the server will refuse.
@@ -205,6 +260,7 @@ export default function Scheduling() {
   const [pinnedPatient, setPinnedPatient] = useState<ReturnType<typeof mapPatient> | null>(null);
   const bookingPatient = patientRecords.find(p => p.id === booking.patientId)
     ?? (pinnedPatient?.id === booking.patientId ? pinnedPatient : undefined);
+  const bookingTimezone = bookingPatient ? timezoneForBranch(bookingPatient.branchId) : clinicTimezone;
   const clinicProviders = useMemo(
     () => (bookingPatient ? providerRecords.filter(p => p.branchId === bookingPatient.branchId) : []),
     [providerRecords, bookingPatient],
@@ -251,17 +307,18 @@ export default function Scheduling() {
   }, [showBooking, booking.providerId, booking.date, booking.service, chosenService]);
 
   useEffect(() => {
+    if (!scheduleScopeReady) return;
     let active = true;
     void (async () => {
       setQueueLoading(true);
       setQueueError(null);
       try {
-        const response = await fetchAppointmentVerificationQueue(
-          selectedBranch === 'all' ? undefined : selectedBranch,
-          clinicDayRangeUtc(activeDate, clinicTimezone),
-        );
+        const response = await fetchAppointmentVerificationQueue(selectedBranch === 'all' ? undefined : selectedBranch, scopeDayRange);
         if (!active) return;
-        setInsuranceQueue(response.appointments);
+        setInsuranceQueue(response.appointments.filter(row =>
+          todayInZone(timezoneForBranch(row.branchId), new Date(row.appointmentTime)) === activeDate
+        ));
+        setQueueTruncated(response.truncated === true);
       } catch (err) {
         if (!active) return;
         setQueueError(err instanceof Error ? err.message : 'Unable to load insurance verification queue');
@@ -272,7 +329,7 @@ export default function Scheduling() {
     return () => {
       active = false;
     };
-  }, [selectedBranch, activeDate, clinicTimezone]);
+  }, [selectedBranch, activeDate, scheduleScopeReady, scopeDayRange, timezoneForBranch]);
 
   function closeBooking() {
     setBooking(emptyBooking(todayDate));
@@ -373,7 +430,9 @@ export default function Scheduling() {
     // Typed as clinic wall time. Parsing this with `new Date()` read it in the
     // staff member's own zone, so a reschedule from anywhere but the clinic
     // wrote a different hour than the one on screen — silently.
-    const startsAt = clinicTimeToUtc(rescheduleForm.date ?? todayDate, rescheduleForm.time, clinicTimezone);
+    const appointment = appointmentRecords.find(row => row.id === id);
+    const appointmentTimezone = appointment ? timezoneForBranch(appointment.branchId) : clinicTimezone;
+    const startsAt = clinicTimeToUtc(rescheduleForm.date ?? todayDate, rescheduleForm.time, appointmentTimezone);
     const endsAt = new Date(startsAt.getTime() + 30 * 60000);
     await runRowAction(id, () => appointmentsApi.reschedule(id, startsAt.toISOString(), endsAt.toISOString()), 'Appointment rescheduled.');
     setRescheduleFor(null);
@@ -396,11 +455,17 @@ export default function Scheduling() {
     }
   }
 
-  // Date + branch are now filtered server-side (see appointmentsPath); just order
-  // the returned day by time.
+  // All-clinic mode queries the union of every branch's UTC day window, then
+  // keeps each row only when its own branch-local calendar date matches.
   const todayAppts = useMemo(() =>
-    [...appointmentRecords].sort((a, b) => a.time.localeCompare(b.time)),
-    [appointmentRecords]
+    (scheduleScopeReady ? appointmentRecords : [])
+      .filter(appt => todayInZone(timezoneForBranch(appt.branchId), new Date(appt.startsAt)) === activeDate)
+      .sort((a, b) => {
+        const localTime = clinicTimeInput(a.startsAt, timezoneForBranch(a.branchId))
+          .localeCompare(clinicTimeInput(b.startsAt, timezoneForBranch(b.branchId)));
+        return localTime || a.startsAt.localeCompare(b.startsAt);
+      }),
+    [activeDate, appointmentRecords, scheduleScopeReady, timezoneForBranch]
   );
 
   const totalValue = todayAppts.reduce((s, a) => s + a.value, 0);
@@ -410,13 +475,23 @@ export default function Scheduling() {
   // are coming. Counted from `patientConfirmation`, which mapAppointment only
   // sets from a timestamp the response actually carried — never from `status`.
   const patientConfirmedCount = todayAppts.filter(a => a.patientConfirmation).length;
-  const eligibilityModes = [...new Set(insuranceQueue.map(row => row.providerMode).filter(Boolean))];
-  const queueMode = eligibilityModes.length === 0
+  const visibleInsuranceQueue = scheduleScopeReady ? insuranceQueue : [];
+  const eligibilityModes = [...new Set(visibleInsuranceQueue.map(row => row.providerMode).filter(Boolean))];
+  const queueMode = !scheduleScopeReady
+    ? 'Waiting for clinic scope'
+    : eligibilityModes.length === 0
     ? 'Provider mode unavailable'
     : eligibilityModes.length === 1
       ? `Recorded mode: ${eligibilityModes[0]}`
       : `Mixed recorded modes: ${eligibilityModes.join(', ')}`;
   const loadError = appointmentError || providerError || patientError || branchError;
+
+  function retryScheduleData() {
+    reloadBranches();
+    reload();
+    reloadProviders();
+    reloadPatients();
+  }
 
   async function verifyInsurance(row: AppointmentVerificationQueueRow) {
     setQueueBusy(row.id);
@@ -428,8 +503,11 @@ export default function Scheduling() {
         branchId: row.branchId,
         serviceType: row.serviceType,
       });
-      const refreshed = await fetchAppointmentVerificationQueue(selectedBranch === 'all' ? undefined : selectedBranch);
-      setInsuranceQueue(refreshed.appointments);
+      const refreshed = await fetchAppointmentVerificationQueue(selectedBranch === 'all' ? undefined : selectedBranch, scopeDayRange);
+      setInsuranceQueue(refreshed.appointments.filter(item =>
+        todayInZone(timezoneForBranch(item.branchId), new Date(item.appointmentTime)) === activeDate
+      ));
+      setQueueTruncated(refreshed.truncated === true);
     } catch (err) {
       setQueueError(err instanceof Error ? err.message : 'Unable to verify insurance');
     } finally {
@@ -446,7 +524,7 @@ export default function Scheduling() {
         badgeColor={loadError ? 'red' : source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
-            <button type="button" onClick={openBooking} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+            <button type="button" onClick={openBooking} disabled={!scheduleScopeReady} title={!scheduleScopeReady ? 'Clinic timezone data must load before booking' : undefined} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:cursor-not-allowed disabled:opacity-40">
               <CalendarDays className="w-4 h-4" /> Book appointment
             </button>
           </div>
@@ -506,7 +584,7 @@ export default function Scheduling() {
                   ) : slots.length > 0 ? (
                     <div className="flex flex-wrap gap-1.5">
                       {slots.map(s => {
-                        const label = new Date(s.startsAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                        const label = clinicTimeLabelForAppointment(s.startsAt, bookingTimezone);
                         const active = booking.slotStart === s.startsAt;
                         return (
                           <button key={s.startsAt} type="button" onClick={() => setBooking(b => ({ ...b, slotStart: s.startsAt, slotEnd: s.endsAt }))} className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${active ? 'bg-[var(--indigo)] text-white' : 'bg-[var(--s3)] text-t2 hover:bg-[var(--b1)]'}`}>{label}</button>
@@ -541,37 +619,56 @@ export default function Scheduling() {
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Appointments" value={todayAppts.length} subtitle="Selected date and branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Booked or arrived" value={bookedCount} subtitle="The clinic's own booking status" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Risk flagged" value={riskyCount} subtitle="Stored no-show score" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Recorded value" value={formatCurrency(totalValue)} subtitle="Selected appointments" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Appointments" value={scheduleScopeReady ? todayAppts.length : '—'} subtitle={scheduleScopeReady ? 'Selected date and branches' : 'Clinic scope unavailable'} icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Booked or arrived" value={scheduleScopeReady ? bookedCount : '—'} subtitle={scheduleScopeReady ? "The clinic's own booking status" : 'Clinic scope unavailable'} icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Risk flagged" value={scheduleScopeReady ? riskyCount : '—'} subtitle={scheduleScopeReady ? 'Stored no-show score' : 'Clinic scope unavailable'} icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Recorded value" value={scheduleScopeReady ? formatCurrency(totalValue) : '—'} subtitle={scheduleScopeReady ? 'Selected appointments' : 'Clinic scope unavailable'} icon={<DollarSign className="w-4 h-4" />} accent="violet" />
       </div>
 
       {loadError && (
         <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-3 text-xs font-semibold text-red-v">
-          <span>Scheduling data is unavailable. {loadError}</span>
-          <button type="button" onClick={reload} className="rounded-lg border border-current px-3 py-1.5">Try again</button>
+          <span>{branchError ? 'Clinic timezone data is unavailable, so timezone-dependent schedule results are hidden.' : `Scheduling data is unavailable. ${loadError}`}</span>
+          <button type="button" onClick={retryScheduleData} className="rounded-lg border border-current px-3 py-1.5">Try again</button>
         </div>
       )}
 
-      {/* Filters */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
-          {dateOptions.map(opt => (
-            <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
-          ))}
-          {/* Pick any day server-side (not just Today/Tomorrow/+2). */}
-          <input type="date" aria-label="Pick a date" value={activeDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === activeDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
+      {/* One calendar label, evaluated inside each clinic's own timezone. */}
+      <section aria-label="Schedule scope" className="glass-card overflow-hidden p-4 sm:p-5">
+        <div className="relative z-[1] flex flex-col gap-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-indigo">Schedule scope</p>
+              <p className="mt-1 text-sm font-bold text-t1">
+                {!scheduleScopeReady ? 'Loading clinic scope' : selectedBranch === 'all' ? `All ${branchRecords.length} clinics` : branchDisplayNames.get(selectedBranch) ?? 'Selected clinic'}
+                <span className="font-medium text-t3"> · {clinicDateLabel(activeDate, clinicTimezone, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}</span>
+              </p>
+            </div>
+            <p className="max-w-md text-xs leading-5 text-t3">
+              {!scheduleScopeReady
+                ? 'Appointments remain hidden until clinic timezones are available.'
+                : selectedBranch === 'all'
+                ? `Each clinic is shown in its own local day. “Today” is anchored to ${branchDisplayNames.get(branchRecords[0]?.id) ?? 'the primary clinic'}.`
+                : `Times and date boundaries use ${clinicTimezone}.`}
+            </p>
+          </div>
+          <div className="flex items-center gap-3 flex-wrap">
+            <div className="flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-white/70 bg-white/60 p-1 shadow-sm">
+              {dateOptions.map(opt => (
+                <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
+              ))}
+              <input type="date" aria-label="Pick a date" value={activeDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === activeDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
+            </div>
+            <div className="flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-white/70 bg-white/60 p-1 shadow-sm">
+              <button type="button" onClick={() => setSelectedBranch('all')} className={`whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All branches</button>
+              {branchRecords.map(b => (
+                <button key={b.id} type="button" aria-label={`${branchDisplayNames.get(b.id) ?? b.name}, ${resolveTimezone(b.timezone)}`} onClick={() => setSelectedBranch(b.id)} className={`whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === b.id ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>
+                  {branchDisplayNames.get(b.id) ?? b.name}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
-        <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
-          <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All branches</button>
-          {branchRecords.map(b => (
-            <button key={b.id} type="button" onClick={() => setSelectedBranch(b.id)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all truncate max-w-[120px] ${selectedBranch === b.id ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>
-              {b.name.split(' ')[0]}
-            </button>
-          ))}
-        </div>
-      </div>
+      </section>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         {/* Appointment timeline */}
@@ -582,13 +679,16 @@ export default function Scheduling() {
             headerRight={<span className="text-xs font-semibold text-t3">{queueMode}</span>}
           >
             {queueError && <p role="alert" className="mb-3 rounded-lg bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">{queueError}</p>}
-            {queueLoading ? (
+            {scheduleScopeReady && queueTruncated && <p role="alert" className="mb-3 rounded-lg bg-[var(--amber-soft)] px-3 py-2 text-xs font-semibold text-amber-v">The first 100 verification rows are shown. Select one clinic to narrow this queue before acting.</p>}
+            {scheduleScopeReady && queueLoading ? (
               <div className="py-8 text-center text-sm text-t3">Loading verification queue…</div>
-            ) : insuranceQueue.length === 0 ? (
+            ) : !scheduleScopeReady ? (
+              <div className="py-8 text-center text-sm text-t3">Insurance appointments are unavailable until clinic timezones load.</div>
+            ) : visibleInsuranceQueue.length === 0 ? (
               <div className="py-8 text-center text-sm text-t3">No appointments found for this clinic scope.</div>
             ) : (
-              <div className="overflow-hidden rounded-2xl border border-[var(--b1)]">
-                <table className="min-w-full text-sm">
+              <div className="overflow-x-auto rounded-2xl border border-[var(--b1)]">
+                <table className="min-w-[960px] text-sm">
                   <thead className="bg-[var(--s2)] text-left text-xs text-t3">
                     <tr>
                       <th className="px-4 py-3">Patient</th>
@@ -603,7 +703,7 @@ export default function Scheduling() {
                     </tr>
                   </thead>
                   <tbody>
-                    {insuranceQueue.map(row => {
+                    {visibleInsuranceQueue.map(row => {
                       const active = row.eligibilityStatus === 'Active';
                       return (
                         <tr key={row.id} className="border-t border-[var(--b1)]">
@@ -612,7 +712,7 @@ export default function Scheduling() {
                             <p className="text-[11px] text-t3">{row.branchName}</p>
                           </td>
                           <td className="px-4 py-3">
-                            <p className="font-semibold text-t1">{new Date(row.appointmentTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</p>
+                            <p className="font-semibold text-t1">{clinicTimeLabelForAppointment(row.appointmentTime, timezoneForBranch(row.branchId), selectedBranch === 'all')}</p>
                             <p className="text-[11px] text-t3">{row.serviceType}</p>
                           </td>
                           <td className="px-4 py-3 text-t2">{row.payerName}</td>
@@ -647,7 +747,7 @@ export default function Scheduling() {
           </BentoCard>
 
           <BentoCard title="Appointment timeline" subtitle={activeDate === todayDate ? "Today's schedule" : clinicDateLabel(activeDate, clinicTimezone, { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
-            <span className="text-xs font-semibold text-t3">{todayAppts.length} appointments · {formatCurrency(totalValue)}</span>
+            <span className="text-xs font-semibold text-t3">{scheduleScopeReady ? `${todayAppts.length} appointments · ${formatCurrency(totalValue)}` : 'Schedule unavailable'}</span>
           }>
             {/* The rule the red flags below are asserted against, stated as the
                 value actually used — or the named failure when it could not be
@@ -675,10 +775,14 @@ export default function Scheduling() {
               </p>
             )}
             <div className="space-y-2">
-              {todayAppts.length === 0 ? (
+              {!scheduleScopeReady ? (
+                <div className="py-8 text-center text-sm text-t3">Appointments are unavailable until clinic timezones load.</div>
+              ) : todayAppts.length === 0 ? (
                 <div className="py-8 text-center text-sm text-t3">No appointments match the selected date and branch.</div>
               ) : todayAppts.map((appt) => {
                 const sc = statusConfig[appt.status] ?? statusConfig['confirmed'];
+                const appointmentTimezone = timezoneForBranch(appt.branchId);
+                const appointmentBranchName = branchDisplayNames.get(appt.branchId) ?? 'Clinic';
                 const isRisky = receivedNoShowPolicy !== null && appt.noShowRisk >= receivedNoShowPolicy.noShowRiskHigh;
                 // Null unless the server sent a real confirmation timestamp.
                 // An unconfirmed row renders nothing here — absence means "not
@@ -692,7 +796,7 @@ export default function Scheduling() {
                 return (
                   <div key={appt.id} data-appointment-id={appt.id} className={`flex items-start gap-3 p-3.5 rounded-xl border transition-all hover:bg-[var(--s3)] ${isRisky ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
                     <div className="text-center shrink-0 w-14">
-                      <p className="text-sm font-bold text-t1">{appt.time}</p>
+                      <p className="text-sm font-bold text-t1">{clinicTimeLabelForAppointment(appt.startsAt, appointmentTimezone, selectedBranch === 'all')}</p>
                       <p className="text-[10px] text-t3">{appt.value ? formatCurrency(Number(appt.value)) : ''}</p>
                     </div>
                     <div className="w-px self-stretch bg-[var(--b1)] shrink-0" />
@@ -712,14 +816,14 @@ export default function Scheduling() {
                           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg} ${sc.text}`}>{sc.label}</span>
                         </div>
                       </div>
-                      <p className="text-xs text-t3">{appt.service} · {appt.doctorName}</p>
+                      <p className="text-xs text-t3">{appt.service} · {appt.doctorName}{selectedBranch === 'all' ? ` · ${appointmentBranchName}` : ''}</p>
                       {confirmation && (
                         <p className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-emerald-v">
                           {/* The id sits on the sentence itself, not on the
                               paragraph that also wraps the button: a
                               description that contained the control's own
                               label would describe it to itself. */}
-                          <span id={confirmationDetailId}>{patientConfirmationDetail(confirmation, clinicTimezone)}</span>
+                          <span id={confirmationDetailId}>{patientConfirmationDetail(confirmation, appointmentTimezone)}</span>
                           {/* Straight from the appointment to the call that
                               evidences it. The description is carried by
                               aria-describedby from the sentence ABOVE, never
@@ -761,7 +865,7 @@ export default function Scheduling() {
                                 </button>
                               )}
                               {act.reschedule && (
-                                <button type="button" disabled={busy} onClick={() => { setRescheduleFor(prev => (prev === appt.id ? null : appt.id)); setRescheduleForm({ date: appt.date, time: appt.time }); }} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
+                                <button type="button" disabled={busy} onClick={() => { setRescheduleFor(prev => (prev === appt.id ? null : appt.id)); setRescheduleForm({ date: todayInZone(appointmentTimezone, new Date(appt.startsAt)), time: clinicTimeInput(appt.startsAt, appointmentTimezone) }); }} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
                                   <CalendarClock className="w-2.5 h-2.5" /> {rescheduleFor === appt.id ? 'Close' : 'Reschedule'}
                                 </button>
                               )}

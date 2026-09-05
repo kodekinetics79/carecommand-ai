@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
@@ -10,6 +10,7 @@ import { aiMorningBriefingService } from '../../lib/ai/services';
 import { invalidateRpmProviderSignoff, lockRpmEvidence, rpmPeriodBounds } from '../../lib/connectedCare/rpmEvidence';
 import { countCurrentReadyRpmPatients } from '../../lib/connectedCare/rpmReadinessService';
 import { MONITORING_ALERT_SOURCE, UNSEEN_NOTIFICATION_STATUSES, inboxScope } from '../../lib/connectedCare/alertInbox';
+import { zonedParts, zonedTimeToInstant } from '../../lib/connectedCare/rpmPeriod';
 
 const uuid = z.string().uuid();
 const readRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'PROVIDER');
@@ -72,7 +73,45 @@ export function normalizeManualReading(body: {
   return { numericValue: numeric, valueSecondary: null, unit };
 }
 
-function startOfToday(): Date { const d = new Date(); d.setHours(0, 0, 0, 0); return d; }
+function clinicDayStart(now: Date, timezone: string): Date {
+  const { year, month, day } = zonedParts(now, timezone);
+  return zonedTimeToInstant(year, month, day, 0, 0, 0, timezone);
+}
+
+const monitoringBranchQuery = z.object({ branchId: uuid.optional() });
+
+/**
+ * Monitoring reads are tenant-wide for an unbound owner and branch-bound for a
+ * clinic user. A tenant-wide owner may deliberately narrow the operational
+ * board to one clinic, but the branch is resolved inside the tenant before it
+ * becomes a database scope. A branch-bound user cannot widen or switch scope by
+ * editing the query string.
+ */
+async function monitoringReadScope(request: FastifyRequest, requestedBranchId?: string) {
+  const selectedBranchId = requestedBranchId ?? request.auth.branchId ?? null;
+  if (selectedBranchId) {
+    assertBranchAccess(request, selectedBranchId);
+    const branch = await db.branch.findFirst({
+      where: { id: selectedBranchId, tenantId: request.auth.tenantId, active: true },
+      select: { id: true, timezone: true },
+    });
+    if (!branch) throw request.server.httpErrors.notFound('Clinic not found');
+    return { scope: { branchId: branch.id }, selectedBranchId: branch.id, selectedBranchTimezone: branch.timezone };
+  }
+  return {
+    scope: {},
+    selectedBranchId: null,
+    selectedBranchTimezone: null,
+  };
+}
+
+async function monitoringClinicDays(tenantId: string, now: Date, selectedBranchId: string | null, selectedBranchTimezone: string | null) {
+  if (selectedBranchId && selectedBranchTimezone) {
+    return [{ branchId: selectedBranchId, timezone: selectedBranchTimezone, start: clinicDayStart(now, selectedBranchTimezone) }];
+  }
+  const branches = await db.branch.findMany({ where: { tenantId, active: true }, select: { id: true, timezone: true } });
+  return branches.map(branch => ({ branchId: branch.id, timezone: branch.timezone, start: clinicDayStart(now, branch.timezone) }));
+}
 
 async function patientNameMap(tenantId: string, ids: (string | null | undefined)[]) {
   const unique = [...new Set(ids.filter((v): v is string => !!v))];
@@ -101,18 +140,19 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
 
   // ── Overview: KPIs + recent readings + device health + notifications ───────
   app.get('/overview', async request => {
+    const q = monitoringBranchQuery.parse(request.query);
     const tenantId = request.auth.tenantId;
-    const scope = branchScope(request);
-    const todayStart = startOfToday();
-    const branchPatientIds = request.auth.branchId
-      ? (await db.patient.findMany({ where: { tenantId, branchId: request.auth.branchId, deletedAt: null }, select: { id: true } })).map(p => p.id)
+    const { scope, selectedBranchId, selectedBranchTimezone } = await monitoringReadScope(request, q.branchId);
+    const clinicDays = await monitoringClinicDays(tenantId, new Date(), selectedBranchId, selectedBranchTimezone);
+    const branchPatientIds = selectedBranchId
+      ? (await db.patient.findMany({ where: { tenantId, branchId: selectedBranchId, deletedAt: null }, select: { id: true } })).map(p => p.id)
       : null;
     const notificationScope = branchPatientIds
       ? { OR: [{ patientId: { in: branchPatientIds } }, { patientId: null, recipientUserId: request.auth.userId }] }
       : {};
 
     const [readingsToday, openAlerts, criticalAlerts, missedReadings, offlineDevices, atRiskPatients, recentRaw, offlineRaw, notifRaw, assignableUsers] = await Promise.all([
-      db.deviceReading.count({ where: { tenantId, ...scope, capturedAt: { gte: todayStart } } }),
+      Promise.all(clinicDays.map(day => db.deviceReading.count({ where: { tenantId, branchId: day.branchId, capturedAt: { gte: day.start } } }))).then(counts => counts.reduce((sum, count) => sum + count, 0)),
       db.readingAlert.count({ where: { tenantId, ...scope, status: { in: OPEN_STATUSES } } }),
       db.readingAlert.count({ where: { tenantId, ...scope, severity: 'critical', status: { in: OPEN_STATUSES } } }),
       db.readingAlert.count({ where: { tenantId, ...scope, alertType: 'missed_reading', status: { in: OPEN_STATUSES } } }),
@@ -121,7 +161,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
       db.deviceReading.findMany({ where: { tenantId, ...scope }, orderBy: { capturedAt: 'desc' }, take: 40 }),
       db.device.findMany({ where: { tenantId, ...scope, active: true, status: { in: ['offline', 'error'] } }, select: { id: true, name: true, deviceType: true, status: true, branchId: true, location: true, lastSeenAt: true } }),
       db.notificationEvent.findMany({ where: { tenantId, ...notificationScope }, orderBy: { createdAt: 'desc' }, take: 10 }),
-      db.user.findMany({ where: { tenantId, active: true, ...(request.auth.branchId ? { branchId: request.auth.branchId } : {}), role: { in: ['OWNER', 'ADMIN', 'MANAGER', 'PROVIDER'] } }, select: { id: true, displayName: true, role: true }, orderBy: { displayName: 'asc' }, take: 50 }),
+      db.user.findMany({ where: { tenantId, active: true, ...(selectedBranchId ? { OR: [{ branchId: selectedBranchId }, { branchId: null }] } : {}), role: { in: ['OWNER', 'ADMIN', 'MANAGER', 'PROVIDER'] } }, select: { id: true, displayName: true, role: true, branchId: true }, orderBy: { displayName: 'asc' }, take: 50 }),
     ]);
 
     const pNames = await patientNameMap(tenantId, [...recentRaw.map(r => r.patientId), ...notifRaw.map(n => n.patientId)]);
@@ -146,10 +186,11 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     const offMap = new Map(offlinePatientCounts.map(o => [o.id, o.patients]));
 
     // HIPAA access accounting — this view surfaces patient names + readings. Id-only.
-    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'overview' } });
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'overview', branchId: selectedBranchId } });
     return {
       summary: {
         readingsToday, openAlerts, criticalAlerts, missedReadings, offlineDevices, patientsAtRisk: atRiskPatients.filter(a => a.patientId).length,
+        dayDefinition: selectedBranchTimezone ? `${selectedBranchTimezone} local day` : 'Sum of each active clinic local day',
       },
       recentReadings,
       deviceHealth: offlineRaw.map(d => ({ id: d.id, name: d.name, deviceType: d.deviceType, status: d.status, branchId: d.branchId, location: d.location, lastSeenAt: d.lastSeenAt, patientsMonitored: offMap.get(d.id) ?? 0 })),
@@ -158,7 +199,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
         patientName: n.patientId ? pNames.get(n.patientId) ?? null : null, channel: n.channel, status: n.status, attempts: n.attempts,
         failureReason: n.failureReason, consentChecked: n.consentChecked, consentResult: n.consentResult, createdAt: n.createdAt,
       })),
-      assignableUsers: assignableUsers.map(u => ({ id: u.id, name: u.displayName, role: u.role })),
+      assignableUsers: assignableUsers.map(u => ({ id: u.id, name: u.displayName, role: u.role, branchId: u.branchId })),
     };
   });
 
@@ -185,6 +226,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
   // ── Alert queue ────────────────────────────────────────────────────────────
   app.get('/alerts', async request => {
     const q = z.object({
+      branchId: uuid.optional(),
       status: z.enum(['open', 'acknowledged', 'assigned', 'resolved']).optional(),
       severity: z.enum(['normal', 'warning', 'high', 'critical']).optional(),
       // Default to outstanding work. The queue previously fetched the 100 most
@@ -197,9 +239,10 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
       limit: z.coerce.number().min(1).max(200).default(100),
     }).parse(request.query);
     const tenantId = request.auth.tenantId;
+    const { scope, selectedBranchId } = await monitoringReadScope(request, q.branchId);
     const where = {
       tenantId,
-      ...branchScope(request),
+      ...scope,
       ...(q.status ? { status: q.status } : q.includeResolved ? {} : { status: { in: [...OPEN_ALERT_STATUSES] } }),
       ...(q.severity ? { severity: q.severity } : {}),
     };
@@ -219,7 +262,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     const readings = readingIds.length ? await db.deviceReading.findMany({ where: { id: { in: readingIds }, tenantId }, select: { id: true, readingType: true, value: true, unit: true } }) : [];
     const rMap = new Map(readings.map(r => [r.id, r]));
     // HIPAA access accounting — alert queue surfaces patient names. Id-only.
-    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'alerts', count: rows.length } });
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'alerts', count: rows.length, branchId: selectedBranchId } });
     const items = rows
       .map(a => {
         const reading = a.readingId ? rMap.get(a.readingId) : null;
@@ -227,6 +270,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
           id: a.id, patientName: a.patientId ? pNames.get(a.patientId) ?? 'Unknown' : 'Unassigned',
           readingType: reading?.readingType ?? null, value: reading?.value ?? null, unit: reading?.unit ?? null,
           severity: a.severity, alertType: a.alertType, status: a.status,
+          branchId: a.branchId,
           assignedTo: a.assignedToUserId ? uNames.get(a.assignedToUserId) ?? null : null,
           generatedReason: a.generatedReason, createdAt: a.createdAt, acknowledgedAt: a.acknowledgedAt, resolvedAt: a.resolvedAt,
         };
@@ -482,8 +526,17 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     const alert = await loadAlert(request, id);
     if (alert.branchId) assertBranchAccess(request, alert.branchId);
     if (alert.status === 'resolved') throw app.httpErrors.conflict('A resolved alert cannot be reassigned');
-    const assignee = await db.user.findFirst({ where: { id: assignedToUserId, tenantId: request.auth.tenantId, active: true }, select: { id: true, displayName: true } });
-    if (!assignee) throw app.httpErrors.badRequest('Assignee not found in this workspace');
+    const assignee = await db.user.findFirst({
+      where: {
+        id: assignedToUserId,
+        tenantId: request.auth.tenantId,
+        active: true,
+        role: { in: ['OWNER', 'ADMIN', 'MANAGER', 'PROVIDER'] },
+        ...(alert.branchId ? { OR: [{ branchId: alert.branchId }, { branchId: null }] } : { branchId: null }),
+      },
+      select: { id: true, displayName: true },
+    });
+    if (!assignee) throw app.httpErrors.badRequest('Assignee is not available for this alert clinic');
     const changed = await db.readingAlert.updateMany({ where: { id, tenantId: request.auth.tenantId, status: alert.status }, data: { assignedToUserId, status: 'assigned', acknowledgedAt: alert.acknowledgedAt ?? new Date() } });
     if (changed.count !== 1) throw app.httpErrors.conflict('Alert changed concurrently; refresh and retry');
     const updated = await db.readingAlert.findUniqueOrThrow({ where: { id }, select: { id: true, status: true, assignedToUserId: true } });
@@ -506,8 +559,9 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
 
   // ── Patients at risk (operational urgency summary, not diagnosis) ──────────
   app.get('/patients-at-risk', async request => {
+    const q = monitoringBranchQuery.parse(request.query);
     const tenantId = request.auth.tenantId;
-    const scope = branchScope(request);
+    const { scope, selectedBranchId } = await monitoringReadScope(request, q.branchId);
     const since = new Date(Date.now() - 24 * 36e5);
     const [openAlerts, recentAbnormalAlerts, missed] = await Promise.all([
       db.readingAlert.findMany({ where: { tenantId, ...scope, status: { in: OPEN_STATUSES } }, select: { patientId: true, severity: true, assignedToUserId: true, createdAt: true } }),
@@ -554,28 +608,31 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     }).filter(r => r.riskScore > 0).sort((a, b) => b.riskScore - a.riskScore);
 
     // HIPAA access accounting — surfaces at-risk patient names. Id-only.
-    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'patients_at_risk', count: rows.length } });
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'patients_at_risk', count: rows.length, branchId: selectedBranchId } });
     return rows;
   });
 
   // ── Morning briefing (stored signals for today + live counts) ──────────────
   app.get('/morning-briefing', async request => {
+    const q = monitoringBranchQuery.parse(request.query);
     const tenantId = request.auth.tenantId;
-    const scope = branchScope(request);
-    const dayStart = startOfToday();
+    const { scope, selectedBranchId, selectedBranchTimezone } = await monitoringReadScope(request, q.branchId);
+    const clinicDays = await monitoringClinicDays(tenantId, new Date(), selectedBranchId, selectedBranchTimezone);
+    const signalDayScope = { OR: clinicDays.map(day => ({ branchId: day.branchId, forDate: { gte: day.start } })) };
+    const eligibilityDayScope = { OR: clinicDays.map(day => ({ branchId: day.branchId, checkedAt: { gte: day.start } })) };
     const overnight = new Date(Date.now() - 12 * 36e5);
-    const branchPatientIds = request.auth.branchId
-      ? (await db.patient.findMany({ where: { tenantId, branchId: request.auth.branchId, deletedAt: null }, select: { id: true } })).map(p => p.id)
+    const branchPatientIds = selectedBranchId
+      ? (await db.patient.findMany({ where: { tenantId, branchId: selectedBranchId, deletedAt: null }, select: { id: true } })).map(p => p.id)
       : null;
     const [signals, criticalOpen, missedHigh, offline, abnormalOvernight, unresolvedDeviceAlerts, eligibilityToday, eligibilityFailedToday, rpmReady, reviewPatients] = await Promise.all([
-      db.morningBriefingSignal.findMany({ where: { tenantId, ...scope, forDate: { gte: dayStart } }, orderBy: [{ severity: 'desc' }, { createdAt: 'asc' }] }),
+      db.morningBriefingSignal.findMany({ where: { tenantId, ...scope, ...signalDayScope }, orderBy: [{ severity: 'desc' }, { createdAt: 'asc' }] }),
       db.readingAlert.count({ where: { tenantId, ...scope, severity: 'critical', status: { in: OPEN_STATUSES } } }),
       db.readingAlert.count({ where: { tenantId, ...scope, alertType: 'missed_reading', status: { in: OPEN_STATUSES } } }),
       db.device.count({ where: { tenantId, ...scope, active: true, status: { in: ['offline', 'error'] } } }),
       db.readingAlert.count({ where: { tenantId, ...scope, alertType: 'abnormal_reading', createdAt: { gte: overnight } } }),
       db.readingAlert.count({ where: { tenantId, ...scope, status: { in: OPEN_STATUSES } } }),
-      db.eligibilityVerification.count({ where: { tenantId, ...scope, checkedAt: { gte: dayStart } } }),
-      db.eligibilityVerification.count({ where: { tenantId, ...scope, checkedAt: { gte: dayStart }, coverageStatus: { in: ['INACTIVE', 'ERROR'] } } }),
+      db.eligibilityVerification.count({ where: { tenantId, ...scope, ...eligibilityDayScope } }),
+      db.eligibilityVerification.count({ where: { tenantId, ...scope, ...eligibilityDayScope, coverageStatus: { in: ['INACTIVE', 'ERROR'] } } }),
       countCurrentReadyRpmPatients(tenantId, branchPatientIds),
       db.readingAlert.findMany({ where: { tenantId, ...scope, status: { in: OPEN_STATUSES }, severity: { in: ['high', 'critical'] } }, select: { patientId: true }, distinct: ['patientId'] }),
     ]);
@@ -584,11 +641,12 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     // the gateway is blocked/unavailable. Never blocks the briefing.
     // The current AI briefing service is tenant-wide. Until it accepts an
     // enforced branch filter, do not expose its summary to branch-restricted users.
-    const ai = request.auth.branchId ? null : await aiMorningBriefingService.generate(tenantId, request.auth.userId).catch(() => null);
+    const ai = selectedBranchId ? null : await aiMorningBriefingService.generate(tenantId, request.auth.userId).catch(() => null);
     // HIPAA access accounting — briefing signals surface patient names. Id-only.
-    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'morning_briefing' } });
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'morning_briefing', branchId: selectedBranchId } });
     return {
       generatedAt: new Date(),
+      dayDefinition: selectedBranchTimezone ? `${selectedBranchTimezone} local day` : 'Each active clinic local day',
       counts: {
         criticalOpen, missedHigh, offlineDevices: offline,
         abnormalOvernight, unresolvedDeviceAlerts,

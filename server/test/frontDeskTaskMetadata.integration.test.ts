@@ -381,7 +381,7 @@ describe('D10 — one priority vocabulary', () => {
     const res = await app.inject({
       method: 'POST', url: '/v1/tasks',
       headers: auth(f, f.owner, 'OWNER'),
-      payload: { title: 'Call the lab back', priority: 'CRITICAL' },
+      payload: { branchId: f.branchId, title: 'Call the lab back', priority: 'CRITICAL' },
     });
     expect(res.statusCode).toBe(201);
     expect(res.json().priority).toBe('critical');

@@ -38,7 +38,7 @@ const externalKeys = [
   'DATABASE_URL', 'PLATFORM_DATABASE_URL', 'CORS_ORIGINS', 'PUBLIC_API_URL',
   'PAYMENT_PROVIDER', 'INSURANCE_PROVIDER', 'AI_PROVIDER', 'ALLOWED_MOCK_INTEGRATIONS',
   'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_SUCCESS_URL', 'STRIPE_CANCEL_URL',
-  'STEDI_API_KEY', 'RETELL_API_KEY', 'RETELL_FROM_NUMBER',
+  'STEDI_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_FROM_NUMBER', 'RETELL_API_KEY', 'RETELL_FROM_NUMBER',
   'CAMPAIGN_WEBHOOK_SECRET', 'EMAIL_HTTP_API_URL', 'EMAIL_HTTP_API_KEY',
   'EMAIL_FROM_ADDRESS', 'OTEL_ENABLED', 'OTEL_EXPORTER_OTLP_ENDPOINT', 'OTEL_EXPORTER_OTLP_HEADERS',
 ];
@@ -64,11 +64,13 @@ describe('production engineering repository gates', () => {
     expect(shared.get('DEPLOYMENT_PROFILE')?.value).toBe('pilot');
     expect(shared.get('INGRESS_MODE')?.value).toBe('trusted_proxy');
     expect(shared.get('QUEUES_ENABLED')?.value).toBe('true');
+    expect(shared.get('QUEUE_NAMESPACE')?.value).toBe('carecommand-pilot');
     expect(shared.get('RLS_ENFORCE_RUNTIME_ROLE')?.value).toBe('true');
     expect(shared.get('PLATFORM_LEGACY_TOKEN_ENABLED')?.value).toBe('false');
     expect(shared.get('COOKIE_SAMESITE')?.value).toBe('none');
     expect(shared.get('METRICS_ENABLED')?.value).toBe('true');
     expect(shared.get('METRICS_TOKEN')?.generateValue).toBe(true);
+    expect(shared.get('ELIGIBILITY_HMAC_SECRET')?.generateValue).toBe(true);
     expect(keyed(service('web').envVars).get('TRUSTED_PROXY_CIDRS')?.sync).toBe(false);
   });
 

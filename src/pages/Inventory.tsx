@@ -1,4 +1,5 @@
-import { Package, AlertCircle, Clock, TrendingUp } from 'lucide-react';
+import { useState } from 'react';
+import { Package, AlertCircle, Clock, TrendingUp, Plus } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -6,6 +7,9 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapInventoryItem, type ApiInventoryItem } from '../lib/apiAdapters';
 import { formatCurrency } from '../utils/formatters';
+import { apiRequest } from '../lib/api';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 
 interface ApiBranchOption { id: string; name: string }
 
@@ -17,9 +21,36 @@ const statusConfig: Record<string, { label: string; badge: string; border: strin
 };
 
 export default function Inventory() {
-  const { data: stockItems, source, error } = useApiResource<ApiInventoryItem, ReturnType<typeof mapInventoryItem>>('/v1/inventory?limit=100', [], mapInventoryItem);
+  const { user } = useSession();
+  const canReceiveStock = hasPermission(user, 'inventory:write');
+  const { data: stockItems, source, error, reload } = useApiResource<ApiInventoryItem, ReturnType<typeof mapInventoryItem>>('/v1/inventory?limit=100&page=true', [], mapInventoryItem, { allPages: true });
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
   const loadError = error;
+  const metricsReady = source === 'live' && !loadError;
+  const [receiveItemId, setReceiveItemId] = useState<string | null>(null);
+  const [receiveQuantity, setReceiveQuantity] = useState('');
+  const [busyItemId, setBusyItemId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function recordReceipt(itemId: string) {
+    const quantity = Number(receiveQuantity);
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      setActionError('Enter a whole received quantity of at least 1.');
+      return;
+    }
+    setBusyItemId(itemId);
+    setActionError(null);
+    try {
+      await apiRequest(`/v1/inventory/${itemId}`, { method: 'PATCH', body: JSON.stringify({ restockBy: quantity }) });
+      setReceiveItemId(null);
+      setReceiveQuantity('');
+      await reload();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'The stock receipt could not be recorded.');
+    } finally {
+      setBusyItemId(null);
+    }
+  }
 
   const criticalCount = stockItems.filter(i => i.status === 'critical' || i.status === 'low').length;
   const expiringCount = stockItems.filter(i => i.status === 'expiring').length;
@@ -48,19 +79,20 @@ export default function Inventory() {
           Inventory data is unavailable. {loadError}
         </div>
       )}
+      {actionError && <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{actionError}</div>}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Items tracked" value={stockItems.length} subtitle="Loaded records" icon={<Package className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Critical or low" value={criticalCount} subtitle="Below recorded threshold" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Expiring soon" value={expiringCount} subtitle="Based on stored dates" icon={<Clock className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Recorded value" value={formatCurrency(totalValue)} subtitle="Stock × stored unit cost" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Items tracked" value={metricsReady ? stockItems.length : '—'} subtitle={metricsReady ? 'All accessible records' : 'Unavailable'} icon={<Package className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Critical or low" value={metricsReady ? criticalCount : '—'} subtitle={metricsReady ? 'Below recorded threshold' : 'Unavailable'} icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Expiring soon" value={metricsReady ? expiringCount : '—'} subtitle={metricsReady ? 'Based on stored dates' : 'Unavailable'} icon={<Clock className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Recorded value" value={metricsReady ? formatCurrency(totalValue) : '—'} subtitle={metricsReady ? 'Stock × stored unit cost' : 'Unavailable'} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
         {/* Inventory table */}
         <BentoCard title="Stock levels" subtitle="Recorded items across accessible branches">
           <div className="space-y-2.5">
-            {stockItems.length === 0 && <p className="py-8 text-center text-sm text-t3">No inventory items are recorded for this workspace.</p>}
+            {!loadError && stockItems.length === 0 && <p className="py-8 text-center text-sm text-t3">No inventory items are recorded for this workspace.</p>}
             {stockItems.map((item) => {
               const sc = statusConfig[item.status];
               const branch = branchOptions.find(b => b.id === item.branchId);
@@ -94,6 +126,19 @@ export default function Inventory() {
                     </div>
                     {(item.status === 'critical' || item.status === 'low') && <span className="text-[10px] font-semibold text-amber-v">Purchasing follow-up required</span>}
                   </div>
+                  {canReceiveStock && (
+                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2 border-t border-[var(--b1)] pt-3">
+                      {receiveItemId === item.id ? (
+                        <>
+                          <label className="text-[11px] font-semibold text-t2">Received quantity <input aria-label={`Received quantity for ${item.name}`} inputMode="numeric" value={receiveQuantity} onChange={event => setReceiveQuantity(event.target.value)} className="ml-2 w-24 rounded-lg border border-[var(--b1)] bg-white px-2.5 py-1.5 text-xs text-t1" /></label>
+                          <button type="button" disabled={busyItemId === item.id} onClick={() => void recordReceipt(item.id)} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50">Save receipt</button>
+                          <button type="button" onClick={() => { setReceiveItemId(null); setReceiveQuantity(''); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2">Cancel</button>
+                        </>
+                      ) : (
+                        <button type="button" onClick={() => setReceiveItemId(item.id)} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)]"><Plus className="w-3 h-3" /> Record received stock</button>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -104,7 +149,7 @@ export default function Inventory() {
         <div className="space-y-4">
           <BentoCard title="Stock alerts" subtitle="Items outside stored stock or expiry thresholds" headerRight={<AlertCircle className="w-4 h-4 text-amber-v" />}>
             <div className="space-y-3">
-              {supplyRecommendations.length === 0 && <p className="text-xs text-t3">No stock or expiry alerts are recorded.</p>}
+              {!loadError && supplyRecommendations.length === 0 && <p className="text-xs text-t3">No stock or expiry alerts are recorded.</p>}
               {supplyRecommendations.map((rec) => (
                 <div key={rec.id} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex items-start justify-between gap-2 mb-1.5">

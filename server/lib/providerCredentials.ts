@@ -38,8 +38,8 @@ export const PROVIDER_CATALOG: Record<string, ProviderDef> = {
     env: { accountSid: 'TWILIO_ACCOUNT_SID', authToken: 'TWILIO_AUTH_TOKEN', fromNumber: 'TWILIO_FROM_NUMBER' },
   },
   email: {
-    label: 'Email (HTTP API)', required: ['apiUrl', 'apiKey'],
-    fields: [{ k: 'apiUrl', label: 'API URL', secret: false }, { k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromAddress', label: 'From Address', secret: false }],
+    label: 'Email (HTTP API)', required: ['apiUrl', 'apiKey', 'fromAddress'],
+    fields: [{ k: 'provider', label: 'Adapter (generic or sendgrid)', secret: false }, { k: 'apiUrl', label: 'API URL', secret: false }, { k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromAddress', label: 'From Address', secret: false }],
     env: { apiUrl: 'EMAIL_HTTP_API_URL', apiKey: 'EMAIL_HTTP_API_KEY', fromAddress: 'EMAIL_FROM_ADDRESS' },
   },
   payments: {

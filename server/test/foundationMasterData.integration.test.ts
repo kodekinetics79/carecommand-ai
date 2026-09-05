@@ -158,15 +158,58 @@ describe('foundation clinic and workforce master-data integrity', () => {
     expect(response.json().data[0].id).toBe(t.branchA.id);
   });
 
-  it('rejects foreign, inactive, or unselected primary clinic access without damaging existing access', async () => {
+  it('lets shared staff select a secondary assigned clinic without granting an unassigned clinic', async () => {
+    const t = await fixture();
+    const other = await fixture();
+    await db.userClinicAccess.create({ data: { tenantId: t.tenantId, userId: t.target.id, branchId: t.branchB.id } });
+    await Promise.all([
+      db.patient.create({ data: { tenantId: t.tenantId, branchId: t.branchA.id, firstName: 'Primary', lastName: 'Clinic' } }),
+      db.patient.create({ data: { tenantId: t.tenantId, branchId: t.branchB.id, firstName: 'Secondary', lastName: 'Clinic' } }),
+    ]);
+    const authorization = `Bearer ${app.jwt.sign({
+      tenantId: t.tenantId,
+      userId: t.target.id,
+      role: 'FRONT_DESK',
+      type: 'access',
+      sessionIssuedAtMs: Date.now(),
+    })}`;
+
+    const directory = await app.inject({
+      method: 'GET',
+      url: '/v1/branches',
+      headers: { authorization, 'x-carecommand-clinic-id': t.branchB.id },
+    });
+    expect(directory.statusCode).toBe(200);
+    expect(directory.json().data.map((branch: { id: string }) => branch.id).sort()).toEqual([t.branchA.id, t.branchB.id].sort());
+
+    const secondary = await app.inject({
+      method: 'GET',
+      url: `/v1/patients?branchId=${t.branchB.id}&limit=20`,
+      headers: { authorization, 'x-carecommand-clinic-id': t.branchB.id },
+    });
+    expect(secondary.statusCode).toBe(200);
+    expect(secondary.json().data).toHaveLength(1);
+    expect(secondary.json().data[0].firstName).toBe('Secondary');
+
+    const denied = await app.inject({
+      method: 'GET',
+      url: '/v1/branches',
+      headers: { authorization, 'x-carecommand-clinic-id': other.branchA.id },
+    });
+    expect(denied.statusCode).toBe(403);
+  });
+
+  it('rejects empty, foreign, inactive, or unselected primary clinic access without damaging existing access', async () => {
     const t = await fixture();
     const other = await fixture();
     const headers = bearer(t.tenantId, t.owner.id);
+    const empty = await app.inject({ method: 'PATCH', url: `/v1/control-plane/users/${t.target.id}/clinic-access`, headers, payload: { branchIds: [] } });
     const foreign = await app.inject({ method: 'PATCH', url: `/v1/control-plane/users/${t.target.id}/clinic-access`, headers, payload: { branchIds: [other.branchA.id], primaryBranchId: other.branchA.id } });
     const primaryNotSelected = await app.inject({ method: 'PATCH', url: `/v1/control-plane/users/${t.target.id}/clinic-access`, headers, payload: { branchIds: [t.branchA.id], primaryBranchId: t.branchB.id } });
     await db.branch.update({ where: { id: t.branchB.id }, data: { active: false } });
     const inactive = await app.inject({ method: 'PATCH', url: `/v1/control-plane/users/${t.target.id}/clinic-access`, headers, payload: { branchIds: [t.branchB.id] } });
-    expect([foreign.statusCode, primaryNotSelected.statusCode, inactive.statusCode]).toEqual([400, 400, 400]);
+    expect([empty.statusCode, foreign.statusCode, primaryNotSelected.statusCode, inactive.statusCode]).toEqual([400, 400, 400, 400]);
+    expect(empty.json().message).toContain('Select at least one clinic');
     const access = await db.userClinicAccess.findMany({ where: { tenantId: t.tenantId, userId: t.target.id } });
     expect(access).toHaveLength(1);
     expect(access[0]).toMatchObject({ branchId: t.branchA.id, isPrimary: true });
@@ -178,6 +221,41 @@ describe('foundation clinic and workforce master-data integrity', () => {
     const response = await app.inject({ method: 'PATCH', url: `/v1/control-plane/clinics/${t.branchA.id}/status`, headers: bearer(t.tenantId, t.owner.id), payload: { active: false } });
     expect(response.statusCode).toBe(409);
     expect((await db.branch.findUniqueOrThrow({ where: { id: t.branchA.id } })).active).toBe(true);
+  });
+
+  it('reports and blocks future operational work before clinic deactivation', async () => {
+    const t = await fixture();
+    const patient = await db.patient.create({ data: { tenantId: t.tenantId, branchId: t.branchB.id, firstName: 'Future', lastName: 'Visit', tags: [] } });
+    const startsAt = new Date(Date.now() + 86_400_000);
+    await db.appointment.create({ data: {
+      tenantId: t.tenantId, branchId: t.branchB.id, patientId: patient.id, service: 'Pilot consult',
+      startsAt, endsAt: new Date(startsAt.getTime() + 1_800_000), channel: 'CALL',
+    } });
+    const headers = bearer(t.tenantId, t.owner.id);
+    const listing = await app.inject({ method: 'GET', url: '/v1/control-plane/clinics', headers });
+    expect(listing.statusCode).toBe(200);
+    expect(listing.json().find((clinic: { id: string }) => clinic.id === t.branchB.id)).toMatchObject({
+      futureAppointmentCount: 1,
+      operationalDependencyCount: 1,
+    });
+    const response = await app.inject({ method: 'PATCH', url: `/v1/control-plane/clinics/${t.branchB.id}/status`, headers, payload: { active: false } });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().message).toMatch(/1 future appointments/i);
+    expect((await db.branch.findUniqueOrThrow({ where: { id: t.branchB.id } })).active).toBe(true);
+  });
+
+  it('returns the effective per-tenant role grants instead of only static defaults', async () => {
+    const t = await fixture();
+    await db.roleDefinition.create({ data: {
+      tenantId: t.tenantId,
+      name: 'Front Desk',
+      description: 'Restricted pilot override',
+      permissions: ['patient:read'],
+    } });
+    const response = await app.inject({ method: 'GET', url: '/v1/control-plane/roles', headers: bearer(t.tenantId, t.owner.id) });
+    expect(response.statusCode).toBe(200);
+    const frontDesk = response.json().permissionMatrix.find((role: { role: string }) => role.role === 'FRONT_DESK');
+    expect(frontDesk).toMatchObject({ permissionSource: 'tenant-override', effectivePermissions: ['patient:read'] });
   });
 
   it('serializes clinic deactivation against access grants so no active user can retain an inactive clinic', async () => {
@@ -218,6 +296,36 @@ describe('foundation clinic and workforce master-data integrity', () => {
 });
 
 describe('patient identity safeguards', () => {
+  it('returns every matching patient through cursors and preserves fields needed to disambiguate duplicate names', async () => {
+    const t = await fixture();
+    const headers = bearer(t.tenantId, t.owner.id);
+    await db.patient.createMany({ data: Array.from({ length: 27 }, (_, index) => ({
+      tenantId: t.tenantId,
+      branchId: t.branchA.id,
+      externalRef: `CURSOR-${String(index + 1).padStart(3, '0')}`,
+      firstName: 'CursorMatch',
+      lastName: index < 2 ? 'Duplicate' : `Patient${String(index + 1).padStart(3, '0')}`,
+      phone: index === 1 ? '+1 571 430 5555' : null,
+    })) });
+
+    const first = await app.inject({ method: 'GET', url: '/v1/patients?search=CursorMatch&limit=25', headers });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().data).toHaveLength(25);
+    expect(first.json().nextCursor).toMatch(/^[0-9a-f-]{36}$/i);
+    const second = await app.inject({ method: 'GET', url: `/v1/patients?search=CursorMatch&limit=25&cursor=${first.json().nextCursor}`, headers });
+    expect(second.statusCode).toBe(200);
+    expect(second.json().data).toHaveLength(2);
+    expect(second.json().nextCursor).toBeUndefined();
+
+    const all = [...first.json().data, ...second.json().data] as Array<{ id: string; firstName: string; lastName: string; externalRef: string | null; phone: string | null; branch: { name: string } }>;
+    expect(new Set(all.map(row => row.id)).size).toBe(27);
+    expect(all.filter(row => row.firstName === 'CursorMatch' && row.lastName === 'Duplicate')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ externalRef: 'CURSOR-001' }),
+      expect.objectContaining({ externalRef: 'CURSOR-002', phone: '+1 571 430 5555' }),
+    ]));
+    expect(all.every(row => row.branch.name === 'Main')).toBe(true);
+  });
+
   it('serializes duplicate identity creation and supports phone/external-reference search', async () => {
     const t = await fixture();
     const headers = bearer(t.tenantId, t.owner.id);
@@ -289,12 +397,16 @@ describe('patient identity safeguards', () => {
     ] });
     await db.user.update({ where: { id: t.owner.id }, data: { branchId: null } });
     const summary = await app.inject({ method: 'GET', url: '/v1/patients/summary', headers: bearer(t.tenantId, t.owner.id) });
+    const selectedBranchSummary = await app.inject({ method: 'GET', url: `/v1/patients/summary?branchId=${t.branchA.id}`, headers: bearer(t.tenantId, t.owner.id) });
     const branchSummary = await app.inject({ method: 'GET', url: '/v1/patients/summary', headers: bearer(t.tenantId, t.target.id) });
     const list = await app.inject({ method: 'GET', url: '/v1/patients?search=Summary', headers: bearer(t.tenantId, t.owner.id) });
     expect(summary.statusCode).toBe(200);
     expect(summary.json()).toMatchObject({ scope: 'tenant', patientCount: 2, highRiskCount: 1, highLifetimeValueCount: 1, outstandingBalance: 125, marketingConsentRate: 0, activeConsentCounts: { MARKETING: 0, SMS: 1 } });
+    expect(selectedBranchSummary.json()).toMatchObject({ scope: 'selected_branch', patientCount: 1, highRiskCount: 1, highLifetimeValueCount: 1, outstandingBalance: 125, branchCounts: { [t.branchA.id]: 1 } });
     expect(branchSummary.json()).toMatchObject({ scope: 'assigned_branch', patientCount: 1, highRiskCount: 1, outstandingBalance: 125 });
     expect(list.json().data[0]._count.appointments).toBe(2);
+    const summaryAudits = await db.auditEvent.findMany({ where: { tenantId: t.tenantId, action: 'patient.summary' }, select: { metadata: true } });
+    expect(summaryAudits.some(event => (event.metadata as { scope?: string } | null)?.scope === 'selected_branch')).toBe(true);
   });
 });
 

@@ -87,6 +87,12 @@ beforeAll(async () => {
     data: { tenantId, branchId: branch.id, userId: providerUser.id, specialty: 'Primary Care' },
   });
   const clinic = await db.receptionistClinic.create({ data: { tenantId, name: 'Review Clinic', phone: phoneFor(tenantId), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
+  // Call-artifact access fails closed for branch-scoped staff unless the line
+  // is exclusively mapped to their clinic. Keep this fixture representative of
+  // a real configured receptionist line instead of relying on tenant identity.
+  await db.receptionistLocation.create({
+    data: { tenantId, clinicId: clinic.id, branchId: branch.id, name: 'Review line', address: '1 Synthetic Way' },
+  });
   const call = await db.receptionistCallLog.create({
     data: {
       tenantId,

@@ -47,8 +47,12 @@ async function makeTenant(): Promise<TenantFixture> {
   ]);
   const users = {} as Record<Role, string>;
   for (const role of ['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR'] as const) {
+    const clinicScoped = ['MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK'].includes(role);
     const user = await db.user.create({
-      data: { tenantId: id, role, active: true, email: `${role}-${id.slice(0, 8)}@endpoint-auth.test`, displayName: role },
+      data: {
+        tenantId: id, role, active: true, branchId: clinicScoped ? branchA.id : undefined,
+        email: `${role}-${id.slice(0, 8)}@endpoint-auth.test`, displayName: role,
+      },
     });
     users[role] = user.id;
   }
@@ -121,6 +125,48 @@ afterAll(async () => {
 });
 
 describe('cross-module endpoint authorization', () => {
+  it('keeps the buyer-proof payload aggregate-only and restricted to compliance roles', async () => {
+    const tenant = await makeTenant();
+    await db.tenantFeatureEntitlement.create({ data: { tenantId: tenant.id, featureKey: 'compliance_readiness', enabled: true, source: 'test' } });
+    const [scoredFramework, notApplicableFramework] = await Promise.all([
+      db.complianceFramework.create({ data: { tenantId: tenant.id, key: 'scored', name: 'Scored', description: 'Scored controls', weight: 1 } }),
+      db.complianceFramework.create({ data: { tenantId: tenant.id, key: 'not-applicable', name: 'Not applicable', description: 'N/A controls', weight: 20 } }),
+    ]);
+    await db.complianceControl.createMany({ data: [
+      { tenantId: tenant.id, frameworkId: scoredFramework.id, categoryKey: 'access', controlKey: 'implemented', title: 'Implemented', description: 'Implemented', status: 'IMPLEMENTED' },
+      { tenantId: tenant.id, frameworkId: notApplicableFramework.id, categoryKey: 'scope', controlKey: 'not-applicable', title: 'Not applicable', description: 'Not applicable', status: 'NOT_APPLICABLE' },
+    ] });
+
+    for (const role of ['OWNER', 'ADMIN', 'COMPLIANCE_OFFICER', 'AUDITOR'] as const) {
+      const response = await app.inject({ method: 'GET', url: '/v1/compliance/buyer-proof', headers: headers(tenant, role) });
+      expect(response.statusCode, role).toBe(200);
+      const payload = response.json();
+      expect(payload).toMatchObject({ dataClassification: 'aggregate_only', tenantName: expect.any(String) });
+      expect(payload.controlStatus).toMatchObject({ available: true, completionPct: 100, eligibleControls: 1 });
+      expect(Object.keys(payload).sort()).toEqual([
+        'accessProtection', 'accountability', 'controlStatus', 'dataClassification', 'generatedAt',
+        'limitations', 'openGaps', 'recoveryEvidence', 'tenantName',
+      ]);
+      expect(JSON.stringify(payload)).not.toMatch(/patient|vendorName|ipAddress|actorUser|incident title/i);
+    }
+    for (const role of ['MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST'] as const) {
+      expect((await app.inject({ method: 'GET', url: '/v1/compliance/buyer-proof', headers: headers(tenant, role) })).statusCode, role).toBe(403);
+    }
+
+    for (const externalUrl of ['javascript:alert(1)', 'data:text/plain,unsafe', 'http://evidence.example.test/file']) {
+      const response = await app.inject({
+        method: 'POST', url: '/v1/compliance/evidence', headers: headers(tenant, 'OWNER'),
+        payload: { title: 'Unsafe evidence link', externalUrl },
+      });
+      expect(response.statusCode, externalUrl).toBe(400);
+    }
+
+    await db.securityIncident.createMany({ data: Array.from({ length: 51 }, (_, index) => ({ tenantId: tenant.id, title: `Incident ${index + 1}`, status: index === 50 ? 'resolved' : 'open' })) });
+    const incidentReport = await app.inject({ method: 'GET', url: '/v1/compliance/reports/incident-response', headers: headers(tenant, 'OWNER') });
+    expect(incidentReport.statusCode).toBe(200);
+    expect(incidentReport.json()).toMatchObject({ integrated: false, status: 'manual_register', total: 51, open: 50, resolved: 1, returned: 50 });
+  });
+
   it('guards every Telehealth and Operations route before resource access or input handling', async () => {
     const tenant = await makeTenant();
     for (const route of guardedRoutes) {
@@ -203,6 +249,54 @@ describe('cross-module endpoint authorization', () => {
     }
   });
 
+  it('adds concurrent received-stock events without losing either receipt', async () => {
+    const tenant = await makeTenant();
+    const item = await db.inventoryItem.create({ data: {
+      tenantId: tenant.id, branchId: tenant.branchA, name: 'Concurrent receipt item', category: 'supply',
+      currentStock: 10, unit: 'box', reorderLevel: 5, supplier: 'Synthetic supplier',
+    } });
+
+    const [first, second] = await Promise.all([
+      app.inject({ method: 'PATCH', url: `/v1/inventory/${item.id}`, headers: headers(tenant, 'OWNER'), payload: { restockBy: 5 } }),
+      app.inject({ method: 'PATCH', url: `/v1/inventory/${item.id}`, headers: headers(tenant, 'OWNER'), payload: { restockBy: 7 } }),
+    ]);
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect((await db.inventoryItem.findUniqueOrThrow({ where: { id: item.id } })).currentStock).toBe(22);
+  });
+
+  it('allows only a received result to advance to clinical review and makes retry idempotent', async () => {
+    const tenant = await makeTenant();
+    const ordered = await db.partnerReport.create({ data: {
+      tenantId: tenant.id, branchId: tenant.branchA, reportType: 'Ordered report', partner: 'Reference lab', urgency: 'routine', status: 'ordered',
+    } });
+    const received = await db.partnerReport.create({ data: {
+      tenantId: tenant.id, branchId: tenant.branchA, reportType: 'Received report', partner: 'Reference lab', urgency: 'routine', status: 'result-received', summary: 'Original result',
+    } });
+
+    const premature = await app.inject({
+      method: 'PATCH', url: `/v1/partner-reports/${ordered.id}/review`, headers: headers(tenant, 'OWNER'), payload: { status: 'doctor-reviewed' },
+    });
+    expect(premature.statusCode).toBe(409);
+    expect((await db.partnerReport.findUniqueOrThrow({ where: { id: ordered.id } })).status).toBe('ordered');
+
+    const first = await app.inject({
+      method: 'PATCH', url: `/v1/partner-reports/${received.id}/review`, headers: headers(tenant, 'OWNER'), payload: { status: 'doctor-reviewed', summary: 'Clinician reviewed result' },
+    });
+    expect(first.statusCode).toBe(200);
+    const firstBody = first.json() as { status: string; reviewedAt: string; reviewedByUserId: string; summary: string };
+    expect(firstBody).toMatchObject({ status: 'doctor-reviewed', reviewedByUserId: tenant.users.OWNER, summary: 'Clinician reviewed result' });
+
+    const retry = await app.inject({
+      method: 'PATCH', url: `/v1/partner-reports/${received.id}/review`, headers: headers(tenant, 'OWNER'), payload: { status: 'doctor-reviewed', summary: 'Retry must not overwrite evidence' },
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({
+      status: 'doctor-reviewed', reviewedAt: firstBody.reviewedAt, reviewedByUserId: tenant.users.OWNER, summary: 'Clinician reviewed result',
+    });
+  });
+
   it('keeps new permission overrides tenant-bound', async () => {
     const [tenantA, tenantB] = [await makeTenant(), await makeTenant()];
     await db.roleDefinition.create({ data: {
@@ -264,13 +358,16 @@ describe('cross-module endpoint authorization', () => {
     for (const probe of crossTenantCreates) {
       const response = await app.inject({ method: 'POST', url: probe.url, headers: headers(tenantB, 'OWNER'), payload: probe.payload });
       expect(response.statusCode, probe.url).toBe(400);
-      expect(response.json().message, probe.url).toMatch(/authenticated tenant/i);
+      expect(response.json().message, probe.url).toMatch(/authenticated tenant|selected clinic/i);
     }
   });
 
   it('keeps branch-bound reads and mutations inside the authenticated branch even when another branch is requested', async () => {
     const tenant = await makeTenant();
-    await db.user.update({ where: { id: tenant.users.OWNER }, data: { branchId: tenant.branchA } });
+    const scopedHeaders = {
+      ...headers(tenant, 'OWNER'),
+      'x-carecommand-clinic-id': tenant.branchA,
+    };
     const [patientA, patientB] = await Promise.all([
       db.patient.create({ data: { tenantId: tenant.id, branchId: tenant.branchA, firstName: 'BranchA', lastName: 'Patient' } }),
       db.patient.create({ data: { tenantId: tenant.id, branchId: tenant.branchB, firstName: 'BranchB', lastName: 'Patient' } }),
@@ -300,6 +397,24 @@ describe('cross-module endpoint authorization', () => {
       db.revenueSnapshot.create({ data: { tenantId: tenant.id, branchId: tenant.branchA, period: new Date('2026-01-01T00:00:00Z'), revenue: 1 } }),
       db.revenueSnapshot.create({ data: { tenantId: tenant.id, branchId: tenant.branchB, period: new Date('2026-01-01T00:00:00Z'), revenue: 2 } }),
     ]);
+    const competitorData = (branchId: string, name: string) => ({
+      tenantId: tenant.id, branchId, name, complaintThemes: [], activeOffers: [], localRankTrend: 'steady',
+      weaknessSummary: 'Synthetic scope fixture', opportunityAlert: 'Synthetic scope fixture',
+      marketOpeningRecommendation: 'Review the source record.',
+    });
+    const [competitorA, competitorB] = await Promise.all([
+      db.competitor.create({ data: competitorData(tenant.branchA, 'Branch A competitor') }),
+      db.competitor.create({ data: competitorData(tenant.branchB, 'Branch B competitor') }),
+    ]);
+    const reputationData = (branchId: string, complaint: string) => ({
+      tenantId: tenant.id, branchId, badReviewRisk: 70, complaintCategory: 'Wait time',
+      unresolvedComplaint: complaint, workflowStatus: 'open', recoveryWorkflow: 'Review and follow up.',
+      suggestedReply: 'Review before sending.', npsScore: 20, publicTrend: 'steady',
+    });
+    const [reputationA, reputationB] = await Promise.all([
+      db.reputationCase.create({ data: reputationData(tenant.branchA, 'Branch A complaint') }),
+      db.reputationCase.create({ data: reputationData(tenant.branchB, 'Branch B complaint') }),
+    ]);
 
     const reads: Array<[string, string, string]> = [
       [`/v1/telehealth/sessions?branchId=${tenant.branchB}`, appointmentA.id, appointmentB.id],
@@ -310,12 +425,30 @@ describe('cross-module endpoint authorization', () => {
       [`/v1/revenue-snapshots?branchId=${tenant.branchB}`, snapshotA.id, snapshotB.id],
     ];
     for (const [url, ownId, otherId] of reads) {
-      const response = await app.inject({ method: 'GET', url, headers: headers(tenant, 'OWNER') });
+      const response = await app.inject({ method: 'GET', url, headers: scopedHeaders });
       expect(response.statusCode, url).toBe(200);
       const ids = (response.json() as Array<{ id: string }>).map(row => row.id);
       expect(ids, url).toContain(ownId);
       expect(ids, url).not.toContain(otherId);
     }
+
+    const competitorResponse = await app.inject({
+      method: 'GET', url: `/v1/competitors/radar?branchId=${tenant.branchB}`, headers: scopedHeaders,
+    });
+    expect(competitorResponse.statusCode).toBe(200);
+    const competitorIds = (competitorResponse.json() as Array<{ id: string; branch: { id: string } }>).map(row => row.id);
+    expect(competitorIds).toContain(competitorA.id);
+    expect(competitorIds).not.toContain(competitorB.id);
+    expect((competitorResponse.json() as Array<{ branch: { id: string } }>)[0]?.branch.id).toBe(tenant.branchA);
+
+    const reputationResponse = await app.inject({
+      method: 'GET', url: `/v1/reputation?branchId=${tenant.branchB}`, headers: scopedHeaders,
+    });
+    expect(reputationResponse.statusCode).toBe(200);
+    const reputationIds = (reputationResponse.json() as { cases: Array<{ id: string }> }).cases.map(row => row.id);
+    expect(reputationIds).toContain(reputationA.id);
+    expect(reputationIds).not.toContain(reputationB.id);
+    expect(reputationResponse.json()).toMatchObject({ summary: { unresolvedCases: 1 } });
 
     const mutations: GuardedRoute[] = [
       { method: 'PATCH', url: `/v1/reviews/${reviewB.id}/respond`, permission: 'crm:write', payload: { response: 'Cross branch' } },
@@ -324,7 +457,12 @@ describe('cross-module endpoint authorization', () => {
       { method: 'POST', url: `/v1/conversations/${conversationB.id}/reply`, permission: 'crm:write', payload: { message: 'Cross branch', status: 'escalated' } },
     ];
     for (const route of mutations) {
-      const response = await inject(tenant, 'OWNER', route);
+      const response = await app.inject({
+        method: route.method,
+        url: route.url,
+        headers: scopedHeaders,
+        ...(route.payload === undefined ? {} : { payload: route.payload }),
+      });
       expect(response.statusCode, `${route.method} ${route.url}`).toBe(403);
       expect(response.json().message, `${route.method} ${route.url}`).toMatch(/another branch/i);
     }

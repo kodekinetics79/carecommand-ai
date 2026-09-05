@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router';
 import Sidebar from '../components/layout/Sidebar';
 import Topbar from '../components/layout/Topbar';
@@ -7,6 +7,7 @@ import { useSession } from '../hooks/useSession';
 import { matchRoute, hasRouteAccess } from '../lib/access';
 import { usePreferences } from '../lib/preferences';
 import AutoTranslate from '../components/AutoTranslate';
+import { clinicSelectionEventName } from '../lib/session';
 import {
   ClientDashboard, ClientAppointments, ClientRequests, ClientIntake,
   ClientInsurance, ClientPayments, ClientProfile, ClientPreferences,
@@ -65,6 +66,13 @@ function ProtectedLayout() {
   // figures (formatCurrency) re-render with the new preference immediately.
   const { currency, language } = usePreferences();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [clinicRevision, setClinicRevision] = useState(0);
+
+  useEffect(() => {
+    const remountClinicScope = () => setClinicRevision(revision => revision + 1);
+    window.addEventListener(clinicSelectionEventName, remountClinicScope);
+    return () => window.removeEventListener(clinicSelectionEventName, remountClinicScope);
+  }, []);
 
   if (loading) {
     return <div className="min-h-screen flex items-center justify-center text-sm text-t3">Loading session…</div>;
@@ -99,7 +107,7 @@ function ProtectedLayout() {
                 navigation behind, with no loading feedback. Keying forces the
                 fallback to show and the shell to track the current route. */}
             <Suspense key={location.pathname} fallback={<div className="skeleton h-48 rounded-2xl" />}>
-              <div key={`${currency}-${language}`}>
+              <div key={`${currency}-${language}-${clinicRevision}`}>
                 {permitted
                   ? <Outlet />
                   : <AccessRestricted section={destination.route.label} role={user?.role} workspace={user?.tenant?.name} />}
@@ -120,7 +128,8 @@ function PublicRoute({ children }: { children: ReactNode }) {
     return <div className="min-h-screen flex items-center justify-center text-sm text-t3">Loading session…</div>;
   }
 
-  if (isAuthenticated) {
+  const isPasswordResetLink = location.pathname === '/login' && new URLSearchParams(location.hash.slice(1)).has('reset');
+  if (isAuthenticated && !isPasswordResetLink) {
     const destination = (location.state as { from?: string } | null)?.from ?? '/';
     return <Navigate to={destination} replace />;
   }

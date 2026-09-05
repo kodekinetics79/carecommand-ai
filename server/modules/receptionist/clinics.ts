@@ -119,7 +119,10 @@ export const clinicRoutes: FastifyPluginAsync = async app => {
 
   app.get('/clinics', { preHandler: receptionistRead }, async request => {
     const rows = await db.receptionistClinic.findMany({
-      where: { tenantId: request.auth.tenantId },
+      where: {
+        tenantId: request.auth.tenantId,
+        ...(request.auth.branchId ? { locations: { some: { branchId: request.auth.branchId } } } : {}),
+      },
       orderBy: { createdAt: 'asc' },
       include: {
         locations: { orderBy: { createdAt: 'asc' }, include: { branch: { select: { timezone: true, name: true } } } },

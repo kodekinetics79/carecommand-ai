@@ -12,6 +12,11 @@ import { TENANT_INTEGRITY_MANIFEST } from '../modules/platform/prismaDriftGuard'
 const ACK = 'CREATE_DROP_LOCAL_RELEASE_TEST_DATABASES';
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const DATABASE_PREFIX = 'carecommand_test_rc_';
+// This drill can only target guarded, disposable local databases in NODE_ENV=test.
+// Give its synthetic seeder local-only signing material so an operator does not
+// need to copy any deployed secret into a recovery exercise.
+const LOCAL_TEST_JWT_SECRET = 'release-lifecycle-local-only-jwt-secret-2026';
+const LOCAL_TEST_REFRESH_SECRET = 'release-lifecycle-local-only-refresh-secret-2026';
 
 function checkedAdminUrl(): URL {
   if (process.env.NODE_ENV !== 'test') throw new Error('Release database lifecycle requires NODE_ENV=test.');
@@ -116,6 +121,8 @@ async function main(): Promise<void> {
     await run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['tsx', 'prisma/seedSynthetic.ts'], {
       ...process.env,
       NODE_ENV: 'test',
+      JWT_SECRET: LOCAL_TEST_JWT_SECRET,
+      JWT_REFRESH_SECRET: LOCAL_TEST_REFRESH_SECRET,
       SYNTHETIC_PROFILE: 'FUNCTIONAL',
       SYNTHETIC_DATABASE_URL: sourceUrl,
       DATABASE_MIGRATION_URL: sourceUrl,
@@ -130,6 +137,9 @@ async function main(): Promise<void> {
 
     await run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['tsx', 'server/scripts/verifyRlsCatalog.ts'], {
       ...process.env,
+      NODE_ENV: 'test',
+      JWT_SECRET: LOCAL_TEST_JWT_SECRET,
+      JWT_REFRESH_SECRET: LOCAL_TEST_REFRESH_SECRET,
       DATABASE_URL: restoreRuntimeUrl,
       DATABASE_MIGRATION_URL: restoreUrl,
     });

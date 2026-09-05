@@ -180,7 +180,10 @@ export const patientRoutes: FastifyPluginAsync = async app => {
       cursor: query.cursor ? { id: query.cursor } : undefined,
       skip: query.cursor ? 1 : 0,
       take: query.limit + 1,
-      include: { _count: { select: { appointments: { where: { deletedAt: null } } } } },
+      include: {
+        branch: { select: { name: true } },
+        _count: { select: { appointments: { where: { deletedAt: null } } } },
+      },
       });
     });
     const page = cursorPage(rows, query.limit);
@@ -190,9 +193,11 @@ export const patientRoutes: FastifyPluginAsync = async app => {
   });
 
   app.get('/summary', { preHandler: canReadPatients }, async request => {
-    const branchId = request.auth.branchId ?? null;
+    const query = z.object({ branchId: z.string().uuid().optional() }).parse(request.query);
+    if (query.branchId) assertBranchAccess(request, query.branchId);
+    const branchId = request.auth.branchId ?? query.branchId ?? null;
     const summary = await runWithTenantContext(request.auth.tenantId, async tx => {
-      const where = { tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) };
+      const where = { tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request), ...(branchId ? { branchId } : {}) };
       const aggregate = await tx.patient.aggregate({
         where,
         _count: { _all: true },
@@ -232,18 +237,21 @@ export const patientRoutes: FastifyPluginAsync = async app => {
         SELECT purpose::text, count(*) FILTER (WHERE granted)::bigint AS granted_count
         FROM latest GROUP BY purpose
       `;
-      return { aggregate, lifecycle, branches, highRiskCount, highLifetimeValueCount, consentRows };
+      return { aggregate, lifecycle, branches, highRiskCount, highLifetimeValueCount, consentRows, growthPolicy };
     });
     const total = summary.aggregate._count._all;
     const consentCounts = Object.fromEntries(summary.consentRows.map(row => [row.purpose, Number(row.granted_count)]));
-    await audit(request, { action: 'patient.summary', resource: 'patient', metadata: { count: total, scope: branchId ? 'assigned_branch' : 'tenant' } });
+    const scope = request.auth.branchId ? 'assigned_branch' : branchId ? 'selected_branch' : 'tenant';
+    await audit(request, { action: 'patient.summary', resource: 'patient', metadata: { count: total, scope } });
     return {
-      scope: branchId ? 'assigned_branch' : 'tenant',
+      scope,
       asOf: new Date().toISOString(),
       patientCount: total,
       activeRetainedCount: summary.lifecycle.filter(row => row.lifecycleStage === 'ACTIVE' || row.lifecycleStage === 'RETAINED').reduce((sum, row) => sum + row._count._all, 0),
       highRiskCount: summary.highRiskCount,
       highLifetimeValueCount: summary.highLifetimeValueCount,
+      churnRiskHigh: summary.growthPolicy.churnRiskHigh,
+      highValuePatientLtv: Number(summary.growthPolicy.highValuePatientLtv),
       averageLifetimeValue: Number(summary.aggregate._avg.lifetimeValue ?? 0),
       outstandingBalance: Number(summary.aggregate._sum.outstandingBalance ?? 0),
       lifecycleCounts: Object.fromEntries(summary.lifecycle.map(row => [row.lifecycleStage, row._count._all])),

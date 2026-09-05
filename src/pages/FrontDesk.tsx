@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, CalendarCheck2, Loader2, Phone, PhoneIncoming, PhoneOutgoing, Siren } from 'lucide-react';
+import { AlertCircle, Building2, CalendarCheck2, Loader2, Network, Phone, PhoneIncoming, PhoneOutgoing, RefreshCw, Siren } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -62,6 +62,14 @@ interface Source<T> {
   refreshFailure: ResourceFailure | null;
 }
 
+interface MetricSource<T> {
+  data: T | null;
+  state: LaneState;
+  failure: ResourceFailure | null;
+  /** A failed background refresh leaves the last good value visible, but named as stale. */
+  refreshFailure: ResourceFailure | null;
+}
+
 const EMPTY: Source<never> = { rows: [], state: 'loading', failure: null, nextCursor: null, refreshFailure: null };
 
 const EMERGENCY_KINDS: ReceptionistTaskKind[] = ['emergency'];
@@ -70,7 +78,8 @@ const TASK_PAGE = 50;
 const REQUEST_PAGE = 25;
 const CALL_PAGE = 20;
 
-function LaneShell({ title, subtitle, total, shown, state, failure, refreshFailure, onRetry, emptyText, onLoadMore, loadingMore, children }: {
+function LaneShell({ id, title, subtitle, total, shown, state, failure, refreshFailure, onRetry, emptyText, onLoadMore, loadingMore, children }: {
+  id?: string;
   title: string; subtitle: string;
   /** The authoritative count from the server. Null when it is not known. */
   total: number | null;
@@ -87,7 +96,7 @@ function LaneShell({ title, subtitle, total, shown, state, failure, refreshFailu
 }) {
   const truncated = total !== null && shown < total;
   return (
-    <section aria-label={title} className="space-y-2">
+    <section id={id} aria-label={title} className="fd-lane space-y-2">
       <div className="flex items-baseline justify-between gap-2">
         <div>
           <h2 className="text-sm font-bold text-t1">{title}{state === 'ready' && total !== null ? ` (${total})` : ''}</h2>
@@ -148,11 +157,12 @@ export default function FrontDesk() {
   const [requests, setRequests] = useState<Source<AppointmentRequestRow>>(EMPTY);
   const [unreviewed, setUnreviewed] = useState<Source<CallLogListRow>>(EMPTY);
   const [recent, setRecent] = useState<Source<CallLogListRow>>(EMPTY);
-  const [callSummary, setCallSummary] = useState<{ data: CallLogSummary | null; state: LaneState; failure: ResourceFailure | null }>({ data: null, state: 'loading', failure: null });
-  const [kpis, setKpis] = useState<{ data: OverviewKpis | null; state: LaneState; failure: ResourceFailure | null }>({ data: null, state: 'loading', failure: null });
+  const [callSummary, setCallSummary] = useState<MetricSource<CallLogSummary>>({ data: null, state: 'loading', failure: null, refreshFailure: null });
+  const [kpis, setKpis] = useState<MetricSource<OverviewKpis>>({ data: null, state: 'loading', failure: null, refreshFailure: null });
   const [bookingRequest, setBookingRequest] = useState<AppointmentRequestRow | null>(null);
   const [openCallId, setOpenCallId] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const rejectState = useMutationState();
   const [rejectingId, setRejectingId] = useState<string | null>(null);
   const [rejectReason, setRejectReason] = useState('');
@@ -241,17 +251,17 @@ export default function FrontDesk() {
       // denominator must carry the same direction filter. Without it the tile
       // counted every unreviewed outbound campaign call too, then told staff
       // those extra rows were mysteriously "not loadable from this lane".
-      return { data: await frontDeskApi.callLogSummary({ clinicId: forClinic || undefined, direction: 'inbound' }), state: 'ready' as const, failure: null };
+      return { data: await frontDeskApi.callLogSummary({ clinicId: forClinic || undefined, direction: 'inbound' }), state: 'ready' as const, failure: null, refreshFailure: null };
     } catch (error) {
-      return { data: null, state: 'error' as const, failure: describeFailure(error) };
+      return { data: null, state: 'error' as const, failure: describeFailure(error), refreshFailure: null };
     }
   }, []);
 
   const fetchKpis = useCallback(async (forClinic: string) => {
     try {
-      return { data: await frontDeskApi.overview({ clinicId: forClinic || undefined, period: 'today' }), state: 'ready' as const, failure: null };
+      return { data: await frontDeskApi.overview({ clinicId: forClinic || undefined, period: 'today' }), state: 'ready' as const, failure: null, refreshFailure: null };
     } catch (error) {
-      return { data: null, state: 'error' as const, failure: describeFailure(error) };
+      return { data: null, state: 'error' as const, failure: describeFailure(error), refreshFailure: null };
     }
   }, []);
 
@@ -336,10 +346,29 @@ export default function FrontDesk() {
       setUnreviewed(nextUnreviewed);
       setRecent(nextRecent);
     }
-    if (nextCallSummary.state === 'ready' || !options.background) setCallSummary(nextCallSummary);
-    if (nextKpis.state === 'ready' || !options.background) setKpis(nextKpis);
+    if (options.background) {
+      setCallSummary(current => nextCallSummary.state === 'ready'
+        ? nextCallSummary
+        : current.state === 'ready' ? { ...current, refreshFailure: nextCallSummary.failure } : nextCallSummary);
+      setKpis(current => nextKpis.state === 'ready'
+        ? nextKpis
+        : current.state === 'ready' ? { ...current, refreshFailure: nextKpis.failure } : nextKpis);
+    } else {
+      setCallSummary(nextCallSummary);
+      setKpis(nextKpis);
+    }
     if (!options.background) await summary.refresh();
   }, [fetchTasks, fetchDeployment, fetchRequests, fetchUnreviewed, fetchRecent, fetchCallSummary, fetchKpis, clinicId, summary]);
+
+  async function manualRefresh() {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await refreshAll();
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   /**
    * E13. The lanes ride the summary's own 20 s tick instead of loading once and
@@ -446,46 +475,57 @@ export default function FrontDesk() {
         : `${needsAction.count} need action · ${critical.count}${critical.exact ? '' : '+'} critical`;
 
   return (
-    <div className="space-y-5 pb-8">
+    <div className="front-desk-workspace space-y-5 pb-8">
       <PageHeader
         title="Front Desk"
-        subtitle="Every caller the AI could not finish with. A task stays open until a person closes it."
+        subtitle="The human work left by calls, booking requests, and safety escalations. Work stays open until a person resolves it."
         badge={headerBadge}
         badgeColor={summary.state === 'error' ? 'red' : critical.count > 0 ? 'red' : 'blue'}
         actions={
           <div className="flex items-center gap-2">
-            {clinics.rows.length > 1 && (
-              <label className="text-[11px] text-t3">
-                <span className="sr-only">Clinic</span>
-                <Select
-                  value={clinicId}
-                  onChange={event => {
-                    generation.current += 1;
-                    setClinicId(event.target.value);
-                    markLoading(setRequests); markLoading(setUnreviewed); markLoading(setRecent);
-                    setCallSummary({ data: null, state: 'loading', failure: null });
-                    setKpis({ data: null, state: 'loading', failure: null });
-                  }}
-                  aria-label="Clinic"
-                >
-                  {clinics.rows.map(row => <option key={row.id} value={row.id}>{row.name}</option>)}
-                </Select>
-              </label>
-            )}
+            <button type="button" onClick={() => void manualRefresh()} disabled={refreshing}
+              className="fd-refresh" aria-label="Refresh the front desk queue">
+              <RefreshCw className={refreshing ? 'animate-spin' : ''} aria-hidden="true" />
+              {refreshing ? 'Refreshing' : 'Refresh'}
+            </button>
             {canOpenStudio && (
-              <a href="/receptionist-studio" className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)]">Studio</a>
+              <a href="/receptionist-studio" className="fd-studio-link">Receptionist studio</a>
             )}
           </div>
         }
       />
 
-      {clinics.rows.length > 1 && (
-        <p className="text-[11px] text-t3">
-          The clinic selector scopes calls, booking requests and the shift report. Task lanes and the header count are
-          tenant-wide for every clinic you can see — the task list has no clinic filter yet, and a clinic-scoped lane
-          under a tenant-wide count would be worse than saying so.
-        </p>
-      )}
+      <section className="fd-scope" aria-label="Front desk data scope">
+        <div className="fd-scope-item">
+          <span className="fd-scope-icon"><Network aria-hidden="true" /></span>
+          <span><strong>{user?.tenant.name ?? 'Clinic network'}</strong><small>Network queue · task lanes and header count</small></span>
+        </div>
+        <div className="fd-scope-item fd-scope-clinic">
+          <span className="fd-scope-icon"><Building2 aria-hidden="true" /></span>
+          <span>
+            <strong>{clinic?.name ?? (clinics.state === 'loading' ? 'Loading clinic…' : 'Accessible clinics')}</strong>
+            <small>Clinic operations · calls, booking requests and call KPIs</small>
+          </span>
+          {clinics.rows.length > 1 && (
+            <label>
+              <span className="sr-only">Clinic operations scope</span>
+              <Select
+                value={clinicId}
+                onChange={event => {
+                  generation.current += 1;
+                  setClinicId(event.target.value);
+                  markLoading(setRequests); markLoading(setUnreviewed); markLoading(setRecent);
+                  setCallSummary({ data: null, state: 'loading', failure: null, refreshFailure: null });
+                  setKpis({ data: null, state: 'loading', failure: null, refreshFailure: null });
+                }}
+                aria-label="Clinic operations scope"
+              >
+                {clinics.rows.map(row => <option key={row.id} value={row.id}>{row.name}</option>)}
+              </Select>
+            </label>
+          )}
+        </div>
+      </section>
 
       {summary.state === 'error' && (
         <div role="alert" className="rounded-2xl border border-red-v/40 bg-[var(--red-soft)] px-4 py-3 text-sm text-red-v">
@@ -510,6 +550,12 @@ export default function FrontDesk() {
         onAcknowledged={() => refreshAll()}
       />
 
+      {callSummary.refreshFailure && (
+        <p role="status" className="rounded-lg border border-amber-v/40 bg-[var(--amber-soft)] px-3 py-2 text-[11px] font-semibold text-t2">
+          The latest clinic call-summary refresh failed ({callSummary.refreshFailure.message}). Counts below are the last successfully loaded values and may be out of date.
+        </p>
+      )}
+
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Emergencies" value={emergencyTotal ?? '—'} subtitle={emergencyTotal === null ? 'Unavailable' : 'Open and unresolved'} icon={<Siren className="h-4 w-4" />} accent="red" />
         <StatCard title="Callbacks due" value={callbackTotal ?? '—'} subtitle={callbackTotal === null ? 'Unavailable' : 'Messages and handoffs'} icon={<Phone className="h-4 w-4" />} accent="amber" />
@@ -517,18 +563,23 @@ export default function FrontDesk() {
         <StatCard title="Unreviewed calls" value={unreviewedTotal ?? '—'} subtitle={unreviewedTotal === null ? 'Unavailable' : 'Inbound, not yet read'} icon={<PhoneIncoming className="h-4 w-4" />} accent="blue" />
       </div>
 
-      <ShiftReport
-        kpis={kpis.data}
-        state={kpis.state}
-        failure={kpis.failure}
-        summary={summaryData}
-        timezone={timezone}
-        onRetry={() => { void (async () => { setKpis({ data: null, state: 'loading', failure: null }); setKpis(await fetchKpis(clinicId)); })(); }}
-      />
+      <section className="fd-queue-intro" aria-labelledby="human-queue-heading">
+        <div>
+          <h2 id="human-queue-heading">Human action queue</h2>
+          <p>Start with safety, then work callbacks and booking requests. Each lane keeps its own loading, failure, and empty state.</p>
+        </div>
+        <nav className="fd-queue-nav" aria-label="Jump to queue lane">
+          <a href="#queue-emergencies" aria-label={`Emergencies, ${emergencyTotal ?? 'count unavailable'}`}><Siren aria-hidden="true" /><span>Emergencies</span><strong>{emergencyTotal ?? '—'}</strong></a>
+          <a href="#queue-callbacks" aria-label={`Callbacks, ${callbackTotal ?? 'count unavailable'}`}><Phone aria-hidden="true" /><span>Callbacks</span><strong>{callbackTotal ?? '—'}</strong></a>
+          <a href="#queue-bookings" aria-label={`Bookings, ${requestTotal ?? 'count unavailable'}`}><CalendarCheck2 aria-hidden="true" /><span>Bookings</span><strong>{requestTotal ?? '—'}</strong></a>
+          <a href="#queue-unreviewed" aria-label={`Unreviewed calls, ${unreviewedTotal ?? 'count unavailable'}`}><PhoneIncoming aria-hidden="true" /><span>Unreviewed</span><strong>{unreviewedTotal ?? '—'}</strong></a>
+        </nav>
+      </section>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_400px]">
         <div className="space-y-5">
           <LaneShell
+            id="queue-emergencies"
             title="Emergencies & urgent" subtitle="Acknowledge first — the AI cannot close these."
             total={tasks.state === 'ready' ? emergencyTotal ?? emergencies.length : null} shown={emergencies.length}
             state={tasks.state} failure={tasks.failure} refreshFailure={tasks.refreshFailure}
@@ -542,6 +593,7 @@ export default function FrontDesk() {
           </LaneShell>
 
           <LaneShell
+            id="queue-callbacks"
             title="Callbacks due" subtitle="Messages, handoffs and missed calls, soonest due first."
             total={tasks.state === 'ready' ? callbackTotal ?? callbacks.length : null} shown={callbacks.length}
             state={tasks.state} failure={tasks.failure} refreshFailure={tasks.refreshFailure}
@@ -555,6 +607,7 @@ export default function FrontDesk() {
           </LaneShell>
 
           <LaneShell
+            id="queue-bookings"
             title="Booking requests" subtitle="A caller asked for a time. Nothing is booked until you book it."
             total={requests.state === 'ready' ? requestTotal ?? requests.rows.length : null} shown={requests.rows.length}
             state={requests.state} failure={requests.failure} refreshFailure={requests.refreshFailure}
@@ -609,6 +662,7 @@ export default function FrontDesk() {
           </LaneShell>
 
           <LaneShell
+            id="queue-unreviewed"
             title="Unreviewed calls" subtitle="Inbound calls nobody has read yet. Open one to read what the AI recorded."
             total={unreviewed.state === 'ready' ? unreviewedTotal ?? unreviewed.rows.length : null} shown={unreviewed.rows.length}
             state={unreviewed.state} failure={unreviewed.failure} refreshFailure={unreviewed.refreshFailure}
@@ -629,6 +683,17 @@ export default function FrontDesk() {
               {otherTasks.map(task => <ReceptionistTaskCard key={task.id} task={task} timezone={timezone} can={can} onChanged={() => refreshAll()} onOpenCall={setOpenCallId} />)}
             </LaneShell>
           )}
+
+          <ShiftReport
+            kpis={kpis.data}
+            state={kpis.state}
+            failure={kpis.failure}
+            summary={summaryData}
+            timezone={timezone}
+            refreshFailure={kpis.refreshFailure}
+            clinicName={clinic?.name ?? 'Selected clinic'}
+            onRetry={() => { void (async () => { setKpis({ data: null, state: 'loading', failure: null, refreshFailure: null }); setKpis(await fetchKpis(clinicId)); })(); }}
+          />
         </div>
 
         <div className="space-y-4">

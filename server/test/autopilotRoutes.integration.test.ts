@@ -45,6 +45,7 @@ async function fixture() {
   const tenantId = randomUUID();
   tenantIds.push(tenantId);
   await db.tenant.create({ data: { id: tenantId, name: `apr-${tenantId.slice(0, 6)}`, slug: `apr-${tenantId.slice(0, 8)}` } });
+  await db.branch.create({ data: { tenantId, name: 'Autopilot test clinic', location: 'Synthetic' } });
   const admin = await db.user.create({
     data: { tenantId, email: `owner-${tenantId}@apr.test`, displayName: 'Owner', role: 'OWNER', active: true },
   });

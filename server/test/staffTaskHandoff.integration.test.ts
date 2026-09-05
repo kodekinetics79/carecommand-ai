@@ -239,6 +239,18 @@ describe('putting a name on a task', () => {
     expect((await db.staffTask.findUniqueOrThrow({ where: { id: task.id } })).assignedToId).toBeNull();
   });
 
+  it('allows an assignee who is explicitly shared into the task clinic', async () => {
+    const f = await makeFixture();
+    const task = await openTask(f, f.branchA);
+    await db.userClinicAccess.create({ data: { tenantId: f.tenantId, userId: f.frontDeskB, branchId: f.branchA } });
+    const res = await app.inject({
+      method: 'PATCH', url: `/v1/staff/tasks/${task.id}/assignment`,
+      headers: auth(f, f.owner, 'OWNER'), payload: { assignedToId: f.frontDeskB },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().assignedToId).toBe(f.frontDeskB);
+  });
+
   it('refuses to reassign a finished task', async () => {
     const f = await makeFixture();
     const task = await openTask(f);
@@ -277,7 +289,7 @@ describe('putting a name on a task', () => {
     for (const [url, payload] of [
       [`/v1/staff/tasks/${taskId}/assignment`, { assignedToId: f.frontDesk }],
       [`/v1/staff/tasks/${taskId}/status`, { status: 'IN_PROGRESS' }],
-      [`/v1/staff/tasks/${taskId}/status`, { status: 'COMPLETED' }],
+      [`/v1/staff/tasks/${taskId}/status`, { status: 'COMPLETED', outcomeCode: 'resolved_elsewhere' }],
     ] as const) {
       const res = await app.inject({ method: 'PATCH', url, headers: auth(f, f.frontDesk, 'FRONT_DESK'), payload });
       expect(res.statusCode, url).toBe(200);
@@ -286,6 +298,95 @@ describe('putting a name on a task', () => {
     expect(await db.staffTask.findUniqueOrThrow({ where: { id: taskId } })).toMatchObject({
       status: 'COMPLETED', assignedToId: f.frontDesk,
     });
+  });
+
+  it('requires a clinic on manual creation and an outcome on final completion', async () => {
+    const f = await makeFixture();
+    const unscoped = await app.inject({
+      method: 'POST', url: '/v1/tasks', headers: auth(f, f.owner, 'OWNER'),
+      payload: { title: 'Ambiguous clinic work', priority: 'medium' },
+    });
+    expect(unscoped.statusCode).toBe(400);
+    expect(unscoped.json().message).toMatch(/select a clinic/i);
+
+    const created = await app.inject({
+      method: 'POST', url: '/v1/tasks', headers: auth(f, f.owner, 'OWNER'),
+      payload: { title: 'Clinic-owned work', priority: 'medium', branchId: f.branchA },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().branchId).toBe(f.branchA);
+
+    const outcomeMissing = await app.inject({
+      method: 'PATCH', url: `/v1/staff/tasks/${created.json().id}/status`, headers: auth(f, f.owner, 'OWNER'),
+      payload: { status: 'COMPLETED' },
+    });
+    expect(outcomeMissing.statusCode).toBe(400);
+    const completed = await app.inject({
+      method: 'PATCH', url: `/v1/staff/tasks/${created.json().id}/status`, headers: auth(f, f.owner, 'OWNER'),
+      payload: { status: 'COMPLETED', outcomeCode: 'not_needed' },
+    });
+    expect(completed.statusCode).toBe(200);
+  });
+
+  it('does not expose tenant-wide legacy tasks inside a branch queue', async () => {
+    const f = await makeFixture();
+    const [clinicTask, legacyUnscoped] = await Promise.all([
+      openTask(f, f.branchA),
+      db.staffTask.create({ data: { tenantId: f.tenantId, branchId: null, title: 'Legacy unscoped work', priority: 'low' } }),
+    ]);
+    const listed = await app.inject({ method: 'GET', url: '/v1/tasks?limit=100', headers: auth(f, f.frontDesk, 'FRONT_DESK') });
+    expect(listed.statusCode).toBe(200);
+    const ids = listed.json().data.map((task: { id: string }) => task.id);
+    expect(ids).toContain(clinicTask.id);
+    expect(ids).not.toContain(legacyUnscoped.id);
+  });
+
+  it('denies every direct unscoped-task route to a clinic-scoped operator', async () => {
+    const f = await makeFixture();
+    const task = await db.staffTask.create({ data: { tenantId: f.tenantId, branchId: null, title: 'Ambiguous safety handoff', priority: 'high' } });
+    const requests = [
+      { method: 'GET' as const, url: `/v1/staff/tasks/${task.id}` },
+      { method: 'PATCH' as const, url: `/v1/staff/tasks/${task.id}/status`, payload: { status: 'IN_PROGRESS' } },
+      { method: 'PATCH' as const, url: `/v1/staff/tasks/${task.id}/acknowledge`, payload: {} },
+      { method: 'POST' as const, url: `/v1/staff/tasks/${task.id}/notes`, payload: { text: 'Should not be visible' } },
+      { method: 'PATCH' as const, url: `/v1/staff/tasks/${task.id}/assignment`, payload: { assignedToId: f.frontDesk } },
+    ];
+    for (const request of requests) {
+      const response = await app.inject({ ...request, headers: auth(f, f.frontDesk, 'FRONT_DESK') });
+      expect(response.statusCode, `${request.method} ${request.url}`).toBe(403);
+    }
+    expect(await db.staffTask.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({ status: 'OPEN', assignedToId: null, acknowledgedAt: null });
+  });
+
+  it('binds a booked outcome to the task clinic and patient', async () => {
+    const f = await makeFixture();
+    const [patientA, otherPatientA, patientB] = await Promise.all([
+      db.patient.create({ data: { tenantId: f.tenantId, branchId: f.branchA, firstName: 'Task', lastName: 'Patient', tags: [] } }),
+      db.patient.create({ data: { tenantId: f.tenantId, branchId: f.branchA, firstName: 'Other', lastName: 'Patient', tags: [] } }),
+      db.patient.create({ data: { tenantId: f.tenantId, branchId: f.branchB, firstName: 'Remote', lastName: 'Patient', tags: [] } }),
+    ]);
+    const startsAt = new Date(Date.now() + 86_400_000);
+    const endsAt = new Date(startsAt.getTime() + 1_800_000);
+    const [crossClinic, crossPatient, matching] = await Promise.all([
+      db.appointment.create({ data: { tenantId: f.tenantId, branchId: f.branchB, patientId: patientB.id, service: 'Consult', startsAt, endsAt, channel: 'CALL' } }),
+      db.appointment.create({ data: { tenantId: f.tenantId, branchId: f.branchA, patientId: otherPatientA.id, service: 'Consult', startsAt, endsAt, channel: 'CALL' } }),
+      db.appointment.create({ data: { tenantId: f.tenantId, branchId: f.branchA, patientId: patientA.id, service: 'Consult', startsAt, endsAt, channel: 'CALL' } }),
+    ]);
+    const task = await db.staffTask.create({ data: { tenantId: f.tenantId, branchId: f.branchA, patientId: patientA.id, title: 'Book patient', priority: 'high' } });
+    for (const appointmentId of [crossClinic.id, crossPatient.id]) {
+      const rejected = await app.inject({
+        method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(f, f.owner, 'OWNER'),
+        payload: { status: 'COMPLETED', outcomeCode: 'booked', appointmentId },
+      });
+      expect(rejected.statusCode).toBe(400);
+      expect(rejected.json().message).toMatch(/tenant, clinic, or patient/i);
+    }
+    const accepted = await app.inject({
+      method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(f, f.owner, 'OWNER'),
+      payload: { status: 'COMPLETED', outcomeCode: 'booked', appointmentId: matching.id },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json()).toMatchObject({ status: 'COMPLETED', outcomeCode: 'booked' });
   });
 
   it('only offers the assignee roster to a caller who may assign', async () => {

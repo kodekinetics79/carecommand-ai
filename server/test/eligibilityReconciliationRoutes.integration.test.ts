@@ -50,7 +50,7 @@ async function tenantFixture() {
     } });
   }
   const admin = await user('ADMIN');
-  const billing = await user('BILLING');
+  const billing = await user('BILLING', firstBranch.id);
   const manager = await user('MANAGER', firstBranch.id);
   const frontDesk = await user('FRONT_DESK', firstBranch.id);
   const provider = await user('PROVIDER', firstBranch.id);

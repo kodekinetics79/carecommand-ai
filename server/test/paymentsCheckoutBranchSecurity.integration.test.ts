@@ -49,7 +49,19 @@ async function fixture() {
   ]);
   const requirementB = await db.depositRequirement.create({ data: { tenantId, branchId: branchB.id, patientId: patientB.id, appointmentId: appointmentB.id, status: 'required', requiredAmount: 30, reason: 'Deposit', mode: 'mock' } });
   const token = app.jwt.sign({ userId: admin.id, tenantId, branchId: branchA.id, role: 'ADMIN', type: 'access' });
-  return { tenantId, branchA, appointmentA, appointmentB, requestA, requestB, requirementB, headers: { authorization: `Bearer ${token}` } };
+  return {
+    tenantId,
+    branchA,
+    appointmentA,
+    appointmentB,
+    requestA,
+    requestB,
+    requirementB,
+    headers: {
+      authorization: `Bearer ${token}`,
+      'x-carecommand-clinic-id': branchA.id,
+    },
+  };
 }
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);

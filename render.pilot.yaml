@@ -36,6 +36,8 @@ services:
         sync: false
       - key: PUBLIC_API_URL
         sync: false
+      - key: PUBLIC_APP_URL
+        sync: false
       - key: TRUSTED_PROXY_CIDRS
         sync: false
       - key: PAYMENT_PROVIDER
@@ -56,6 +58,12 @@ services:
         sync: false
       - key: STEDI_API_KEY
         sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
       - key: RETELL_API_KEY
         sync: false
       - key: RETELL_FROM_NUMBER
@@ -63,6 +71,8 @@ services:
       - key: CAMPAIGN_WEBHOOK_SECRET
         sync: false
       - key: EMAIL_HTTP_API_URL
+        sync: false
+      - key: EMAIL_HTTP_PROVIDER
         sync: false
       - key: EMAIL_HTTP_API_KEY
         sync: false
@@ -100,6 +110,8 @@ services:
         sync: false
       - key: PUBLIC_API_URL
         sync: false
+      - key: PUBLIC_APP_URL
+        sync: false
       - key: PAYMENT_PROVIDER
         sync: false
       - key: INSURANCE_PROVIDER
@@ -118,6 +130,12 @@ services:
         sync: false
       - key: STEDI_API_KEY
         sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
       - key: RETELL_API_KEY
         sync: false
       - key: RETELL_FROM_NUMBER
@@ -125,6 +143,8 @@ services:
       - key: CAMPAIGN_WEBHOOK_SECRET
         sync: false
       - key: EMAIL_HTTP_API_URL
+        sync: false
+      - key: EMAIL_HTTP_PROVIDER
         sync: false
       - key: EMAIL_HTTP_API_KEY
         sync: false
@@ -148,6 +168,8 @@ envVarGroups:
         value: trusted_proxy
       - key: QUEUES_ENABLED
         value: "true"
+      - key: QUEUE_NAMESPACE
+        value: carecommand-pilot
       - key: RLS_ENFORCE_RUNTIME_ROLE
         value: "true"
       - key: PLATFORM_LEGACY_TOKEN_ENABLED
@@ -167,6 +189,8 @@ envVarGroups:
       - key: AUTH_ENCRYPTION_KEY
         generateValue: true
       - key: JOB_ENVELOPE_SECRET
+        generateValue: true
+      - key: ELIGIBILITY_HMAC_SECRET
         generateValue: true
       - key: METRICS_TOKEN
         generateValue: true

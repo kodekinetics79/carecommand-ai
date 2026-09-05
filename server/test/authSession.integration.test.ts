@@ -22,7 +22,7 @@ const { TENANT_LOGIN_DUMMY_HASH, verifyTenantLoginPassword } = await import('../
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
 
-async function makeLoginUser(options: { email?: string; password?: string; status?: string } = {}) {
+async function makeLoginUser(options: { email?: string; password?: string; status?: string; role?: 'ADMIN' | 'PROVIDER' | 'FRONT_DESK' | 'MANAGER' } = {}) {
   const id = randomUUID();
   const slug = `auth-${id.slice(0, 8)}`;
   await db.tenant.create({ data: { id, name: `Auth ${id.slice(0, 6)}`, slug, status: options.status ?? 'active' } });
@@ -34,7 +34,7 @@ async function makeLoginUser(options: { email?: string; password?: string; statu
       tenantId: id,
       email,
       displayName: 'Auth User',
-      role: 'ADMIN',
+      role: options.role ?? 'ADMIN',
       passwordHash: await generatePasswordHash(password),
       passwordChangedAt: new Date(),
     },
@@ -68,6 +68,19 @@ afterAll(async () => {
 });
 
 describe('tenant authentication session lifecycle', () => {
+  it('fails closed when an operational account has no clinic assignment', async () => {
+    const account = await makeLoginUser({ role: 'PROVIDER' });
+    const login = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: account.email, password: account.password } });
+    expect(login.statusCode).toBe(403);
+    expect(login.json().status).toBe('clinic_assignment_required');
+    expect((await db.user.findUniqueOrThrow({ where: { id: account.userId } })).refreshTokenHash).toBeNull();
+    expect(await db.auditEvent.count({ where: { tenantId: account.tenantId, actorUserId: account.userId, action: 'auth.login.denied' } })).toBe(1);
+
+    const forged = app.jwt.sign({ userId: account.userId, tenantId: account.tenantId, role: 'PROVIDER', type: 'access', sessionIssuedAtMs: Date.now() });
+    const protectedResponse = await app.inject({ method: 'GET', url: '/v1/auth/me', headers: { authorization: `Bearer ${forged}` } });
+    expect(protectedResponse.statusCode).toBe(403);
+  });
+
   it('performs fixed-cost password verification for an unknown tenant identity', async () => {
     const verifier = vi.fn(async () => false);
     await expect(verifyTenantLoginPassword('unknown-password', undefined, verifier)).resolves.toBe(false);

@@ -80,12 +80,25 @@ export const DOUBLE_BOOK_CONSTRAINT = 'appointment_no_double_book';
 
 export function isDoubleBookConflictError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
-  const anyErr = error as { code?: string; meta?: { code?: string; constraint?: unknown }; message?: string };
+  const anyErr = error as {
+    code?: string;
+    meta?: { code?: string; constraint?: unknown; database_error?: unknown };
+    message?: string;
+    cause?: unknown;
+  };
   const dbCode = anyErr.meta?.code ?? anyErr.code;
   if (dbCode === '23P01') return true;
+  // Prisma's PostgreSQL adapter can translate the same exclusion race into a
+  // generic constraint wrapper (P2004), while transaction-level contention is
+  // surfaced as P2034. Preserve the customer contract: the losing booking is a
+  // conflict, never an internal error.
+  if (dbCode === 'P2034') return true;
   const constraint = anyErr.meta?.constraint;
   if (typeof constraint === 'string' && constraint === DOUBLE_BOOK_CONSTRAINT) return true;
-  return typeof anyErr.message === 'string' && anyErr.message.includes(DOUBLE_BOOK_CONSTRAINT);
+  const detail = `${anyErr.message ?? ''} ${typeof anyErr.meta?.database_error === 'string' ? anyErr.meta.database_error : ''}`;
+  if (detail.includes(DOUBLE_BOOK_CONSTRAINT)) return true;
+  if (dbCode === 'P2004' && /exclusion constraint/i.test(detail)) return true;
+  return anyErr.cause ? isDoubleBookConflictError(anyErr.cause) : false;
 }
 
 const BLOCKING_STATUSES = ['CONFIRMED', 'RISKY', 'ARRIVED', 'COMPLETED', 'WAITLIST'] as const;

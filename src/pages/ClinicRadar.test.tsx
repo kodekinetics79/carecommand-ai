@@ -3,11 +3,23 @@ import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const apiRequestMock = vi.hoisted(() => vi.fn());
+const sessionState = vi.hoisted(() => ({
+  user: {
+    role: 'OWNER',
+    branchId: null as string | null,
+    branch: null as { id: string; name: string } | null,
+    effectivePermissions: ['operations:read', 'crm:read', 'campaign:read', 'appointment:read', 'receptionist:call-artifacts:read'],
+  },
+}));
 
 vi.mock('../lib/api', async () => {
   const actual = await vi.importActual<typeof import('../lib/api')>('../lib/api');
   return { ...actual, apiRequest: apiRequestMock };
 });
+
+vi.mock('../hooks/useSession', () => ({
+  useSession: () => ({ user: sessionState.user, loading: false, isAuthenticated: true }),
+}));
 
 import { ApiError } from '../lib/api';
 import { GROWTH_POLICY_PATH } from '../lib/growthPolicy';
@@ -46,7 +58,7 @@ const COMPETITORS = [{
   complaintThemes: ['wait times'], activeOffers: ['Free consultation'], localRankTrend: 'up',
   weaknessSummary: 'Long waits reported.', opportunityAlert: 'Reviews mention scheduling.',
   marketOpeningRecommendation: 'Review same-week availability.', createdAt: '2026-08-21T11:00:00.000Z',
-  branch: { name: 'Riverside Clinic' }, insights: [],
+  branch: { id: 'branch-1', name: 'Riverside Clinic' }, insights: [],
 }];
 
 /**
@@ -73,6 +85,10 @@ const PENDING_FOREVER = () => new Promise<never>(() => {});
 let respond: (path: string) => Promise<unknown>;
 
 beforeEach(() => {
+  sessionState.user = {
+    role: 'OWNER', branchId: null, branch: null,
+    effectivePermissions: ['operations:read', 'crm:read', 'campaign:read', 'appointment:read', 'receptionist:call-artifacts:read'],
+  };
   respond = PENDING_FOREVER;
   apiRequestMock.mockReset();
   apiRequestMock.mockImplementation((path: string) => respond(path));
@@ -235,6 +251,47 @@ describe('ClinicRadar request volume', () => {
     // per signal it classifies.
     expect(apiRequestMock).toHaveBeenCalledTimes(4);
   });
+
+  it('reloads both feeds for the chosen clinic and withdraws tenant-wide claims while they are pending', async () => {
+    let resolveScopedReputation!: (value: unknown) => void;
+    let resolveScopedCompetitors!: (value: unknown) => void;
+    const scopedReputation = new Promise(resolve => { resolveScopedReputation = resolve; });
+    const scopedCompetitors = new Promise(resolve => { resolveScopedCompetitors = resolve; });
+
+    respond = (path: string) => {
+      if (path.startsWith(GROWTH_POLICY_PATH)) return Promise.resolve(growthPolicy());
+      if (path.startsWith('/v1/branches')) return Promise.resolve(BRANCHES);
+      if (path === '/v1/reputation?limit=10&branchId=branch-1') return scopedReputation;
+      if (path === '/v1/competitors/radar?limit=10&branchId=branch-1') return scopedCompetitors;
+      if (path === '/v1/reputation?limit=10') return Promise.resolve(reputationPayload(3));
+      if (path === '/v1/competitors/radar?limit=10') return Promise.resolve(COMPETITORS);
+      throw new Error(`Unexpected request: ${path}`);
+    };
+    renderPage();
+
+    await screen.findByText('Northside Dental');
+    expect(figureUnder('Signals loaded')).toBe('2');
+    expect(figureUnder('Open reputation cases')).toBe('3');
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Clinic scope' }), { target: { value: 'branch-1' } });
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith('/v1/reputation?limit=10&branchId=branch-1', expect.anything());
+      expect(apiRequestMock).toHaveBeenCalledWith('/v1/competitors/radar?limit=10&branchId=branch-1', expect.anything());
+    });
+    expect(screen.getByText('Loading signals')).toBeInTheDocument();
+    expect(screen.queryByText('Northside Dental')).not.toBeInTheDocument();
+    expect(screen.queryByText('Signals loaded')).not.toBeInTheDocument();
+    expect(screen.queryByText('Open reputation cases')).not.toBeInTheDocument();
+
+    resolveScopedReputation({ ...reputationPayload(0), cases: [] });
+    resolveScopedCompetitors([{ ...COMPETITORS[0], id: 'scoped-competitor', name: 'Riverside Family Dental' }]);
+
+    await screen.findByText('Riverside Family Dental');
+    expect(figureUnder('Signals loaded')).toBe('1');
+    expect(figureUnder('Open reputation cases')).toBe('0');
+    expect(screen.getByText(/Every total, signal, timeline entry, and competitor record below is scoped to Riverside Clinic/)).toBeInTheDocument();
+  });
 });
 
 /**
@@ -376,5 +433,33 @@ describe('ClinicRadar signal timeline', () => {
     expect(screen.queryByText(/loaded detections\./)).not.toBeInTheDocument();
     // Two rows, one connector.
     expect(document.querySelectorAll('div.w-px')).toHaveLength(1);
+  });
+
+  it('orders the combined timeline by detection time across both feeds', async () => {
+    respond = answerAll();
+    renderPage();
+
+    await screen.findByText('Signals loaded');
+    const card = screen.getByRole('heading', { name: 'Signal Timeline' }).closest('.cc-card');
+    expect(card).not.toBeNull();
+    const text = card?.textContent ?? '';
+    // The competitor fixture is 21 Aug; the reputation case is 20 Aug.
+    expect(text.indexOf('Northside Dental')).toBeLessThan(text.indexOf('Riverside Clinic'));
+  });
+});
+
+describe('ClinicRadar destination access', () => {
+  it('does not offer actions into modules the current role cannot open', async () => {
+    sessionState.user.effectivePermissions = ['operations:read', 'crm:read'];
+    respond = answerAll();
+    renderPage();
+
+    await screen.findByText('Signals loaded');
+    // Reputation is covered by crm:read, but the competitor action requires
+    // campaign:read and is therefore withheld.
+    expect(screen.getAllByRole('button', { name: 'Review action' })).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Review win-back campaign setup' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review scheduling gaps' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review missed-call queue' })).not.toBeInTheDocument();
   });
 });

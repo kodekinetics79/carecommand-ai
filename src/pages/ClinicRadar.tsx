@@ -12,6 +12,8 @@ import { fetchList } from '../lib/apiAdapters';
 import { LOADING_STATE, receivedData, type ResourceState } from '../lib/resourceState';
 import { useResource } from '../hooks/useResource';
 import { formatRatingThreshold, growthPolicyProvenance, loadGrowthPolicy, type GrowthPolicy } from '../lib/growthPolicy';
+import { useSession } from '../hooks/useSession';
+import { canOpenPath } from '../lib/access';
 
 interface ApiBranchOption { id: string; name: string }
 
@@ -28,7 +30,7 @@ interface ApiCompetitorRadar {
   opportunityAlert: string;
   marketOpeningRecommendation: string;
   createdAt: string;
-  branch: { name: string };
+  branch: { id: string; name: string };
   insights: Array<{ theme: string; complaintCount: number; summary: string }>;
 }
 
@@ -95,10 +97,10 @@ const categoryColor: Record<RadarCategory, { bg: string; text: string; dot: stri
   reputation: { bg: 'bg-[var(--amber-soft)]',  text: 'text-amber-v',  dot: 'bg-amber-500' },
 };
 
-const severityConfig: Record<AlertSeverity, { border: string; glow: string }> = {
-  high:   { border: 'border-l-red-500',   glow: 'shadow-red-500/5' },
-  medium: { border: 'border-l-amber-500', glow: 'shadow-amber-500/5' },
-  low:    { border: 'border-l-[var(--b2)]', glow: '' },
+const severityConfig: Record<AlertSeverity, string> = {
+  high: 'ring-1 ring-red-500/10 shadow-sm shadow-red-500/5',
+  medium: 'ring-1 ring-amber-500/10 shadow-sm shadow-amber-500/5',
+  low: '',
 };
 
 /**
@@ -166,8 +168,6 @@ const TIMELINE_ROW_COUNT = 6;
 // Module-scope loaders and paths: useResource keys a request by the identity of
 // its source, so these must not be re-created on every render.
 const loadBranches = (signal: AbortSignal) => fetchList<ApiBranchOption>('/v1/branches?limit=100', signal);
-const loadCompetitors = (signal: AbortSignal) => fetchList<ApiCompetitorRadar>(`/v1/competitors/radar?limit=${RADAR_PAGE_SIZE}`, signal);
-const REPUTATION_PATH = `/v1/reputation?limit=${RADAR_PAGE_SIZE}`;
 
 /**
  * Two feeds, one claim. See the note on the twin helper in Reviews.tsx: a count
@@ -212,20 +212,24 @@ function combineThree<A, B, C, R>(
 
 export default function ClinicRadar() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const [selectedBranchId, setSelectedBranchId] = useState<'all' | string>('all');
+  const branchQuery = selectedBranchId === 'all' ? '' : `&branchId=${encodeURIComponent(selectedBranchId)}`;
+  const reputationPath = `/v1/reputation?limit=${RADAR_PAGE_SIZE}${branchQuery}`;
+  const competitorPath = `/v1/competitors/radar?limit=${RADAR_PAGE_SIZE}${branchQuery}`;
   // Four independent requests rather than one Promise.all: a user who can read
   // reputation but not the competitor radar (or the reverse) now sees the half
   // they are entitled to, with a named failure and a retry beside the half they
   // are not, instead of the whole screen collapsing to a single error.
   const branches = useResource<ApiBranchOption[]>(loadBranches);
-  const reputation = useResource<ReputationResponse>(REPUTATION_PATH);
-  const competitors = useResource<ApiCompetitorRadar[]>(loadCompetitors);
+  const reputation = useResource<ReputationResponse>(reputationPath);
+  const competitors = useResource<ApiCompetitorRadar[]>(competitorPath);
   // The bands every severity on this page is decided by. A fourth feed, held to
   // the same contract: no band, no severity, and no count of severities.
   const policy = useResource<GrowthPolicy>(loadGrowthPolicy);
 
   const [activeCategory, setActiveCategory] = useState<RadarCategory | 'all'>('all');
   const [activeTab, setActiveTab] = useState<'all' | 'risk'>('all');
-  const [selectedBranchId, setSelectedBranchId] = useState<'all' | string>('all');
 
   // Memoised so the empty-list fallback keeps one identity: it is a dependency
   // of the filter memo below, and a fresh [] on every render would re-run it.
@@ -261,24 +265,26 @@ export default function ClinicRadar() {
       // rating on file.
       description: `${competitor.reviewVolume} reviews recorded, ${rating === null ? 'no rating on file' : `${rating.toFixed(1)} rating`}${themes ? `. Recorded complaint themes: ${themes}` : '.'}`,
       action: competitor.marketOpeningRecommendation,
+      branchId: competitor.branch.id,
       branchName: competitor.branch.name,
       createdAt: competitor.createdAt,
     };
   })), [receivedCompetitors, receivedPolicy]);
 
-  const signals = useMemo(() => [...reputationSignals, ...competitorSignals], [competitorSignals, reputationSignals]);
+  const signals = useMemo(
+    () => [...reputationSignals, ...competitorSignals]
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
+    [competitorSignals, reputationSignals],
+  );
 
   const filtered = useMemo(() => {
     let list = activeCategory === 'all' ? signals : signals.filter(a => a.category === activeCategory);
     if (activeTab === 'risk') list = list.filter(a => a.severity === 'high' || a.severity === 'medium');
-    if (selectedBranchId !== 'all') {
-      const branchName = branchOptions.find(branch => branch.id === selectedBranchId)?.name;
-      list = list.filter(a => a.branchId === selectedBranchId || (branchName && a.branchName === branchName));
-    }
     return [...list].sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
-  }, [activeCategory, activeTab, selectedBranchId, branchOptions, signals]);
+  }, [activeCategory, activeTab, signals]);
 
-  const selectedBranchName = selectedBranchId === 'all' ? 'All clinics' : branchOptions.find(branch => branch.id === selectedBranchId)?.name ?? 'All clinics';
+  const canChooseClinic = !user?.branchId;
+  const selectedBranchName = user?.branch?.name ?? (selectedBranchId === 'all' ? 'All clinics' : branchOptions.find(branch => branch.id === selectedBranchId)?.name ?? 'Selected clinic');
 
   // The counts above the board are claims spanning every feed: a total drawn
   // from some of them is not a total, and a severity split drawn without the
@@ -302,8 +308,8 @@ export default function ClinicRadar() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="ClinicRadar"
-        subtitle="Your reputation cases and nearby competitor records, ranked as signals so you can decide what to act on."
+        title="Insights"
+        subtitle="Reputation and local-market signals for the current clinic scope, ranked by your configured thresholds."
         badge={
           signalTotals.status === 'loading' ? 'Loading signals'
             : signalTotals.status === 'error' ? 'Data unavailable'
@@ -321,6 +327,14 @@ export default function ClinicRadar() {
         }
       />
 
+      <div role="note" className="flex items-start gap-3 rounded-2xl border border-[var(--b1)] bg-[var(--amber-soft)] px-4 py-3 text-sm text-t2">
+        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-v" aria-hidden="true" />
+        <div>
+          <p className="font-semibold text-t1">Stored workspace intelligence — not live market research</p>
+          <p className="mt-0.5 text-xs text-t3">Competitor ratings, offers, distances, and complaint themes come from records saved in this workspace. CareCommand does not independently verify or refresh them; confirm the source and date before using them in patient, sales, or strategy decisions.</p>
+        </div>
+      </div>
+
       {/* Summary KPI strip */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <ResourceSection
@@ -337,7 +351,7 @@ export default function ClinicRadar() {
               <div className="bg-[var(--s2)] rounded-2xl border border-[var(--b1)] p-4">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Signals loaded</p>
                 <p className="text-2xl font-bold text-t1 tabular-nums">{totals.total}</p>
-                <p className="text-xs text-t3 mt-0.5">Most recent {RADAR_PAGE_SIZE} reputation cases and {RADAR_PAGE_SIZE} competitor records</p>
+                <p className="text-xs text-t3 mt-0.5">Up to {RADAR_PAGE_SIZE} prioritized reputation cases and {RADAR_PAGE_SIZE} ranked competitor records · {selectedBranchName}</p>
               </div>
               <div className="bg-[var(--red-soft)] rounded-2xl border border-[var(--b1)] p-4">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-red-v mb-2">High Priority</p>
@@ -389,16 +403,18 @@ export default function ClinicRadar() {
 
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-3">
         <p className="text-xs font-semibold text-t2">Clinic</p>
-        <select
-          aria-label="Clinic"
-          value={selectedBranchId}
-          onChange={e => setSelectedBranchId(e.target.value)}
-          className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t1 outline-none"
-        >
-          <option value="all">All clinics</option>
-          {branchOptions.map(branch => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
-        </select>
-        <p className="text-xs text-t2">Showing signals for {selectedBranchName}.</p>
+        {canChooseClinic ? (
+          <select
+            aria-label="Clinic scope"
+            value={selectedBranchId}
+            onChange={e => setSelectedBranchId(e.target.value)}
+            className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t1 outline-none"
+          >
+            <option value="all">All clinics</option>
+            {branchOptions.map(branch => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
+          </select>
+        ) : <span className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1">{selectedBranchName}</span>}
+        <p className="text-xs text-t2">Every total, signal, timeline entry, and competitor record below is scoped to {selectedBranchName}.</p>
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
@@ -450,19 +466,19 @@ export default function ClinicRadar() {
             >
               {rows => {
                 if (rows.length === 0) {
-                  const filtersActive = activeCategory !== 'all' || activeTab !== 'all' || selectedBranchId !== 'all';
+                  const filtersActive = activeCategory !== 'all' || activeTab !== 'all';
                   return filtersActive ? (
                     <EmptyStatePremium
                       icon={<Filter className="w-5 h-5" />}
                       title="No signals match these filters"
-                      description={`${signals.length} signal${signals.length === 1 ? ' is' : 's are'} loaded, and none match the current clinic, category and severity selection. Clear the filters to see all of them.`}
-                      cta={{ label: 'Clear filters', onClick: () => { setActiveCategory('all'); setActiveTab('all'); setSelectedBranchId('all'); } }}
+                      description={`${signals.length} signal${signals.length === 1 ? ' is' : 's are'} loaded for ${selectedBranchName}, and none match the current category and severity selection. Clear those filters to see the full scoped set.`}
+                      cta={{ label: 'Clear filters', onClick: () => { setActiveCategory('all'); setActiveTab('all'); } }}
                     />
                   ) : (
                     <EmptyStatePremium
                       icon={<Radar className="w-5 h-5" />}
                       title="No signals recorded"
-                      description="Both feeds loaded and this workspace has no reputation cases or competitor records on file. Nothing needs action right now — new cases and competitor records appear here as they are recorded."
+                      description={`Both feeds loaded and ${selectedBranchName} has no reputation cases or competitor records in the current result. New records appear here as they are recorded.`}
                       cta={{ label: 'Refresh signals', onClick: reloadSignals }}
                     />
                   );
@@ -471,9 +487,10 @@ export default function ClinicRadar() {
                   <div className="space-y-3">
                     {rows.map((alert) => {
                       const cat = categoryColor[alert.category];
-                      const sev = severityConfig[alert.severity];
+                      const severityClass = severityConfig[alert.severity];
+                      const actionPath = alert.category === 'reputation' ? '/reviews' : '/campaigns';
                       return (
-                        <div key={alert.id} className={`rounded-2xl border border-[var(--b1)] border-l-2 p-4 hover:bg-[var(--s3)] transition-all ${sev.border} ${sev.glow}`}>
+                        <div key={alert.id} className={`rounded-2xl border border-[var(--b1)] p-4 hover:bg-[var(--s3)] transition-all ${severityClass}`}>
                           <div className="flex items-start gap-3">
                             <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${cat.bg}`}>
                               <span className={`w-2.5 h-2.5 rounded-full ${cat.dot}`} />
@@ -497,13 +514,15 @@ export default function ClinicRadar() {
 
                               <div className="flex items-center justify-end gap-3">
                                 <div className="flex items-center gap-2">
-                                  <button
-                                    type="button"
-                                    onClick={() => navigate(alert.category === 'reputation' ? '/reviews' : '/campaigner')}
-                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors"
-                                  >
-                                    <Zap className="w-3 h-3" /> Review action
-                                  </button>
+                                  {canOpenPath(user, actionPath) && (
+                                    <button
+                                      type="button"
+                                      onClick={() => navigate(actionPath)}
+                                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors"
+                                    >
+                                      <Zap className="w-3 h-3" /> Review action
+                                    </button>
+                                  )}
                                 </div>
                               </div>
 
@@ -540,21 +559,9 @@ export default function ClinicRadar() {
                 description: 'The competitor radar loaded and this workspace has no competitor records on file yet.',
               }}
             >
-              {rows => {
-                const visible = selectedBranchId === 'all' ? rows : rows.filter(competitor => competitor.branch.name === selectedBranchName);
-                if (visible.length === 0) {
-                  return (
-                    <EmptyStatePremium
-                      icon={<Filter className="w-5 h-5" />}
-                      title="No competitors for this clinic"
-                      description={`${rows.length} competitor record${rows.length === 1 ? ' is' : 's are'} loaded, and none are recorded against ${selectedBranchName}. Switch back to all clinics to see them.`}
-                      cta={{ label: 'Show all clinics', onClick: () => setSelectedBranchId('all') }}
-                    />
-                  );
-                }
-                return (
+              {rows => (
                   <div className="space-y-3">
-                    {visible.map((competitor) => {
+                    {rows.map((competitor) => {
                       const rating = competitorRating(competitor.googleRating);
                       return (
                         <div key={competitor.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
@@ -562,6 +569,7 @@ export default function ClinicRadar() {
                             <div className="min-w-0">
                               <p className="text-sm font-bold text-t1">{competitor.name}</p>
                               <p className="text-[10px] text-t3 mt-0.5">{competitor.branch.name} · {competitor.distanceKm} km away</p>
+                              <p className="text-[10px] text-t3 mt-0.5">Recorded {new Date(competitor.createdAt).toLocaleDateString()}</p>
                             </div>
                             <div className="text-right shrink-0">
                               {/* An unset googleRating is "0" in the database,
@@ -587,8 +595,7 @@ export default function ClinicRadar() {
                       );
                     })}
                   </div>
-                );
-              }}
+              )}
             </ResourceSection>
           </BentoCard>
 
@@ -606,7 +613,7 @@ export default function ClinicRadar() {
             >
               {rows => (
                 <div className="space-y-3">
-                  {rows.map((branch) => {
+                  {rows.filter(branch => selectedBranchId === 'all' || branch.id === selectedBranchId).map((branch) => {
                     const signalCount = signals.filter(signal => signal.branchId === branch.id || signal.branchName === branch.name).length;
                     return (
                       <div key={branch.id}>
@@ -694,11 +701,11 @@ export default function ClinicRadar() {
           <BentoCard title="Quick Actions" subtitle="Common commands">
             <div className="space-y-2">
               {[
-                { label: 'Review win-back campaign setup', icon: <Sparkles className="w-3.5 h-3.5" />, action: () => navigate('/campaigner') },
-                { label: 'Review scheduling gaps', icon: <AlertCircle className="w-3.5 h-3.5" />, action: () => navigate('/scheduling') },
-                { label: 'Review missed-call queue', icon: <TrendingUp className="w-3.5 h-3.5" />, action: () => navigate('/ai-receptionist') },
-              ].map((a) => (
-                <button key={a.label} type="button" onClick={a.action} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all text-left group">
+                { label: 'Review win-back campaign setup', path: '/campaigns', icon: <Sparkles className="w-3.5 h-3.5" /> },
+                { label: 'Review scheduling gaps', path: '/scheduling', icon: <AlertCircle className="w-3.5 h-3.5" /> },
+                { label: 'Review missed-call queue', path: '/ai-receptionist', icon: <TrendingUp className="w-3.5 h-3.5" /> },
+              ].filter(a => canOpenPath(user, a.path)).map((a) => (
+                <button key={a.label} type="button" onClick={() => navigate(a.path)} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all text-left group">
                   <div className="text-t3 group-hover:text-indigo transition-colors">{a.icon}</div>
                   <span className="text-xs font-semibold text-t2 group-hover:text-t1 transition-colors flex-1">{a.label}</span>
                   <ArrowRight className="w-3.5 h-3.5 text-t3 group-hover:text-indigo transition-all" />

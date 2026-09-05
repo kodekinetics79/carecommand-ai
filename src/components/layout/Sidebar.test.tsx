@@ -47,21 +47,21 @@ beforeEach(() => {
 afterEach(() => { resetFrontDeskPollForTests(); });
 
 const renderSidebar = () => render(<MemoryRouter><Sidebar /></MemoryRouter>);
-const frontDeskLink = () => screen.getByRole('link', { name: /Front Desk/ });
+const frontDeskLink = () => screen.getByRole('link', { name: /Work Queue/ });
 
-describe('Sidebar Front Desk entry', () => {
-  it('offers Front Desk and Receptionist Studio to a role that holds their grants', async () => {
+describe('Sidebar Work Queue entry', () => {
+  it('offers Work Queue to a role that holds the Front Desk grants', async () => {
     apiRequestMock.mockResolvedValue(summary());
     renderSidebar();
     expect(frontDeskLink()).toHaveAttribute('href', '/front-desk');
     await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith('/v1/tasks/summary'));
   });
 
-  it('hides Front Desk from a role without receptionist:call-artifacts:read', () => {
+  it('hides Work Queue from a role without receptionist:call-artifacts:read', () => {
     signedIn(['staff:read']);
     apiRequestMock.mockResolvedValue(summary());
     renderSidebar();
-    expect(screen.queryByRole('link', { name: /Front Desk/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Work Queue/ })).not.toBeInTheDocument();
     // …and it never asks for a summary it is not allowed to read.
     expect(apiRequestMock).not.toHaveBeenCalledWith('/v1/tasks/summary');
   });
@@ -74,11 +74,11 @@ describe('Sidebar Front Desk entry', () => {
    * every lane answered 403, with a badge polling that same 403 every 20s from
    * every screen in the app.
    */
-  it('hides Front Desk from a role that may read call artifacts but holds no staff grant', () => {
+  it('hides Work Queue from a role that may read call artifacts but holds no staff grant', () => {
     signedIn(['receptionist:call-artifacts:read', 'receptionist:recordings:read', 'compliance:read', 'audit:read']);
     apiRequestMock.mockResolvedValue(summary());
     renderSidebar();
-    expect(screen.queryByRole('link', { name: /Front Desk/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Work Queue/ })).not.toBeInTheDocument();
     expect(apiRequestMock).not.toHaveBeenCalledWith('/v1/tasks/summary');
   });
 
@@ -140,5 +140,33 @@ describe('Sidebar Front Desk entry', () => {
     renderSidebar();
     await waitFor(() => expect(apiRequestMock).toHaveBeenCalled());
     expect(within(frontDeskLink()).queryByText(/^\d+$/)).not.toBeInTheDocument();
+  });
+});
+
+describe('Sidebar Insights entry', () => {
+  it('requires both operations and reputation access for the combined board', () => {
+    signedIn(['operations:read']);
+    apiRequestMock.mockResolvedValue(summary());
+    const { unmount } = renderSidebar();
+    expect(screen.queryByRole('link', { name: 'Insights' })).not.toBeInTheDocument();
+    unmount();
+
+    signedIn(['operations:read', 'crm:read']);
+    renderSidebar();
+    expect(screen.getByRole('link', { name: 'Insights' })).toHaveAttribute('href', '/clinic-radar');
+  });
+});
+
+describe('Sidebar Communications entry', () => {
+  it('offers Communications only when both message and call-artifact reads are granted', () => {
+    signedIn(['crm:read', 'receptionist:call-artifacts:read']);
+    renderSidebar();
+    expect(screen.getByRole('link', { name: 'Communications' })).toHaveAttribute('href', '/ai-receptionist');
+  });
+
+  it('hides Communications from a CRM-only role that cannot read call artifacts', () => {
+    signedIn(['crm:read']);
+    renderSidebar();
+    expect(screen.queryByRole('link', { name: 'Communications' })).not.toBeInTheDocument();
   });
 });

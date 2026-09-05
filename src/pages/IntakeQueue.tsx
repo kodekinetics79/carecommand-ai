@@ -1,26 +1,59 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ClipboardList, Loader2, CheckCircle2, AlertCircle, Copy, Check, RefreshCw, FileText, Send } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import ModuleTabs from '../components/ui/ModuleTabs';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 import { apiRequest } from '../lib/api';
-import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
+import type { ApiPatient } from '../lib/apiAdapters';
 import {
   intakeApi, intakeLink, INTAKE_STATUS_META, SECTION_LABEL,
   type IntakePacket, type IntakePacketDetail,
 } from '../lib/intake';
 
+type PatientPage = { data: ApiPatient[]; nextCursor?: string };
+
+function maskedContact(patient: ApiPatient): string | null {
+  const digits = patient.phone?.replace(/\D/g, '') ?? '';
+  if (digits.length >= 4) return `phone ending ${digits.slice(-4)}`;
+  if (patient.email) {
+    const [local, domain] = patient.email.split('@');
+    if (local && domain) return `${local.slice(0, 1)}***@${domain}`;
+  }
+  return null;
+}
+
+function patientOptionLabel(patient: ApiPatient): string {
+  const identity = [
+    patient.branch?.name,
+    patient.externalRef ? `ref ${patient.externalRef}` : null,
+    patient.dateOfBirth ? `DOB ${patient.dateOfBirth.slice(0, 10)}` : null,
+    maskedContact(patient),
+  ].filter((value): value is string => Boolean(value));
+  return `${patient.firstName} ${patient.lastName} · ${identity.join(' · ') || `record ${patient.id.slice(0, 8)}`}`;
+}
+
 export default function IntakeQueue() {
+  const { user } = useSession();
+  const canWrite = hasPermission(user, 'intake:write');
   const [packets, setPackets] = useState<IntakePacket[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string>('');
   const [tab, setTab] = useState<'queue' | 'all'>('queue');
   // Originate a new intake for a patient (createPacket) directly from the queue.
-  const [patients, setPatients] = useState<ReturnType<typeof mapPatient>[]>([]);
+  const [patients, setPatients] = useState<ApiPatient[]>([]);
+  const [patientSearch, setPatientSearch] = useState('');
+  const patientSearchRef = useRef('');
+  const [patientsLoading, setPatientsLoading] = useState(false);
+  const [patientsLoadingMore, setPatientsLoadingMore] = useState(false);
+  const [patientNextCursor, setPatientNextCursor] = useState<string | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
+  const [patientLoadMoreError, setPatientLoadMoreError] = useState<string | null>(null);
   const [originatePatientId, setOriginatePatientId] = useState('');
   const [originating, setOriginating] = useState(false);
   const [originateNotice, setOriginateNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+  const [originatedLink, setOriginatedLink] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -54,34 +87,74 @@ export default function IntakeQueue() {
 
   useEffect(() => {
     let active = true;
-    void (async () => {
+    const timer = setTimeout(() => void (async () => {
+      setPatientsLoading(true);
+      setPatientsLoadingMore(false);
+      setPatientNextCursor(null);
+      setPatientLoadError(null);
+      setPatientLoadMoreError(null);
       try {
-        // limit=200 exceeded the server's cap of 100, so this always returned
-        // 400 VALIDATION_ERROR. The empty catch then swallowed it, leaving the
-        // patient picker permanently empty and "Send intake" unusable with no
-        // sign anything was wrong.
-        const res = await apiRequest<{ data: ApiPatient[] } | ApiPatient[]>('/v1/patients?limit=100');
+        const query = new URLSearchParams({ limit: '25' });
+        if (patientSearch.trim()) query.set('search', patientSearch.trim());
+        const res = await apiRequest<PatientPage | ApiPatient[]>(`/v1/patients?${query.toString()}`);
         const rows = Array.isArray(res) ? res : res.data;
-        if (active) setPatients(rows.map(mapPatient));
+        if (active) {
+          setPatients(rows);
+          setPatientNextCursor(Array.isArray(res) ? null : res.nextCursor ?? null);
+          setPatientLoadError(null);
+        }
       } catch (error) {
-        // Still non-fatal for the queue itself, but never silent: without a
-        // patient list the originate control cannot work, and the user needs
-        // to know that rather than face a picker that is simply empty.
         if (active) setPatientLoadError(error instanceof Error ? error.message : 'Could not load the patient list.');
+      } finally {
+        if (active) setPatientsLoading(false);
       }
-    })();
-    return () => { active = false; };
-  }, []);
+    })(), patientSearch ? 250 : 0);
+    return () => { active = false; clearTimeout(timer); };
+  }, [patientSearch]);
+
+  async function loadMorePatients() {
+    if (!patientNextCursor || patientsLoadingMore) return;
+    const searched = patientSearch.trim();
+    setPatientsLoadingMore(true);
+    setPatientLoadMoreError(null);
+    try {
+      const query = new URLSearchParams({ limit: '25', cursor: patientNextCursor });
+      if (searched) query.set('search', searched);
+      const res = await apiRequest<PatientPage | ApiPatient[]>(`/v1/patients?${query.toString()}`);
+      if (patientSearchRef.current.trim() !== searched) return;
+      const rows = Array.isArray(res) ? res : res.data;
+      setPatients(current => {
+        const byId = new Map(current.map(patient => [patient.id, patient]));
+        rows.forEach(patient => byId.set(patient.id, patient));
+        return [...byId.values()];
+      });
+      setPatientNextCursor(Array.isArray(res) ? null : res.nextCursor ?? null);
+    } catch (error) {
+      if (patientSearchRef.current.trim() === searched) {
+        setPatientLoadMoreError(error instanceof Error ? error.message : 'Could not load more matching patients.');
+      }
+    } finally {
+      if (patientSearchRef.current.trim() === searched) setPatientsLoadingMore(false);
+    }
+  }
 
   async function originateIntake() {
     if (!originatePatientId) return;
     setOriginating(true);
     setOriginateNotice(null);
+    setOriginatedLink(null);
     try {
       const packet = await intakeApi.createPacket({ patientId: originatePatientId, source: 'staff' });
       const link = intakeLink(packet.publicUrl, packet.publicToken);
-      if (link) await navigator.clipboard.writeText(link).catch(() => undefined);
-      setOriginateNotice({ kind: 'ok', text: link ? 'Intake link created and copied to clipboard.' : 'Intake packet created.' });
+      let copied = false;
+      if (link) {
+        try { await navigator.clipboard.writeText(link); copied = true; }
+        catch { setOriginatedLink(link); }
+      }
+      setOriginateNotice({
+        kind: 'ok',
+        text: !link ? 'Intake packet created.' : copied ? 'Intake link created and copied to clipboard.' : 'Intake link created. Clipboard access was unavailable; copy the link below.',
+      });
       setOriginatePatientId('');
       await reload();
       if (packet.intakePacketId) { setTab('all'); setSelectedId(packet.intakePacketId); }
@@ -102,19 +175,44 @@ export default function IntakeQueue() {
           onChange={id => setTab(id as 'queue' | 'all')}
           ariaLabel="Intake packet views"
         />
-        {/* Originate a new intake for a patient (createPacket). */}
-        <div className="flex items-center gap-2 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
-          <select aria-label="Patient for new intake" value={originatePatientId} onChange={e => setOriginatePatientId(e.target.value)} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs text-t1 outline-none max-w-[200px]">
-            <option value="">Send intake to…</option>
-            {patients.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select>
-          <button type="button" disabled={!originatePatientId || originating} onClick={() => void originateIntake()} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
-            <Send className="w-3.5 h-3.5" /> {originating ? 'Sending…' : 'Send intake'}
-          </button>
-        </div>
+        {canWrite && (
+          <div className="flex flex-wrap items-center gap-2 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
+            <input
+              type="search"
+              aria-label="Search patients for new intake"
+              value={patientSearch}
+              onChange={event => { patientSearchRef.current = event.target.value; setPatientSearch(event.target.value); setOriginatePatientId(''); }}
+              placeholder="Search patient…"
+              className="w-44 px-2.5 py-1.5 rounded-lg bg-white border border-[var(--b1)] text-xs text-t1 outline-none"
+            />
+            <select aria-label="Patient for new intake" value={originatePatientId} onChange={e => setOriginatePatientId(e.target.value)} disabled={patientsLoading || !!patientLoadError} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs text-t1 outline-none max-w-[220px] disabled:opacity-50">
+              <option value="">{patientsLoading ? 'Searching…' : patients.length ? 'Select patient…' : 'No matching patients'}</option>
+              {patients.map(patient => <option key={patient.id} value={patient.id}>{patientOptionLabel(patient)}</option>)}
+            </select>
+            {patientNextCursor && (
+              <button type="button" onClick={() => void loadMorePatients()} disabled={patientsLoadingMore} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs font-semibold text-t2 hover:bg-[var(--s2)] transition disabled:opacity-40">
+                {patientsLoadingMore && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                {patientsLoadingMore ? 'Loading…' : patientSearch.trim() ? 'Load more matches' : 'Load more patients'}
+              </button>
+            )}
+            <button type="button" disabled={!originatePatientId || originating} onClick={() => void originateIntake()} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
+              <Send className="w-3.5 h-3.5" /> {originating ? 'Creating…' : 'Create & copy link'}
+            </button>
+          </div>
+        )}
       </div>
       {patientLoadError && <p role="alert" className="text-xs font-semibold text-red-v">Patient list unavailable, so a new intake cannot be started right now. {patientLoadError}</p>}
+      {patientLoadMoreError && <p role="alert" className="text-xs font-semibold text-red-v">More matching patients could not be loaded. The results already shown remain available. {patientLoadMoreError}</p>}
       {originateNotice && <p role={originateNotice.kind === 'error' ? 'alert' : 'status'} className={`text-xs font-semibold ${originateNotice.kind === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>{originateNotice.text}</p>}
+      {originatedLink && (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+          <input aria-label="New intake link" readOnly value={originatedLink} className="min-w-0 flex-1 rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-xs text-t1" />
+          <button type="button" onClick={async () => {
+            try { await navigator.clipboard.writeText(originatedLink); setOriginateNotice({ kind: 'ok', text: 'Intake link copied to clipboard.' }); setOriginatedLink(null); }
+            catch { setOriginateNotice({ kind: 'error', text: 'Clipboard access is still unavailable. Select and copy the link manually.' }); }
+          }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-xs font-semibold text-t2"><Copy className="w-3.5 h-3.5" /> Copy link</button>
+        </div>
+      )}
       {error && <p role="alert" className="text-sm text-red-v">{error}</p>}
       {loading ? (
         <div className="cc-card p-10 text-center text-sm text-t3" role="status" aria-label="Loading intake packets"><Loader2 className="inline w-5 h-5 animate-spin" /></div>
@@ -137,14 +235,14 @@ export default function IntakeQueue() {
               );
             })}
           </div>
-          <div>{selectedId ? <PacketDetail key={selectedId} id={selectedId} onChanged={reload} /> : <div className="cc-card p-10 text-center text-sm text-t3">Select an intake packet.</div>}</div>
+          <div>{selectedId ? <PacketDetail key={selectedId} id={selectedId} onChanged={reload} canWrite={canWrite} /> : <div className="cc-card p-10 text-center text-sm text-t3">Select an intake packet.</div>}</div>
         </div>
       )}
     </div>
   );
 }
 
-function PacketDetail({ id, onChanged }: { id: string; onChanged: () => void }) {
+function PacketDetail({ id, onChanged, canWrite }: { id: string; onChanged: () => void; canWrite: boolean }) {
   const [packet, setPacket] = useState<IntakePacketDetail | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -180,17 +278,20 @@ function PacketDetail({ id, onChanged }: { id: string; onChanged: () => void }) 
         {notice && <p className="text-[11px] text-emerald-v">{notice}</p>}
         {error && <p className="text-[11px] text-red-v">{error}</p>}
         <div className="flex flex-wrap gap-2">
-          {packet.allowedActions.includes('approve') && (
+          {canWrite && packet.allowedActions.includes('approve') && (
             <button type="button" disabled={busy || !packet.subject.name} title={!packet.subject.name ? 'Resolve the patient or lead identity before approval.' : undefined} onClick={() => run(async () => { await intakeApi.review(id, 'approve'); setNotice('Packet approved.'); await load(); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><CheckCircle2 className="w-3.5 h-3.5" /> Approve</button>
           )}
-          {packet.allowedActions.includes('mark_needs_review') && (
+          {canWrite && packet.allowedActions.includes('mark_needs_review') && (
             <button type="button" disabled={busy} onClick={() => run(async () => { await intakeApi.review(id, 'needs_review'); setNotice('Marked needs review.'); await load(); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><AlertCircle className="w-3.5 h-3.5" /> Needs review</button>
           )}
-          {packet.allowedActions.includes('resend') && (
+          {canWrite && packet.allowedActions.includes('resend') && (
             <button type="button" disabled={busy} onClick={() => run(async () => { const r = await intakeApi.resend(id); setLink(intakeLink(r.publicUrl, r.publicToken)); setNotice('New intake link generated. Share it with the patient — the clinic does not send it for you.'); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><RefreshCw className="w-3.5 h-3.5" /> Resend link</button>
           )}
           {link && (
-            <button type="button" onClick={async () => { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 1500); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]">{copied ? <Check className="w-3.5 h-3.5 text-emerald-v" /> : <Copy className="w-3.5 h-3.5" />} {copied ? 'Copied' : 'Copy patient link'}</button>
+            <button type="button" onClick={async () => {
+              try { await navigator.clipboard.writeText(link); setCopied(true); setNotice('Patient link copied to clipboard.'); setTimeout(() => setCopied(false), 1500); }
+              catch { setCopied(false); setError('Clipboard access is unavailable. Copy the link from the browser address field or try again after granting clipboard access.'); }
+            }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]">{copied ? <Check className="w-3.5 h-3.5 text-emerald-v" /> : <Copy className="w-3.5 h-3.5" />} {copied ? 'Copied' : 'Copy patient link'}</button>
           )}
         </div>
       </div>

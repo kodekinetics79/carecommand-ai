@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mapReview, type ApiReview, type ReviewRow } from './apiAdapters';
+import { mapReview, mapTelehealthSession, type ApiReview, type ReviewRow } from './apiAdapters';
 
 /**
  * `GET /v1/reviews` returns the stored Review row and nothing else: no author
@@ -125,5 +125,29 @@ describe('mapReview author', () => {
   it('invents no value for the absent draft response', () => {
     expect(mapReview(apiReview({ aiDraftResponse: null })).storedResponse).toBeUndefined();
     expect(mapReview(apiReview({ aiDraftResponse: 'A stored draft.' })).storedResponse).toBe('A stored draft.');
+  });
+});
+
+describe('mapTelehealthSession', () => {
+  it('keeps canceled and no-show appointments distinct from pending work', () => {
+    const base = {
+      id: 'visit-1', patientName: 'Synthetic Patient', service: 'Video consultation',
+      startsAt: '2026-09-02T13:00:00.000Z', provider: 'Dr Synthetic', providerProfileId: 'provider-1',
+      branchName: 'Bright Health Arlington', branchTimezone: 'America/New_York', value: '125',
+      noShowRisk: 0, intakeComplete: false,
+    };
+    expect(mapTelehealthSession({ ...base, status: 'CANCELED' }).status).toBe('Canceled');
+    expect(mapTelehealthSession({ ...base, status: 'NO_SHOW' }).status).toBe('No-show');
+  });
+
+  it('formats the visit in the clinic timezone rather than the browser timezone', () => {
+    const row = mapTelehealthSession({
+      id: 'visit-1', patientName: 'Synthetic Patient', service: 'Video consultation',
+      startsAt: '2026-09-03T01:30:00.000Z', status: 'CONFIRMED', provider: 'Dr Synthetic',
+      providerProfileId: 'provider-1', branchName: 'Bright Health Arlington', branchTimezone: 'America/New_York',
+      value: '125', noShowRisk: 0, intakeComplete: true,
+    });
+    expect(row.date).toBe('2026-09-02');
+    expect(row.time).toBe('9:30 PM');
   });
 });

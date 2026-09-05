@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { campaignRoiFromRow } from './dashboardService';
+import { buildPriorityActions, campaignRoiFromRow } from './dashboardService';
 
 /**
  * The dashboard's campaign row, read honestly.
@@ -77,5 +77,34 @@ describe('campaignRoiFromRow', () => {
     expect(draft.conversionRate).toBeNull();
     expect(draft.attributedRevenue).toBeNull();
     expect(draft.nextAction).toBe('Generate & approve');
+  });
+});
+
+describe('buildPriorityActions', () => {
+  it('reads the persisted Opportunity and included owner shapes', () => {
+    const [action] = buildPriorityActions([{
+      id: 'opp-1', title: 'Recover interrupted scheduling calls', source: 'missed_call',
+      recommendedAction: 'Review the call evidence.', expectedRevenue: '3200.00', confidence: 92, urgency: 'high',
+      updatedAt: '2026-09-01T13:30:00.000Z',
+      ownerUser: { displayName: 'Central Front Desk' },
+    }], []);
+
+    expect(action).toMatchObject({
+      title: 'Recover interrupted scheduling calls', description: 'Review the call evidence.',
+      category: 'missed_calls', severity: 'high', revenueImpact: 3200,
+      confidence: 92, owner: 'Central Front Desk', updatedAt: '2026-09-01T13:30:00.000Z',
+      cta: { label: 'Open AI Front Desk', route: '/ai-receptionist' },
+    });
+  });
+
+  it('reads the included RevenueLeak owner rather than inventing an assignment', () => {
+    const [action] = buildPriorityActions([], [{
+      id: 'leak-1', source: 'Eligibility evidence incomplete', category: 'insurance',
+      evidence: 'Upcoming visits need review.', estimatedValue: '2400.00', confidence: 76,
+      createdAt: '2026-09-01T13:00:00.000Z',
+      ownerUser: { displayName: 'Morgan Lee' },
+    }]);
+
+    expect(action).toMatchObject({ owner: 'Morgan Lee', category: 'insurance', revenueImpact: 2400, updatedAt: '2026-09-01T13:00:00.000Z' });
   });
 });

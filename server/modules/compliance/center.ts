@@ -31,6 +31,7 @@ const idParam = z.object({ id: uuid });
 const CONTROL_STATUSES = ['IMPLEMENTED', 'IN_PROGRESS', 'NOT_IMPLEMENTED', 'NOT_APPLICABLE'] as const;
 const REVIEW_STATUSES = ['PENDING', 'APPROVED', 'REJECTED', 'EXPIRED'] as const;
 const RISK_STATUSES = ['OPEN', 'MITIGATING', 'ACCEPTED', 'CLOSED'] as const;
+const httpsEvidenceUrl = z.string().trim().max(500).url().refine(value => new URL(value).protocol === 'https:', 'Evidence links must use HTTPS');
 
 const STATUS_WEIGHT: Record<string, number> = { IMPLEMENTED: 1, IN_PROGRESS: 0.5, NOT_IMPLEMENTED: 0 };
 
@@ -77,6 +78,82 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
   // compliance_readiness entitlement (in addition to the per-route RBAC below).
   app.addHook('preHandler', requireFeature('compliance_readiness'));
 
+  // Aggregate-only screen-share surface. It intentionally returns no user,
+  // patient, vendor, incident, IP, note, URL, or raw audit-event fields.
+  app.get('/buyer-proof', { preHandler: complianceRead }, async request => {
+    const tenantId = tenant(request);
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 86_400_000);
+    const [tenantRow, frameworks, controls, currentEvidenceLinks, risks, incidents, latestBackup, activeUsers, mfaUsers, policy, recentAuditEventCount] = await Promise.all([
+      db.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
+      db.complianceFramework.findMany({ where: { tenantId } }),
+      db.complianceControl.findMany({ where: { tenantId }, select: { id: true, frameworkId: true, status: true } }),
+      db.complianceControlEvidence.findMany({
+        where: {
+          tenantId,
+          evidence: {
+            deletedAt: null,
+            reviewStatus: 'APPROVED',
+            OR: [{ expiresAt: null }, { expiresAt: { gte: now } }],
+          },
+        },
+        select: { controlId: true },
+      }),
+      db.complianceRisk.findMany({ where: { tenantId }, select: { status: true } }),
+      db.securityIncident.findMany({ where: { tenantId }, select: { status: true } }),
+      db.backupVerification.findFirst({ where: { tenantId }, orderBy: { runAt: 'desc' }, select: { status: true, runAt: true } }),
+      db.user.count({ where: { tenantId, active: true } }),
+      db.user.count({ where: { tenantId, active: true, mfaEnabled: true } }),
+      db.tenantSecurityPolicy.findUnique({ where: { tenantId }, select: { requireMfa: true } }),
+      db.auditEvent.count({ where: { tenantId, occurredAt: { gte: thirtyDaysAgo } } }),
+    ]);
+
+    const eligibleControls = controls.filter(control => control.status !== 'NOT_APPLICABLE');
+    const scoreFor = (frameworkId?: string) => {
+      const subset = (frameworkId ? controls.filter(control => control.frameworkId === frameworkId) : controls)
+        .filter(control => control.status !== 'NOT_APPLICABLE');
+      if (!subset.length) return 0;
+      return Math.round((subset.reduce((sum, control) => sum + (STATUS_WEIGHT[control.status] ?? 0), 0) / subset.length) * 100);
+    };
+    const scoredFrameworks = frameworks.filter(framework => controls.some(control => control.frameworkId === framework.id && control.status !== 'NOT_APPLICABLE'));
+    const weightTotal = scoredFrameworks.reduce((sum, framework) => sum + framework.weight, 0) || 1;
+    const completionPct = Math.round(scoredFrameworks.reduce((sum, framework) => sum + scoreFor(framework.id) * framework.weight, 0) / weightTotal);
+    const evidencedControlIds = new Set(currentEvidenceLinks.map(link => link.controlId));
+
+    return {
+      generatedAt: now.toISOString(),
+      tenantName: tenantRow?.name ?? 'Tenant',
+      dataClassification: 'aggregate_only',
+      controlStatus: {
+        available: eligibleControls.length > 0,
+        completionPct,
+        eligibleControls: eligibleControls.length,
+        evidenceBackedControls: eligibleControls.filter(control => evidencedControlIds.has(control.id)).length,
+      },
+      accessProtection: {
+        mfaEnforced: policy?.requireMfa ?? false,
+        adoptionPct: activeUsers > 0 ? Math.round((mfaUsers / activeUsers) * 100) : 0,
+      },
+      recoveryEvidence: {
+        latestStatus: latestBackup?.status ?? 'unverified',
+        latestRunAt: latestBackup?.runAt.toISOString() ?? null,
+        latestVerified: latestBackup?.status === 'verified',
+      },
+      accountability: { auditEventsLast30Days: recentAuditEventCount },
+      openGaps: {
+        risks: risks.filter(risk => risk.status === 'OPEN' || risk.status === 'MITIGATING').length,
+        incidents: incidents.filter(incident => incident.status === 'open').length,
+        notImplementedControls: controls.filter(control => control.status === 'NOT_IMPLEMENTED').length,
+        controlsWithoutCurrentApprovedEvidence: eligibleControls.filter(control => !evidencedControlIds.has(control.id)).length,
+      },
+      limitations: [
+        'Control-status completion is self-recorded and is not an audit opinion.',
+        'Evidence coverage counts only approved, unexpired evidence linked to an eligible control.',
+        'Deployment-specific safeguards and infrastructure controls still require independent verification.',
+      ],
+    };
+  });
+
   // ===== Dashboard =========================================================
   app.get('/dashboard', { preHandler: complianceRead }, async request => {
     const tenantId = tenant(request);
@@ -110,13 +187,20 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
     };
 
     const frameworkScores = frameworks.map(f => ({ key: f.key, name: f.name, score: scoreFor(f.id) }));
-    const weightTotal = frameworks.reduce((sum, f) => sum + f.weight, 0) || 1;
-    const overall = Math.round(frameworks.reduce((sum, f) => sum + scoreFor(f.id) * f.weight, 0) / weightTotal);
+    const scoredFrameworks = frameworks.filter(framework => controls.some(control => control.frameworkId === framework.id && control.status !== 'NOT_APPLICABLE'));
+    const weightTotal = scoredFrameworks.reduce((sum, f) => sum + f.weight, 0) || 1;
+    const overall = Math.round(scoredFrameworks.reduce((sum, f) => sum + scoreFor(f.id) * f.weight, 0) / weightTotal);
 
     const controlsWithEvidence = new Set(controlEvidenceLinks.map(l => l.controlId));
+    const eligibleControls = controls.filter(c => c.status !== 'NOT_APPLICABLE');
     const missingEvidence = controls.filter(c => c.status !== 'NOT_APPLICABLE' && !controlsWithEvidence.has(c.id)).length;
 
     return {
+      generatedAt: new Date().toISOString(),
+      readinessAvailable: eligibleControls.length > 0,
+      controlCount: controls.length,
+      eligibleControlCount: eligibleControls.length,
+      evidenceLinkedControlCount: eligibleControls.filter(c => controlsWithEvidence.has(c.id)).length,
       overallReadinessScore: overall,
       frameworks: frameworkScores,
       soc2ReadinessPct: byKey('soc2_readiness'),
@@ -201,7 +285,7 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
     ownerUserId: uuid.optional(),
     reviewStatus: z.enum(REVIEW_STATUSES).default('PENDING'),
     sourceType: z.string().trim().max(40).default('manual'),
-    externalUrl: z.string().trim().max(500).optional(),
+    externalUrl: httpsEvidenceUrl.optional(),
     contentHash: z.string().trim().max(128).optional(),
     auditorNotes: z.string().max(2000).optional(),
     expiresAt: z.coerce.date().optional(),
@@ -239,7 +323,7 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
       ownerUserId: uuid.nullable().optional(),
       reviewStatus: z.enum(REVIEW_STATUSES).optional(),
       sourceType: z.string().trim().max(40).optional(),
-      externalUrl: z.string().trim().max(500).nullable().optional(),
+      externalUrl: httpsEvidenceUrl.nullable().optional(),
       contentHash: z.string().trim().max(128).nullable().optional(),
       auditorNotes: z.string().max(2000).nullable().optional(),
       expiresAt: z.coerce.date().nullable().optional(),
@@ -349,27 +433,38 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
       action: z.string().trim().optional(),
       resource: z.string().trim().optional(),
       actorUserId: uuid.optional(),
-      from: z.coerce.date().optional(),
-      to: z.coerce.date().optional(),
+      from: z.string().trim().max(40).refine(value => !Number.isNaN(Date.parse(value)), 'Invalid from date').optional(),
+      to: z.string().trim().max(40).refine(value => !Number.isNaN(Date.parse(value)), 'Invalid to date').optional(),
       limit: z.coerce.number().int().min(1).max(200).default(50),
     }).parse(request.query);
-    const rows = await db.auditEvent.findMany({
-      where: {
-        tenantId: tenant(request),
-        ...(query.action ? { action: query.action } : {}),
-        ...(query.resource ? { resource: query.resource } : {}),
-        ...(query.actorUserId ? { actorUserId: query.actorUserId } : {}),
-        ...(query.from || query.to ? { occurredAt: { ...(query.from ? { gte: query.from } : {}), ...(query.to ? { lte: query.to } : {}) } } : {}),
-      },
-      orderBy: { occurredAt: 'desc' },
-      take: query.limit,
-      include: { actorUser: { select: { displayName: true, email: true, role: true } } },
-    });
-    return rows.map(e => ({
-      id: e.id, action: e.action, resource: e.resource, resourceId: e.resourceId,
-      actor: e.actorUser?.displayName ?? 'System', actorRole: e.actorUser?.role ?? null,
-      ipAddress: e.ipAddress, occurredAt: e.occurredAt.toISOString(), metadata: e.metadata ?? null,
-    }));
+    const from = query.from ? new Date(query.from) : undefined;
+    const to = query.to ? new Date(query.to) : undefined;
+    if (to && /^\d{4}-\d{2}-\d{2}$/.test(query.to ?? '')) to.setUTCHours(23, 59, 59, 999);
+    const where: Prisma.AuditEventWhereInput = {
+      tenantId: tenant(request),
+      ...(query.action ? { action: query.action } : {}),
+      ...(query.resource ? { resource: query.resource } : {}),
+      ...(query.actorUserId ? { actorUserId: query.actorUserId } : {}),
+      ...(from || to ? { occurredAt: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
+    };
+    const [rows, total] = await Promise.all([
+      db.auditEvent.findMany({
+        where,
+        orderBy: { occurredAt: 'desc' },
+        take: query.limit,
+        include: { actorUser: { select: { displayName: true, email: true, role: true } } },
+      }),
+      db.auditEvent.count({ where }),
+    ]);
+    return {
+      total,
+      limit: query.limit,
+      items: rows.map(e => ({
+        id: e.id, action: e.action, resource: e.resource, resourceId: e.resourceId,
+        actor: e.actorUser?.displayName ?? 'System', actorRole: e.actorUser?.role ?? null,
+        ipAddress: e.ipAddress, occurredAt: e.occurredAt.toISOString(), metadata: e.metadata ?? null,
+      })),
+    };
   });
 
   // ===== Reports (real data where available; truthful placeholders else) ===
@@ -457,7 +552,7 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
   app.get('/reports/backup-status', { preHandler: complianceRead }, async request => {
     const rows = await db.backupVerification.findMany({ where: { tenantId: tenant(request) }, orderBy: { runAt: 'desc' }, take: 30 });
     if (!rows.length) return { integrated: false, status: 'unverified', records: [], note: 'No automated backup verification integration yet.' };
-    return { integrated: rows.some(r => r.status === 'verified'), status: rows[0].status, records: rows.map(r => ({ id: r.id, runAt: r.runAt.toISOString(), type: r.type, status: r.status, location: r.location })) };
+    return { integrated: rows[0].status === 'verified', status: rows[0].status, records: rows.map(r => ({ id: r.id, runAt: r.runAt.toISOString(), type: r.type, status: r.status, location: r.location })), note: rows[0].status === 'verified' ? 'The latest recorded backup verification passed.' : 'The latest recorded backup verification did not pass.' };
   });
 
   app.get('/reports/deployment-history', { preHandler: complianceRead }, async () => {
@@ -475,14 +570,22 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
   });
 
   app.get('/reports/incident-response', { preHandler: complianceRead }, async request => {
-    const rows = await db.securityIncident.findMany({ where: { tenantId: tenant(request) }, orderBy: { detectedAt: 'desc' }, take: 50 });
+    const tenantId = tenant(request);
+    const [rows, statusCounts] = await Promise.all([
+      db.securityIncident.findMany({ where: { tenantId }, orderBy: { detectedAt: 'desc' }, take: 50 }),
+      db.securityIncident.groupBy({ by: ['status'], where: { tenantId }, _count: { _all: true } }),
+    ]);
+    const countFor = (status: string) => statusCounts.find(row => row.status === status)?._count._all ?? 0;
+    const total = statusCounts.reduce((sum, row) => sum + row._count._all, 0);
     return {
-      integrated: rows.length > 0,
-      total: rows.length,
-      open: rows.filter(r => r.status === 'open').length,
-      resolved: rows.filter(r => r.status === 'resolved').length,
+      integrated: false,
+      status: 'manual_register',
+      total,
+      open: countFor('open'),
+      resolved: countFor('resolved'),
+      returned: rows.length,
       incidents: rows.map(r => ({ id: r.id, title: r.title, severity: r.severity, status: r.status, detectedAt: r.detectedAt.toISOString(), resolvedAt: r.resolvedAt?.toISOString() ?? null })),
-      note: rows.length ? undefined : 'No incidents recorded; no formal incident-response automation yet.',
+      note: total ? `Manual incident register; showing the latest ${rows.length} of ${total}. No incident-response automation is connected.` : 'No incidents recorded; no formal incident-response automation yet.',
     };
   });
 

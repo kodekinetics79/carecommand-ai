@@ -10,8 +10,7 @@ import type { FastifyInstance } from 'fastify';
 //   - a second message on the SAME call is added to the same task, never
 //     swallowed as a duplicate, and never lost to a task someone already closed;
 //   - the caller-stated callback number and the network-verified one stay apart;
-//   - a task nobody could assign a branch to is visible to every branch, not to
-//     nobody;
+//   - a task nobody could assign a branch to does not leak into every branch;
 //   - a role without receptionist call-artifact access sees that work exists
 //     without seeing who called or what they said, and NO surface ever prints
 //     an unmasked phone number;
@@ -82,7 +81,7 @@ async function makeFixture(): Promise<Fixture> {
   const [owner, frontDeskA, provider, analyst] = await Promise.all([
     mkUser('OWNER', null, 'owner'),
     mkUser('FRONT_DESK', branchA.id, 'fd-a'),
-    mkUser('PROVIDER', null, 'prov'),
+    mkUser('PROVIDER', branchA.id, 'prov'),
     mkUser('ANALYST', null, 'analyst'),
   ]);
   return {
@@ -205,7 +204,7 @@ describe('createSafetyTask — one task per live call, and never a lost message'
 });
 
 describe('GET /v1/tasks — visibility, masking, filters', () => {
-  it('shows a branch-scoped user their own branch AND the tasks no branch could be resolved for', async () => {
+  it('shows a branch-scoped user only their own branch and withholds unresolved legacy work', async () => {
     const f = await makeFixture();
     const mine = await db.staffTask.create({ data: { tenantId: f.tenantId, branchId: f.branchA, title: 'Branch A work', priority: 'high' } });
     const unscoped = await db.staffTask.create({ data: { tenantId: f.tenantId, branchId: null, title: 'Nobody owns this yet', priority: 'high' } });
@@ -215,7 +214,7 @@ describe('GET /v1/tasks — visibility, masking, filters', () => {
     expect(res.statusCode).toBe(200);
     const ids = res.json().data.map((row: { id: string }) => row.id);
     expect(ids).toContain(mine.id);
-    expect(ids).toContain(unscoped.id);
+    expect(ids).not.toContain(unscoped.id);
     expect(ids).not.toContain(other.id);
   });
 

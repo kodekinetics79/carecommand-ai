@@ -1,4 +1,5 @@
 import { env } from '../config/env';
+import { resolveReleaseIdentity } from './releaseIdentity';
 
 // ===========================================================================
 // Observability: error capture.
@@ -62,7 +63,7 @@ export function captureException(error: Error, context: ErrorContext = {}, logge
       event: 'exception',
       err: { type: error.name, message: error.message, stack: error.stack },
       ...context,
-      release: env.RELEASE,
+      release: resolveReleaseIdentity(env),
       serviceEnv: env.SERVICE_ENV ?? env.NODE_ENV,
     },
     'unhandled exception',
@@ -111,7 +112,7 @@ export async function registerSentry(logger?: MinimalLogger): Promise<boolean> {
     Sentry.init({
       dsn: env.SENTRY_DSN,
       environment: env.SERVICE_ENV ?? env.NODE_ENV,
-      release: env.RELEASE,
+      release: resolveReleaseIdentity(env),
       tracesSampleRate: env.SENTRY_TRACES_SAMPLE_RATE,
     });
 

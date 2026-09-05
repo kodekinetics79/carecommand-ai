@@ -40,11 +40,12 @@ interface ConsentRecord {
 interface Props {
   patientId: string;
   patientName: string;
+  canWrite: boolean;
   onClose: () => void;
   onSaved: () => void;
 }
 
-export default function ConsentModal({ patientId, patientName, onClose, onSaved }: Props) {
+export default function ConsentModal({ patientId, patientName, canWrite, onClose, onSaved }: Props) {
   const titleId = useId();
   const [current, setCurrent] = useState<ConsentRecord | null>(null);
   const [loading, setLoading] = useState(true);
@@ -134,15 +135,17 @@ export default function ConsentModal({ patientId, patientName, onClose, onSaved 
             </ul>
           </div>
 
-          <label className="block space-y-1">
-            <span className="text-[11px] font-semibold text-t2">How was consent obtained?</span>
-            <select value={method} onChange={e => setMethod(e.target.value)} disabled={alreadyGranted}
-              className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-[13px] text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-60">
-              {METHODS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
-            </select>
-          </label>
+          {canWrite && (
+            <label className="block space-y-1">
+              <span className="text-[11px] font-semibold text-t2">How was consent obtained?</span>
+              <select value={method} onChange={e => setMethod(e.target.value)} disabled={alreadyGranted}
+                className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-[13px] text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-60">
+                {METHODS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+              </select>
+            </label>
+          )}
 
-          {!alreadyGranted && (
+          {canWrite && !alreadyGranted && (
             <label className="flex items-start gap-2 text-[12px] text-t2">
               <input type="checkbox" checked={acknowledged} onChange={e => setAcknowledged(e.target.checked)} className="mt-0.5" />
               <span>I read the above to the patient, including that they may owe a copay, and they agreed.</span>
@@ -157,7 +160,7 @@ export default function ConsentModal({ patientId, patientName, onClose, onSaved 
 
           <div className="flex items-center justify-end gap-2">
             <button type="button" onClick={onClose} className="rounded-lg border border-[var(--b1)] px-3 py-2 text-[13px] font-semibold text-t2 hover:bg-[var(--s3)]">Cancel</button>
-            {alreadyGranted ? (
+            {!canWrite ? null : alreadyGranted ? (
               <button type="button" disabled={busy} onClick={() => void save(false)}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-4 py-2 text-[13px] font-semibold text-white hover:opacity-90 disabled:opacity-50">
                 {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldOff className="w-4 h-4" />} Withdraw consent

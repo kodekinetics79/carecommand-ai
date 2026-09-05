@@ -56,6 +56,8 @@ services:
         sync: false        # set to your frontend origin, e.g. https://app.vercel.app
       - key: PUBLIC_API_URL
         sync: false        # https://carecommand-ai.onrender.com
+      - key: PUBLIC_APP_URL
+        sync: false        # exact tenant UI origin, e.g. https://carecommand.kodekinetics.com
 
   # ── Background worker (autopilot + compliance + campaign queues) ───────────
   - type: worker

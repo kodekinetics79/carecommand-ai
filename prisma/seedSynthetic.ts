@@ -41,6 +41,7 @@ process.env.RETELL_FROM_NUMBER ??= '+15550100000';
 // layer would then refuse to deploy with `setup_required`.
 const { PLATFORM_LOCALE_PACKS, platformLocalePackHash } = await import('../server/lib/receptionist/localePacks/defaults');
 const { knowledgeHash } = await import('../server/lib/receptionist/knowledge');
+const { seedComplianceBaseline } = await import('../server/modules/compliance/baseline');
 
 // Inactivity windows are evaluated against the API's wall clock, so a
 // `lastVisitAt` pinned to the controlled clock would fall out of the 30-60 /
@@ -156,6 +157,9 @@ async function seed(): Promise<void> {
     });
   }
   await db.tenant.createMany({ data: tenants });
+  for (const tenantId of tenantIds) {
+    await seedComplianceBaseline(db, tenantId);
+  }
   await db.platformUser.createMany({ data: [
     {
       id: stableUuid('platform-user', 0), email: 'synthetic.platform.owner@example.test', name: 'Synthetic Platform Owner',
@@ -277,10 +281,121 @@ async function seed(): Promise<void> {
   }
   await db.user.createMany({ data: users });
   await db.userClinicAccess.createMany({
-    data: userIds.map((userId, index) => ({
-      id: stableUuid('user-clinic', index), tenantId: userTenant[index], userId, branchId: userBranch[index], isPrimary: true, createdAt: now,
+    data: userIds.flatMap((userId, index) => {
+      const primary = { id: stableUuid('user-clinic', index * 2), tenantId: userTenant[index], userId, branchId: userBranch[index], isPrimary: true, createdAt: now };
+      const candidateBranches = branchIds.filter((_, branchIndex) => branchTenant[branchIndex] === userTenant[index]);
+      const secondaryBranchId = candidateBranches.find(branchId => branchId !== userBranch[index]);
+      const sharedOperationalRole = ['MANAGER', 'PROVIDER', 'FRONT_DESK'].includes(users[index].role);
+      return sharedOperationalRole && secondaryBranchId
+        ? [primary, { id: stableUuid('user-clinic', index * 2 + 1), tenantId: userTenant[index], userId, branchId: secondaryBranchId, isPrimary: false, createdAt: now }]
+        : [primary];
+    }),
+  });
+
+  // Busy-clinic workforce evidence. StaffTask is the real queue model used by
+  // the browser; these rows are synthetic operational handoffs, not visual
+  // placeholders. StaffProfile rows are intentionally labelled as persisted
+  // snapshots in the product because no automated measurement pipeline exists.
+  const staffTasks: Prisma.StaffTaskCreateManyInput[] = [];
+  const staffTaskTemplates = [
+    { title: 'Confirm tomorrow morning eligibility exceptions', priority: 'high', offsetMinutes: -45 },
+    { title: 'Return interrupted scheduling request', priority: 'critical', offsetMinutes: -10 },
+    { title: 'Reconcile duplicate appointment request', priority: 'medium', offsetMinutes: 25 },
+    { title: 'Review incomplete digital intake packet', priority: 'medium', offsetMinutes: 55 },
+    { title: 'Prepare provider schedule handoff', priority: 'low', offsetMinutes: 120 },
+    { title: 'Confirm after-hours escalation owner', priority: 'high', offsetMinutes: 180 },
+  ] as const;
+  branchIds.forEach((branchId, branchIndex) => {
+    const tenantId = branchTenant[branchIndex];
+    const candidateUsers = userIds.filter((_, userIndex) => userTenant[userIndex] === tenantId);
+    staffTaskTemplates.forEach((template, templateIndex) => {
+      staffTasks.push({
+        id: stableUuid('staff-task', branchIndex * staffTaskTemplates.length + templateIndex),
+        tenantId,
+        branchId,
+        assignedToId: templateIndex % 3 === 0 ? candidateUsers[templateIndex % candidateUsers.length] : null,
+        title: template.title,
+        priority: template.priority,
+        status: templateIndex === 4 ? 'IN_PROGRESS' : 'OPEN',
+        dueAt: new Date(demoClock.getTime() + template.offsetMinutes * 60_000),
+        metadata: { synthetic: true, workflow: 'clinic_operations', source: 'synthetic_pilot' },
+        createdAt: new Date(demoClock.getTime() - (templateIndex + 1) * 12 * 60_000),
+        updatedAt: demoClock,
+      });
+    });
+  });
+  await db.staffTask.createMany({ data: staffTasks });
+
+  const profiledUsers = userIds.map((userId, index) => ({ userId, index })).filter(({ index }) => users[index].role !== 'OWNER');
+  await db.staffProfile.createMany({
+    data: profiledUsers.map(({ userId, index }) => ({
+      id: stableUuid('staff-profile', index),
+      tenantId: userTenant[index],
+      branchId: userBranch[index],
+      userId,
+      roleTitle: users[index].role.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, value => value.toUpperCase()),
+      responseTime: new Prisma.Decimal((2.5 + (index % 6) * 0.7).toFixed(1)),
+      missedCalls: index % 7,
+      followUpRate: 72 + (index % 5) * 5,
+      bookingConversionRate: 48 + (index % 6) * 7,
+      tasksCompleted: 18 + index,
+      tasksPending: index % 4,
+      patientFeedbackScore: new Prisma.Decimal((4.1 + (index % 5) * 0.15).toFixed(1)),
+      createdAt: now,
+      updatedAt: now,
     })),
   });
+
+  // Daily-operations evidence for the Today workspace. These are persisted
+  // records, not presentation fixtures: the same opportunity and revenue-leak
+  // endpoints used by the operational queues supply the briefing.
+  const opportunityTemplates = [
+    {
+      title: 'Recover interrupted scheduling calls', source: 'missed_call', category: 'access',
+      trigger: 'Recent inbound calls ended before an appointment was confirmed.', expectedRevenue: 3200,
+      confidence: 92, effortLevel: 'LOW', urgency: 'IMMEDIATE',
+      recommendedAction: 'Review the call evidence and return the patient callback from Communications.',
+    },
+    {
+      title: 'Protect tomorrow’s high-risk appointments', source: 'no_show_risk', category: 'schedule',
+      trigger: 'Confirmed appointments match recorded no-show risk rules.', expectedRevenue: 1800,
+      confidence: 78, effortLevel: 'MEDIUM', urgency: 'TODAY',
+      recommendedAction: 'Review the affected appointments before sending any reminder.',
+    },
+    {
+      title: 'Resolve eligibility before arrival', source: 'insurance_eligibility', category: 'eligibility',
+      trigger: 'Appointments are approaching without completed eligibility evidence.', expectedRevenue: 950,
+      confidence: 66, effortLevel: 'MEDIUM', urgency: 'TODAY',
+      recommendedAction: 'Verify coverage in the insurance work queue before quoting benefits.',
+    },
+  ] as const;
+  await db.opportunity.createMany({ data: tenantIds.flatMap((tenantId, tenantIndex) => {
+    const branchId = branchIds.find((_, branchIndex) => branchTenant[branchIndex] === tenantId)!;
+    const ownerUserId = userIds.find((_, userIndex) => userTenant[userIndex] === tenantId)!;
+    return opportunityTemplates.map((template, templateIndex) => ({
+      id: stableUuid('opportunity', tenantIndex * opportunityTemplates.length + templateIndex),
+      tenantId, branchId, ownerUserId, ...template, automationSteps: [], actualRevenue: 0, roi: 0,
+      status: 'OPEN', ownerApprovalRequired: false, createdAt: now, updatedAt: now,
+    }));
+  }) });
+  await db.revenueLeak.createMany({ data: tenantIds.flatMap((tenantId, tenantIndex) => {
+    const branchId = branchIds.find((_, branchIndex) => branchTenant[branchIndex] === tenantId)!;
+    const ownerUserId = userIds.find((_, userIndex) => userTenant[userIndex] === tenantId)!;
+    return [
+      {
+        id: stableUuid('revenue-leak', tenantIndex * 2), tenantId, branchId, ownerUserId,
+        category: 'payments', source: 'Unconfirmed patient deposits', evidence: 'Recorded payment requests remain unconfirmed.',
+        estimatedValue: 4800, confidence: 84, status: 'OPEN', workflowStatus: 'NEEDS_REVIEW',
+        suggestedAction: 'Review the payment queue and contact only patients with valid consent.', createdAt: now, updatedAt: now,
+      },
+      {
+        id: stableUuid('revenue-leak', tenantIndex * 2 + 1), tenantId, branchId, ownerUserId,
+        category: 'insurance', source: 'Eligibility evidence incomplete', evidence: 'Upcoming appointments have no completed eligibility record.',
+        estimatedValue: 2400, confidence: 76, status: 'OPEN', workflowStatus: 'NEEDS_REVIEW',
+        suggestedAction: 'Complete eligibility review before patient arrival.', createdAt: now, updatedAt: now,
+      },
+    ];
+  }) });
 
   // Approved locale packs and knowledge: both carry an approver, so they are
   // created after the users exist. Without them a clinic cannot be activated.

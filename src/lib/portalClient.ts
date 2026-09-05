@@ -25,13 +25,23 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
 
 // ---- types (patient-safe) --------------------------------------------------
 export interface PortalDashboard {
-  displayName: string; clinicName: string; branchName: string | null;
+  displayName: string; clinicName: string; branchName: string | null; clinicTimezone: string;
   cards: Record<string, { state: string; amount?: number; currency?: string; count?: number; service?: string; startsAt?: string; detail?: string }>;
   paymentPolicyAvailable: boolean; paymentPolicyAcknowledged: boolean; allowedActions: string[]; deepLinkTargets: Record<string, string>;
 }
-export interface PortalAppt { id: string; service: string; startsAt: string; endsAt: string; status: string; provider: string | null }
-export interface PortalRequest { id: string; service: string | null; requestedDateTime: string | null; status: string; createdAt: string }
-export interface PortalBookingProvider { id: string; name: string; specialty: string | null; rating: number; reviewCount: number }
+export interface PortalAppt {
+  id: string;
+  service: string;
+  startsAt: string;
+  endsAt: string;
+  status: string;
+  providerProfileId: string | null;
+  providerName: string | null;
+  branchName: string;
+  clinicTimezone: string;
+}
+export interface PortalRequest { id: string; service: string | null; requestedDateTime: string | null; status: string; createdAt: string; branchName: string; clinicTimezone: string }
+export interface PortalBookingProvider { id: string; name: string; specialty: string | null; rating: number; reviewCount: number; branchName: string; clinicTimezone: string }
 export interface PortalBookingSlot { startsAt: string; endsAt: string }
 export interface PortalIntake { id: string; status: string; label: string; readinessScore: number; createdAt: string }
 export interface PortalIntakeSection {
@@ -73,7 +83,7 @@ export const portalClient = {
   cancelAppointment: (id: string, reason?: string) => pf<{ id: string; status: string; deduped?: boolean; deposit?: { needsManualRefund: boolean } }>(`/v1/portal/appointments/${id}/cancel`, { method: 'POST', body: JSON.stringify(reason ? { reason } : {}) }),
   rescheduleAppointment: (id: string, body: { startsAt: string; durationMin?: number }) => pf<PortalAppt>(`/v1/portal/appointments/${id}/reschedule`, { method: 'POST', body: JSON.stringify(body) }),
   bookingProviders: () => pf<PortalBookingProvider[]>('/v1/portal/booking/providers'),
-  bookingSlots: (providerId: string, date: string) => pf<{ providerId: string; date: string; slots: PortalBookingSlot[] }>(`/v1/portal/booking/providers/${providerId}/slots?date=${encodeURIComponent(date)}`),
+  bookingSlots: (providerId: string, date: string) => pf<{ providerId: string; date: string; branchName: string; clinicTimezone: string; slots: PortalBookingSlot[] }>(`/v1/portal/booking/providers/${providerId}/slots?date=${encodeURIComponent(date)}`),
   bookSlot: (providerId: string, body: { startsAt: string; durationMin?: number; reason: string; channel?: 'WHATSAPP' | 'SMS' | 'EMAIL' | 'PUSH' | 'CALL' | 'VIDEO' }) =>
     pf<PortalAppt>(`/v1/portal/booking/providers/${providerId}/book`, { method: 'POST', body: JSON.stringify(body) }),
   requests: () => pf<PortalRequest[]>('/v1/portal/appointment-requests'),

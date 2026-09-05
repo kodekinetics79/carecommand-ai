@@ -1,40 +1,46 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router';
-import { Clock, Phone, AlertCircle, Sparkles, ArrowRight, Plus, UserPlus, CheckCircle2, PlayCircle } from 'lucide-react';
+import { Clock, AlertCircle, Plus, UserPlus, CheckCircle2, PlayCircle, MapPin, ChevronDown } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
-import ProgressBar from '../components/ui/ProgressBar';
 import { apiRequest } from '../lib/api';
 import { mapStaffProfile, mapStaffTask, type ApiStaffProfile, type ApiStaffTask } from '../lib/apiAdapters';
-import { normalizeTaskRow } from '../lib/frontDesk';
-import { resolveTimezone } from '../lib/clinicTime';
+import { normalizeTaskRow, TASK_OUTCOME_CODES, TASK_OUTCOME_LABEL, type TaskOutcomeCode } from '../lib/frontDesk';
+import { clinicTimeToUtc, resolveTimezone } from '../lib/clinicTime';
 import { formatClinicDateTime, formatRelativeDue } from '../lib/frontDeskTime';
 import { ReceptionistTaskCard } from '../components/receptionist/ReceptionistTaskCard';
 import { hasPermission } from '../lib/access';
 import { useSession } from '../hooks/useSession';
+import { getSelectedClinicId } from '../lib/session';
 import type { StaffMember } from '../types';
 
-type StaffView = StaffMember & { branch?: string };
+type StaffView = StaffMember & { branch?: string; updatedAt: string };
 type TaskView = ReturnType<typeof mapStaffTask>;
 interface Assignee { id: string; displayName: string; role: string }
+interface BranchOption { id: string; name: string; location: string; timezone: string; active: boolean }
+interface TaskPage { data: ApiStaffTask[]; nextCursor: string | null }
+interface StaffOverviewPage {
+  data: ApiStaffProfile[];
+  nextCursor: string | null;
+  measurement: { source: string; automatedAggregation: boolean; limitation: string };
+}
 
 /** The page asks for this many tasks. Counts below are labelled as covering only these. */
 const TASK_PAGE_SIZE = 100;
 
-const statusStyles: Record<TaskView['status'], { label: string; badge: string; border: string }> = {
-  open: { label: 'Open', badge: 'badge badge-blue', border: 'border-l-blue-500' },
-  'in-progress': { label: 'In Progress', badge: 'badge badge-amber', border: 'border-l-amber-500' },
-  completed: { label: 'Completed', badge: 'badge badge-emerald', border: 'border-l-emerald-500' },
-  canceled: { label: 'Canceled', badge: 'badge badge-red', border: 'border-l-red-500' },
+const statusStyles: Record<TaskView['status'], { label: string; badge: string }> = {
+  open: { label: 'Open', badge: 'badge badge-blue' },
+  'in-progress': { label: 'In Progress', badge: 'badge badge-amber' },
+  completed: { label: 'Completed', badge: 'badge badge-emerald' },
+  canceled: { label: 'Canceled', badge: 'badge badge-red' },
 };
 
 const priorityStyles = {
-  critical: { badge: 'badge badge-red', border: 'border-l-red-500' },
-  high: { badge: 'badge badge-red', border: 'border-l-red-500' },
-  medium: { badge: 'badge badge-amber', border: 'border-l-amber-500' },
-  normal: { badge: 'badge badge-amber', border: 'border-l-amber-500' },
-  low: { badge: 'badge badge-blue', border: 'border-l-[var(--b2)]' },
+  critical: { badge: 'badge badge-red' },
+  high: { badge: 'badge badge-red' },
+  medium: { badge: 'badge badge-amber' },
+  normal: { badge: 'badge badge-amber' },
+  low: { badge: 'badge badge-blue' },
 };
 
 type QueueFilter = 'live' | 'mine' | 'unassigned' | 'all';
@@ -52,7 +58,6 @@ function extractRows<T>(payload: T[] | { data: T[] }) {
 const errorText = (error: unknown, fallback: string) => error instanceof Error ? error.message : fallback;
 
 export default function StaffWorkflow() {
-  const navigate = useNavigate();
   const { user } = useSession();
   const canAssignOthers = hasPermission(user, 'staff:write');
   const canWorkTasks = hasPermission(user, 'staff:task-status');
@@ -67,6 +72,7 @@ export default function StaffWorkflow() {
   // card renders from the full C4 projection, the generic row from the view.
   const [taskRows, setTaskRows] = useState<ApiStaffTask[]>([]);
   const [assignees, setAssignees] = useState<Assignee[]>([]);
+  const [branches, setBranches] = useState<BranchOption[]>([]);
   // Each source reports its own outcome. One failing panel must not blank the
   // others, and must never look like an empty result.
   const [tasksState, setTasksState] = useState<'loading' | 'ready' | 'error'>('loading');
@@ -77,11 +83,18 @@ export default function StaffWorkflow() {
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   const [filter, setFilter] = useState<QueueFilter>('live');
   const [composerOpen, setComposerOpen] = useState(false);
+  const [nextTaskCursor, setNextTaskCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [completionTask, setCompletionTask] = useState<{ id: string; title: string } | null>(null);
+  const [completionOutcome, setCompletionOutcome] = useState<TaskOutcomeCode | ''>('');
+  const [completionNote, setCompletionNote] = useState('');
+  const [measurementNote, setMeasurementNote] = useState<string | null>(null);
 
   const loadTasks = useCallback(async () => {
     try {
-      const response = await apiRequest<ApiStaffTask[] | { data: ApiStaffTask[] }>(`/v1/tasks?limit=${TASK_PAGE_SIZE}`);
+      const response = await apiRequest<TaskPage>(`/v1/tasks?limit=${TASK_PAGE_SIZE}`);
       setTaskRows(extractRows(response));
+      setNextTaskCursor(response.nextCursor);
       setTasksState('ready');
       setTasksError(null);
     } catch (error) {
@@ -89,6 +102,21 @@ export default function StaffWorkflow() {
       setTasksError(errorText(error, 'Unable to load the task queue'));
     }
   }, []);
+
+  const loadMoreTasks = useCallback(async () => {
+    if (!nextTaskCursor || loadingMore) return;
+    setLoadingMore(true);
+    setRowError(null);
+    try {
+      const response = await apiRequest<TaskPage>(`/v1/tasks?limit=${TASK_PAGE_SIZE}&cursor=${encodeURIComponent(nextTaskCursor)}`);
+      setTaskRows(current => [...current, ...response.data.filter(row => !current.some(existing => existing.id === row.id))]);
+      setNextTaskCursor(response.nextCursor);
+    } catch (error) {
+      setRowError(errorText(error, 'Unable to load the next tasks'));
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [loadingMore, nextTaskCursor]);
 
   useEffect(() => {
     void (async () => { await loadTasks(); })();
@@ -98,14 +126,28 @@ export default function StaffWorkflow() {
     let active = true;
     void (async () => {
       try {
-        const response = await apiRequest<ApiStaffProfile[] | { data: ApiStaffProfile[] }>('/v1/staff/overview?limit=100');
+        const response = await apiRequest<StaffOverviewPage>('/v1/staff/overview?limit=100');
         if (!active) return;
         setStaffRecords(extractRows(response).map(row => mapStaffProfile(row)));
+        setMeasurementNote(response.measurement.limitation);
         setStaffState('ready');
       } catch (error) {
         if (!active) return;
         setStaffState('error');
         setStaffError(errorText(error, 'Unable to load staff performance records'));
+      }
+    })();
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const response = await apiRequest<{ data: BranchOption[] }>('/v1/branches?limit=100');
+        if (active) setBranches(response.data.filter(branch => branch.active));
+      } catch {
+        if (active) setBranches([]);
       }
     })();
     return () => { active = false; };
@@ -132,7 +174,7 @@ export default function StaffWorkflow() {
 
   const tasksReady = tasksState === 'ready';
   const staffReady = staffState === 'ready' && staffRecords.length > 0;
-  const queueTruncated = tasksReady && taskRecords.length >= TASK_PAGE_SIZE;
+  const queueTruncated = tasksReady && Boolean(nextTaskCursor);
 
   // Counts describe the loaded rows only, and are labelled that way.
   const counts = useMemo(() => ({
@@ -185,14 +227,24 @@ export default function StaffWorkflow() {
     }
   }
 
-  const setStatus = (taskId: string, status: 'IN_PROGRESS' | 'COMPLETED') =>
+  const setStatus = (taskId: string, status: 'IN_PROGRESS') =>
     mutateTask(taskId, `/v1/staff/tasks/${taskId}/status`, { status }, 'Unable to update this task');
 
   const setAssignment = (taskId: string, assignedToId: string | null) =>
     mutateTask(taskId, `/v1/staff/tasks/${taskId}/assignment`, { assignedToId }, 'Unable to change who owns this task');
 
-  const underperformers = staffRecords.filter(m => m.bookingConversionRate < 55 || m.responseTime > 6);
-  const responseThresholdExceptions = staffRecords.filter(m => m.responseTime > 6);
+  async function completeGenericTask() {
+    if (!completionTask || !completionOutcome) return;
+    await mutateTask(
+      completionTask.id,
+      `/v1/staff/tasks/${completionTask.id}/status`,
+      { status: 'COMPLETED', outcomeCode: completionOutcome, ...(completionNote.trim() ? { outcomeNote: completionNote.trim() } : {}) },
+      'Unable to complete this task',
+    );
+    setCompletionTask(null);
+    setCompletionOutcome('');
+    setCompletionNote('');
+  }
 
   return (
     <div className="space-y-6 pb-8">
@@ -221,6 +273,8 @@ export default function StaffWorkflow() {
       {composerOpen && canAssignOthers && (
         <NewTaskForm
           assignees={assignees}
+          branches={branches}
+          initialBranchId={getSelectedClinicId() ?? user?.branchId ?? ''}
           onCancel={() => setComposerOpen(false)}
           onCreated={async () => { setComposerOpen(false); await loadTasks(); }}
         />
@@ -237,7 +291,7 @@ export default function StaffWorkflow() {
         <div className="space-y-4">
           <BentoCard
             title="Task Queue"
-            subtitle={queueTruncated ? `Newest ${TASK_PAGE_SIZE} tasks — counts cover these only` : 'Tasks stored for your clinic'}
+            subtitle={queueTruncated ? `${taskRecords.length} highest-priority due tasks loaded — more are available` : `${taskRecords.length} task${taskRecords.length === 1 ? '' : 's'} loaded for the selected clinic`}
             headerRight={
               <div className="flex flex-wrap gap-1">
                 {QUEUE_FILTERS.map(f => (
@@ -283,7 +337,7 @@ export default function StaffWorkflow() {
                 const busy = busyTaskId === task.id;
                 const mine = task.assignedToId === user?.id;
                 return (
-                  <div key={task.id} className={`p-3.5 rounded-xl border border-l-2 transition-all ${priorityStyle.border} ${task.overdue ? 'border-[var(--b1)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
+                  <div key={task.id} className={`rounded-xl border border-[var(--b1)] p-3.5 transition-colors ${task.overdue ? 'bg-[var(--red-soft)]' : 'bg-white/80 hover:bg-white'}`}>
                     <div className="flex items-start gap-3">
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-semibold text-t1">{task.title}</p>
@@ -293,7 +347,7 @@ export default function StaffWorkflow() {
                           <span className={`text-[10px] font-semibold ${task.overdue ? 'text-red-v' : 'text-t3'}`} title={formatClinicDateTime(task.dueAt, task.clinic?.timezone ?? viewerTimezone)}>
                             {formatRelativeDue(task.dueAt).label}
                           </span>
-                          <span className="text-[10px] text-t3">· {task.branch} · {task.assignee ?? 'Unassigned'}</span>
+                          <span className="min-w-0 break-words text-[10px] text-t3">· {task.branch} · {task.assignee ?? 'Unassigned'}</span>
                           {task.origin && <span className="text-[10px] text-t3">· from {task.origin}</span>}
                         </div>
                       </div>
@@ -308,9 +362,9 @@ export default function StaffWorkflow() {
                             <PlayCircle className="w-3 h-3" /> Start
                           </button>
                         )}
-                        <button type="button" disabled={busy} onClick={() => void setStatus(task.id, 'COMPLETED')}
+                        <button type="button" disabled={busy} onClick={() => { setCompletionTask({ id: task.id, title: task.title }); setCompletionOutcome(''); setCompletionNote(''); }}
                           className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s2)] transition disabled:opacity-50">
-                          <CheckCircle2 className="w-3 h-3" /> Complete
+                          <CheckCircle2 className="w-3 h-3" /> Complete…
                         </button>
                         {mine ? (
                           <button type="button" disabled={busy} onClick={() => void setAssignment(task.id, null)}
@@ -324,13 +378,13 @@ export default function StaffWorkflow() {
                           </button>
                         )}
                         {canAssignOthers && assignees.length > 0 && (
-                          <label className="inline-flex items-center gap-1 text-[10px] text-t3">
+                          <label className="inline-flex min-w-0 w-full max-w-full items-center gap-1 text-[10px] text-t3 sm:w-auto">
                             <span className="sr-only">Assign “{task.title}” to</span>
                             <select
                               value={task.assignedToId ?? ''}
                               disabled={busy}
                               onChange={e => void setAssignment(task.id, e.target.value || null)}
-                              className="rounded-lg border border-[var(--b1)] bg-transparent px-2 py-1 text-[10px] font-semibold text-t2 outline-none disabled:opacity-50"
+                              className="min-w-0 w-full max-w-full rounded-lg border border-[var(--b1)] bg-transparent px-2 py-1 text-[10px] font-semibold text-t2 outline-none disabled:opacity-50 sm:w-auto sm:max-w-[14rem]"
                             >
                               <option value="">Unassigned</option>
                               {assignees.map(a => <option key={a.id} value={a.id}>{a.displayName}</option>)}
@@ -339,34 +393,62 @@ export default function StaffWorkflow() {
                         )}
                       </div>
                     )}
+                    {completionTask?.id === task.id && (
+                      <div className="mt-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3" role="group" aria-label={`Complete ${task.title}`}>
+                        <p className="text-xs font-semibold text-t1">Record the outcome before closing</p>
+                        <p className="mt-0.5 text-[10px] text-t3">Completion is final. Choose what happened so the next shift has an auditable handoff.</p>
+                        <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,180px)_1fr]">
+                          <select aria-label={`Outcome for ${task.title}`} value={completionOutcome} onChange={event => setCompletionOutcome(event.target.value as TaskOutcomeCode | '')}
+                            className="rounded-lg border border-[var(--b1)] bg-white px-2.5 py-2 text-xs text-t1 outline-none">
+                            <option value="">Choose outcome</option>
+                            {TASK_OUTCOME_CODES.filter(code => code !== 'booked').map(code => <option key={code} value={code}>{TASK_OUTCOME_LABEL[code]}</option>)}
+                          </select>
+                          <input aria-label={`Completion note for ${task.title}`} value={completionNote} onChange={event => setCompletionNote(event.target.value)} maxLength={500}
+                            placeholder="Optional handoff note" className="rounded-lg border border-[var(--b1)] bg-white px-2.5 py-2 text-xs text-t1 outline-none" />
+                        </div>
+                        <div className="mt-2 flex gap-2">
+                          <button type="button" disabled={!completionOutcome || busy} onClick={() => void completeGenericTask()} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50">Confirm completion</button>
+                          <button type="button" onClick={() => setCompletionTask(null)} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[10px] font-semibold text-t2">Keep open</button>
+                        </div>
+                      </div>
+                    )}
                     {!terminal && !canWorkTasks && (
                       <p className="mt-2 text-[10px] text-t3">Your role can read this queue but not change a task.</p>
                     )}
                   </div>
                 );
               })}
+              {nextTaskCursor && (
+                <div className="pt-2 text-center">
+                  <button type="button" disabled={loadingMore} onClick={() => void loadMoreTasks()} className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--b1)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50">
+                    <ChevronDown className="h-3.5 w-3.5" /> {loadingMore ? 'Loading more…' : 'Load next 100 tasks'}
+                  </button>
+                </div>
+              )}
             </div>
           </BentoCard>
 
-          <BentoCard title="Staff Performance Leaderboard" subtitle="Response time & conversion ranking">
+          <BentoCard title="Recorded Staff Profile Snapshots" subtitle="Context only — no automated ranking">
+            <div role="note" className="mb-3 rounded-xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-3 py-2 text-[11px] leading-relaxed text-amber-v">
+              {measurementNote ?? 'Measurement provenance is unavailable. Do not use these rows for staff evaluation.'}
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full">
                 <thead>
                   <tr className="border-b border-[var(--b1)]">
-                    {['Staff Member', 'Branch', 'Response Time', 'Conversion', 'Missed Calls', 'Follow-up', 'Score'].map(header => (
+                    {['Staff Member', 'Clinic', 'Response Time', 'Conversion', 'Missed Calls', 'Follow-up', 'Last stored'].map(header => (
                       <th key={header} className="text-left py-2 px-2 text-[10px] font-bold uppercase tracking-widest text-t3 whitespace-nowrap">{header}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[var(--b0)]">
-                  {[...staffRecords].sort((a, b) => b.bookingConversionRate - a.bookingConversionRate).map(member => {
+                  {staffRecords.map(member => {
                     const branchName = member.branch ?? 'Branch not recorded';
-                    const score = Math.round((member.bookingConversionRate * 0.4) + (member.followUpRate * 0.3) + (member.patientFeedbackScore * 10 * 0.3));
                     return (
                       <tr key={member.id} className="hover:bg-[var(--s3)] transition-colors group">
                         <td className="py-2.5 px-2">
                           <div className="flex items-center gap-2">
-                            <div className="w-7 h-7 rounded-full bg-gradient-to-br from-slate-300 to-slate-400 flex items-center justify-center text-white text-[10px] font-bold shrink-0">
+                            <div className="w-7 h-7 rounded-full bg-[var(--indigo-soft)] flex items-center justify-center text-indigo text-[10px] font-bold shrink-0">
                               {member.name.split(' ').map(n => n[0]).join('')}
                             </div>
                             <div>
@@ -375,14 +457,12 @@ export default function StaffWorkflow() {
                             </div>
                           </div>
                         </td>
-                        <td className="py-2.5 px-2 text-xs text-t3">{branchName.split(' ')[0]}</td>
-                        <td className={`py-2.5 px-2 text-xs font-bold ${member.responseTime > 6 ? 'text-red-v' : member.responseTime > 4 ? 'text-amber-v' : 'text-emerald-v'}`}>{member.responseTime} min</td>
+                        <td className="py-2.5 px-2 text-xs text-t3">{branchName}</td>
+                        <td className="py-2.5 px-2 text-xs font-semibold text-t1">{member.responseTime} min</td>
                         <td className="py-2.5 px-2 text-xs font-bold text-t1">{member.bookingConversionRate}%</td>
-                        <td className={`py-2.5 px-2 text-xs font-bold ${member.missedCalls > 10 ? 'text-red-v' : 'text-t2'}`}>{member.missedCalls}</td>
+                        <td className="py-2.5 px-2 text-xs font-semibold text-t2">{member.missedCalls}</td>
                         <td className="py-2.5 px-2 text-xs font-semibold text-t2">{member.followUpRate}%</td>
-                        <td className="py-2.5 px-2">
-                          <span className={`badge ${score >= 75 ? 'badge-emerald' : score >= 55 ? 'badge-amber' : 'badge-red'}`}>{score}</span>
-                        </td>
+                        <td className="py-2.5 px-2 text-[10px] text-t3">{formatClinicDateTime(member.updatedAt, viewerTimezone)}</td>
                       </tr>
                     );
                   })}
@@ -413,57 +493,13 @@ export default function StaffWorkflow() {
             </p>
           </BentoCard>
 
-          {underperformers.length > 0 && (
-            <BentoCard title="Coaching Recommendations" subtitle="For underperforming staff" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
-              <div className="space-y-3">
-                {underperformers.map(member => (
-                  <div key={member.id} className="p-3.5 rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)]">
-                    <div className="flex items-center justify-between gap-2 mb-2">
-                      <p className="text-xs font-bold text-t1">{member.name}</p>
-                      <span className="badge badge-amber">{member.bookingConversionRate}% conv.</span>
-                    </div>
-                    <div className="space-y-1 mb-3">
-                      <div className="flex justify-between text-[10px] text-t3">
-                        <span>Booking conversion</span><span className="font-semibold">{member.bookingConversionRate}%</span>
-                      </div>
-                      <ProgressBar value={member.bookingConversionRate} size="xs" />
-                      <div className="flex justify-between text-[10px] text-t3">
-                        <span>Response time</span><span className="font-semibold">{member.responseTime} min</span>
-                      </div>
-                      <ProgressBar value={Math.max(0, 100 - (member.responseTime * 10))} size="xs" />
-                    </div>
-                    <p className="text-[11px] text-t2 mb-2">
-                      Coaching prompt: confirm the patient's identity, review the documented service context, and offer only an available time slot.
-                    </p>
-                    <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:opacity-80">
-                      <Sparkles className="w-3 h-3" /> Open Autopilot <ArrowRight className="w-3 h-3" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </BentoCard>
-          )}
-
-          <div className="rounded-2xl border border-[var(--b1)] bg-[var(--red-soft)] p-4">
-            <div className="flex items-start gap-3">
-              <AlertCircle className="w-5 h-5 text-red-v shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-bold text-red-v">Response Threshold Review</p>
-                <p className="text-xs text-t2 mt-0.5 leading-relaxed">
-                  {responseThresholdExceptions.length > 0
-                    ? `${responseThresholdExceptions.slice(0, 2).map(m => m.name).join(' and ')} exceed this page's 6-minute response-time review threshold in the loaded records. Review staffing and routing with the branch manager.`
-                    : staffReady
-                      ? "No loaded staff record exceeds this page's 6-minute response-time review threshold."
-                      : 'Response-time records are unavailable, so no staff member can be assessed against the threshold.'}
-                </p>
-                {/* This button navigates. It does not switch routing on, so it no
-                    longer says it does. */}
-                <button type="button" onClick={() => navigate('/ai-receptionist')} className="mt-2 inline-flex items-center gap-1 text-xs font-semibold badge badge-red px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors">
-                  <Phone className="w-3 h-3" /> Open AI Receptionist
-                </button>
-              </div>
+          <BentoCard title="Measurement Status" subtitle="What this page can prove">
+            <div className="space-y-2 text-xs text-t2">
+              <p className="flex items-start gap-2"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-v" /> Task counts and task states come from the live stored queue.</p>
+              <p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-v" /> Staff response and conversion values are profile snapshots without an automated calculation pipeline.</p>
+              <p className="text-[10.5px] leading-relaxed text-t3">Ranking, coaching, and threshold alerts remain unavailable until measurement periods, denominators, source events, and per-clinic shared-staff attribution are implemented.</p>
             </div>
-          </div>
+          </BentoCard>
         </div>
       </div>
     </div>
@@ -480,12 +516,14 @@ function MetricTile({ label, value }: { label: string; value: string }) {
 }
 
 /** Real task creation: POST /v1/tasks. Requires staff:write, which the server re-checks. */
-function NewTaskForm({ assignees, onCancel, onCreated }: {
-  assignees: Assignee[]; onCancel: () => void; onCreated: () => Promise<void>;
+function NewTaskForm({ assignees: initialAssignees, branches, initialBranchId, onCancel, onCreated }: {
+  assignees: Assignee[]; branches: BranchOption[]; initialBranchId: string; onCancel: () => void; onCreated: () => Promise<void>;
 }) {
   const [title, setTitle] = useState('');
   const [priority, setPriority] = useState('medium');
   const [assignedToId, setAssignedToId] = useState('');
+  const [branchId, setBranchId] = useState(() => initialBranchId || branches[0]?.id || '');
+  const [clinicAssignees, setClinicAssignees] = useState(initialAssignees);
   const [dueAt, setDueAt] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -493,6 +531,15 @@ function NewTaskForm({ assignees, onCancel, onCreated }: {
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (title.trim().length < 2) { setError('Give the task a title of at least 2 characters.'); return; }
+    if (!branchId) { setError('Select the clinic that owns this task.'); return; }
+    const branch = branches.find(option => option.id === branchId);
+    if (!branch) { setError('The selected clinic is no longer available.'); return; }
+    let dueInstant: Date | null = null;
+    if (dueAt) {
+      const [dateISO, time] = dueAt.split('T');
+      dueInstant = clinicTimeToUtc(dateISO, time, branch.timezone);
+      if (Number.isNaN(dueInstant.getTime())) { setError('Enter a valid due date and time.'); return; }
+    }
     setSaving(true);
     setError(null);
     try {
@@ -501,8 +548,9 @@ function NewTaskForm({ assignees, onCancel, onCreated }: {
         body: JSON.stringify({
           title: title.trim(),
           priority,
+          branchId,
           ...(assignedToId ? { assignedToId } : {}),
-          ...(dueAt ? { dueAt: new Date(dueAt).toISOString() } : {}),
+          ...(dueInstant ? { dueAt: dueInstant.toISOString() } : {}),
         }),
       });
       await onCreated();
@@ -512,9 +560,27 @@ function NewTaskForm({ assignees, onCancel, onCreated }: {
     }
   }
 
+  async function changeBranch(nextBranchId: string) {
+    setBranchId(nextBranchId);
+    setAssignedToId('');
+    try {
+      const rows = await apiRequest<Assignee[]>(`/v1/staff/assignees?branchId=${encodeURIComponent(nextBranchId)}`);
+      setClinicAssignees(rows);
+    } catch {
+      setClinicAssignees([]);
+    }
+  }
+
+  const selectedBranch = branches.find(branch => branch.id === branchId);
+
   return (
     <form onSubmit={submit} className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4 space-y-3">
-      <div className="grid gap-3 sm:grid-cols-[2fr_1fr_1fr_1fr]">
+      <div className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t2">
+        <MapPin className="h-4 w-4 shrink-0 text-indigo" />
+        <span className="font-semibold">Clinic-owned work</span>
+        <span className="text-t3">A clinic is required; unscoped tasks are not shared across locations.</span>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-[2fr_1fr_1fr_1fr_1fr]">
         <label className="block">
           <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Task</span>
           <input value={title} onChange={e => setTitle(e.target.value)} maxLength={240} placeholder="Call back the Tuesday no-shows"
@@ -530,17 +596,26 @@ function NewTaskForm({ assignees, onCancel, onCreated }: {
           </select>
         </label>
         <label className="block">
+          <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Clinic</span>
+          <select value={branchId} onChange={e => void changeBranch(e.target.value)} required
+            className="mt-1 w-full rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-sm text-t1 outline-none">
+            <option value="">Select clinic</option>
+            {branches.map(branch => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
+          </select>
+        </label>
+        <label className="block">
           <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Assign to</span>
           <select value={assignedToId} onChange={e => setAssignedToId(e.target.value)}
             className="mt-1 w-full rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-sm text-t1 outline-none">
             <option value="">Leave unassigned</option>
-            {assignees.map(a => <option key={a.id} value={a.id}>{a.displayName}</option>)}
+            {clinicAssignees.map(a => <option key={a.id} value={a.id}>{a.displayName}</option>)}
           </select>
         </label>
         <label className="block">
           <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Due</span>
           <input type="datetime-local" value={dueAt} onChange={e => setDueAt(e.target.value)}
             className="mt-1 w-full rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-sm text-t1 outline-none" />
+          {selectedBranch && <span className="mt-1 block text-[9.5px] text-t3">{selectedBranch.timezone}</span>}
         </label>
       </div>
       {error && <p role="alert" className="text-[11px] font-semibold text-red-v">{error}</p>}

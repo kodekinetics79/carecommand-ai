@@ -70,8 +70,8 @@ interface ControlPlaneUsersResponse {
 }
 
 interface ControlPlaneRolesResponse {
-  roles: (AdminRole & { risk?: 'low' | 'medium' | 'high' })[];
-  permissionMatrix: Array<{ role: string; scope: string; modules: string[]; risk: 'low' | 'medium' | 'high' }>;
+  roles: (AdminRole & { risk?: 'low' | 'medium' | 'high'; effectivePermissions?: string[]; permissionSource?: 'built-in-default' | 'tenant-override' })[];
+  permissionMatrix: Array<{ role: string; scope: string; modules: string[]; risk: 'low' | 'medium' | 'high'; effectivePermissions: string[]; permissionSource: 'built-in-default' | 'tenant-override' }>;
   moduleSummary: Array<{ module: string; permissions: string[] }>;
 }
 
@@ -81,7 +81,13 @@ interface ControlPlaneClinicsResponse {
   location: string;
   active: boolean;
   userCount: number;
-  securityAlerts: number;
+  activeAssignedUserCount: number;
+  openRevenueAlerts: number;
+  futureAppointmentCount: number;
+  activeProviderScheduleCount: number;
+  activeReceptionistLocationCount: number;
+  activeCampaignCount: number;
+  operationalDependencyCount: number;
 }
 
 interface ControlPlaneAuditLog extends AdminAuditEvent {
@@ -151,6 +157,10 @@ function formatRisk(value?: 'low' | 'medium' | 'high') {
   return value === 'high' ? 'badge-red' : value === 'medium' ? 'badge-amber' : 'badge-emerald';
 }
 
+function roleRequiresClinic(role: string) {
+  return ['MANAGER', 'PROVIDER', 'FRONT_DESK', 'BILLING'].includes(role);
+}
+
 export default function ControlPlane() {
   const { user } = useSession();
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
@@ -189,6 +199,8 @@ export default function ControlPlane() {
   const [editingAccessUserId, setEditingAccessUserId] = useState<string | null>(null);
   const [accessDraft, setAccessDraft] = useState<{ branchIds: string[]; primaryBranchId?: string }>({ branchIds: [] });
   const [auditTrailUserId, setAuditTrailUserId] = useState<string | null>(null);
+  const [resettingPasswordUserId, setResettingPasswordUserId] = useState<string | null>(null);
+  const [temporaryPassword, setTemporaryPassword] = useState('');
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
@@ -232,7 +244,7 @@ export default function ControlPlane() {
   }
 
   const receivedRoles = receivedData(roles.state);
-  const roleOptions = receivedRoles?.roles ?? null;
+  const roleOptions = receivedRoles?.roles.filter(role => role.assignable !== false) ?? null;
   const selectedRole = roleSelection && roleOptions?.some(role => role.enumValue === roleSelection)
     ? roleSelection
     : roleOptions?.[0]?.enumValue ?? '';
@@ -242,7 +254,7 @@ export default function ControlPlane() {
   const headerBadge = overview.state.status === 'loading'
     ? 'Loading…'
     : receivedOverview
-      ? `Checks ${receivedOverview.summary.productionReadinessScore}%`
+      ? `Configured ${receivedOverview.summary.productionReadinessScore}%`
       : 'Checks unavailable';
 
   async function updateUserRole(userId: string, role: string) {
@@ -274,6 +286,20 @@ export default function ControlPlane() {
       `session:${userId}`,
       () => apiRequest(`/v1/control-plane/sessions/${userId}/revoke`, { method: 'PATCH' }),
       () => { users.reload(); sessions.reload(); },
+    );
+  }
+
+  async function resetUserPassword(userId: string) {
+    await runAction(
+      `password:${userId}`,
+      () => apiRequest(`/v1/control-plane/users/${userId}/password-reset`, { method: 'POST', body: JSON.stringify({ password: temporaryPassword }) }),
+      () => {
+        setResettingPasswordUserId(null);
+        setTemporaryPassword('');
+        users.reload();
+        sessions.reload();
+        auditLogs.reload();
+      },
     );
   }
 
@@ -313,7 +339,11 @@ export default function ControlPlane() {
     );
   }
 
-  const inviteValid = inviteForm.name.trim().length >= 2 && /.+@.+\..+/.test(inviteForm.email) && inviteForm.password.length >= 8;
+  const inviteRequiresClinic = roleRequiresClinic(inviteForm.role);
+  const inviteValid = inviteForm.name.trim().length >= 2
+    && /.+@.+\..+/.test(inviteForm.email)
+    && inviteForm.password.length >= 8
+    && (!inviteRequiresClinic || inviteForm.branchIds.length > 0);
 
   return (
     <div className="space-y-6 pb-8">
@@ -334,7 +364,7 @@ export default function ControlPlane() {
       />
 
       <div role="note" className="rounded-2xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-4 py-3 text-xs text-amber-v">
-        The displayed score summarizes selected configuration checks. It is not a security assessment, compliance certification, or authorization to launch.
+        The displayed score is a configuration inventory. Only live, configured provider connections count; mock and sandbox catalogue entries do not. It is not a security assessment, compliance certification, or authorization to launch.
       </div>
 
       {actionFailure && <ResourceErrorNotice title="That change was not saved" failure={actionFailure} />}
@@ -372,15 +402,15 @@ export default function ControlPlane() {
                   <StatCard title="Active users" value={data.summary.activeUsers} subtitle="Enabled accounts" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
                   <StatCard title="Admin users" value={data.summary.adminUsers} subtitle="OWNER / ADMIN" icon={<ShieldCheck className="w-4 h-4" />} accent="violet" />
                   <StatCard title="Clinics" value={data.summary.clinics} subtitle="Branches in tenant" icon={<Building2 className="w-4 h-4" />} accent="amber" />
-                  <StatCard title="Control checks" value={`${data.summary.productionReadinessScore}%`} subtitle="Configured-check score" icon={<BadgeCheck className="w-4 h-4" />} accent="emerald" />
+                  <StatCard title="Configured checks" value={`${data.summary.productionReadinessScore}%`} subtitle="Live controls only" icon={<BadgeCheck className="w-4 h-4" />} accent="emerald" />
                 </div>
 
-                <BentoCard title="Configuration checks" subtitle="Calculated from the runtime signals listed below" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
+                <BentoCard title="Configuration inventory" subtitle="Recorded runtime configuration, not launch certification" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-2xl border border-[var(--b1)] p-4">
-                      <p className="text-xs text-t3">Configured-check score</p>
+                      <p className="text-xs text-t3">Configured live checks</p>
                       <p className="mt-2 text-3xl font-black text-t1">{data.summary.productionReadinessScore}%</p>
-                      <p className="mt-1 text-xs text-t3">Calculated from authentication, secret configuration, access controls, audit logging, and tenant-isolation checks.</p>
+                      <p className="mt-1 text-xs text-t3">Authentication, secrets, live provider connections, access guards, and audit presence. Mock and sandbox connections are excluded.</p>
                     </div>
                     <div className="rounded-2xl border border-[var(--b1)] p-4">
                       <p className="text-xs text-t3">Audit events today</p>
@@ -438,6 +468,8 @@ export default function ControlPlane() {
               const term = userSearch.trim().toLowerCase();
               const visibleUsers = payload.users.filter(userRecord => !term || userRecord.displayName.toLowerCase().includes(term) || userRecord.email.toLowerCase().includes(term));
               const activeBranches = payload.branches.filter(branch => branch.active);
+              const editingAccessUser = payload.users.find(userRecord => userRecord.id === editingAccessUserId);
+              const editingRequiresClinic = editingAccessUser ? roleRequiresClinic(editingAccessUser.role) : true;
               return (
                 <>
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -446,7 +478,7 @@ export default function ControlPlane() {
                       <input value={userSearch} onChange={event => setUserSearch(event.target.value)} placeholder="Search users" className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-10 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]" />
                     </div>
                     <button type="button" onClick={() => setInviteOpen(v => !v)} disabled={!canManage} className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:cursor-not-allowed disabled:opacity-50">
-                      <Plus className="w-3.5 h-3.5" /> Invite user
+                      <Plus className="w-3.5 h-3.5" /> Create account
                     </button>
                   </div>
 
@@ -454,8 +486,8 @@ export default function ControlPlane() {
                     <div className="mt-4 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                       <div className="flex items-start justify-between gap-3">
                         <div>
-                          <p className="text-sm font-semibold text-t1">Invite a new clinic user</p>
-                          <p className="text-xs text-t3">Creates a real tenant user with a temporary password and optional clinic access.</p>
+                          <p className="text-sm font-semibold text-t1">Create a clinic account</p>
+                          <p className="text-xs text-t3">Creates an active tenant account immediately. No invitation is sent; share the temporary password through an approved secure channel.</p>
                         </div>
                         <button type="button" onClick={() => setInviteOpen(false)} className="text-xs font-semibold text-t3 hover:text-t1">Close</button>
                       </div>
@@ -478,7 +510,8 @@ export default function ControlPlane() {
                           value={inviteForm.password}
                           onChange={event => setInviteForm(current => ({ ...current, password: event.target.value }))}
                           placeholder="Temporary password"
-                          type="text"
+                          type="password"
+                          autoComplete="new-password"
                           className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
                         />
                         <select
@@ -498,7 +531,7 @@ export default function ControlPlane() {
                         </select>
                       </div>
                       <div className="mt-4">
-                        <p className="text-xs font-semibold text-t2">Clinic access</p>
+                        <p className="text-xs font-semibold text-t2">Clinic access {inviteRequiresClinic ? <span className="text-red-v">(required)</span> : <span className="font-normal text-t3">(optional for tenant-wide roles)</span>}</p>
                         <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                           {activeBranches.map(branch => (
                             <label key={branch.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2 text-sm text-t2">
@@ -550,7 +583,57 @@ export default function ControlPlane() {
                     </div>
                   )}
 
-                  <div className="mt-4 overflow-x-auto rounded-2xl border border-[var(--b1)]">
+                  <div className="mt-4 space-y-3 md:hidden">
+                    {visibleUsers.map(userRecord => (
+                      <article key={`mobile-${userRecord.id}`} className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4 shadow-[0_12px_32px_rgba(31,42,68,0.06)]">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-t1">{userRecord.displayName}</p>
+                            <p className="mt-0.5 truncate text-xs text-t3">{userRecord.email}</p>
+                          </div>
+                          <span className={`badge shrink-0 ${userRecord.active ? 'badge-emerald' : 'badge-red'}`}>{userRecord.active ? 'Active' : 'Inactive'}</span>
+                        </div>
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          <label className="text-[11px] font-semibold uppercase tracking-[0.08em] text-t3">
+                            Role
+                            {roleOptions ? (
+                              <select
+                                value={userRecord.role}
+                                onChange={event => void updateUserRole(userRecord.id, event.target.value)}
+                                disabled={!canManage || savingAction === `role:${userRecord.id}`}
+                                className="mt-1.5 w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs font-semibold normal-case tracking-normal text-t1 disabled:opacity-60"
+                              >
+                                {roleOptions.map(role => <option key={role.enumValue} value={role.enumValue}>{role.name}</option>)}
+                              </select>
+                            ) : <span className="mt-1.5 block text-xs normal-case tracking-normal text-t1">{userRecord.role}</span>}
+                          </label>
+                          <div>
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-t3">Session</p>
+                            <p className="mt-1.5 text-xs font-semibold text-t1">{userRecord.sessionActive ? 'Active session' : 'No active session'}</p>
+                            <p className="mt-0.5 text-[11px] text-t3">Last login {formatDateTime(userRecord.lastLoginAt)}</p>
+                          </div>
+                        </div>
+                        <div className="mt-3 rounded-xl bg-[var(--s2)] px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-t3">Clinic access</p>
+                          <p className={`mt-1 text-xs ${userRecord.accessBranches.length === 0 && roleRequiresClinic(userRecord.role) ? 'font-semibold text-red-v' : 'text-t1'}`}>
+                                  {roleRequiresClinic(userRecord.role)
+                                    ? userRecord.accessBranches.map(branch => branch.name).join(', ') || 'Assignment missing — sign-in blocked'
+                                    : 'Tenant-wide role'}
+                          </p>
+                        </div>
+                        <div className="mt-4 grid grid-cols-2 gap-2">
+                          <button type="button" onClick={() => { setEditingAccessUserId(userRecord.id); setAccessDraft({ branchIds: userRecord.accessBranches.map(branch => branch.id), primaryBranchId: userRecord.accessBranches.find(branch => branch.isPrimary)?.id }); }} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2">Clinic access</button>
+                          <button type="button" onClick={() => { setResettingPasswordUserId(userRecord.id); setTemporaryPassword(''); }} disabled={!canManage} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 disabled:opacity-50">Reset password</button>
+                          <button type="button" onClick={() => void toggleUserActive(userRecord.id, !userRecord.active)} disabled={!canManage || savingAction === `status:${userRecord.id}`} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 disabled:opacity-50">{userRecord.active ? 'Deactivate' : 'Activate'}</button>
+                          <button type="button" onClick={() => void revokeSession(userRecord.id)} disabled={!canManage || !userRecord.sessionActive || savingAction === `session:${userRecord.id}`} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 disabled:opacity-40">Revoke session</button>
+                          <button type="button" onClick={() => { setAuditTrailUserId(userRecord.id); setActiveTab('audit'); }} className="col-span-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2">View audit trail</button>
+                        </div>
+                      </article>
+                    ))}
+                    {visibleUsers.length === 0 && <p className="rounded-2xl border border-[var(--b1)] p-5 text-center text-xs text-t3">{payload.users.length === 0 ? 'No user accounts returned.' : 'No users match your search.'}</p>}
+                  </div>
+
+                  <div className="mt-4 hidden overflow-x-auto rounded-2xl border border-[var(--b1)] md:block">
                     <table className="min-w-full text-sm">
                       <thead className="bg-[var(--s2)] text-left text-xs text-t3">
                         <tr>
@@ -594,7 +677,11 @@ export default function ControlPlane() {
                             </td>
                             <td className="px-4 py-3">
                               <div className="space-y-2">
-                                <p className="text-xs text-t1">{userRecord.accessBranches.map(branch => branch.name).join(', ') || 'No access configured'}</p>
+                                <p className={`text-xs ${userRecord.accessBranches.length === 0 && roleRequiresClinic(userRecord.role) ? 'font-semibold text-red-v' : 'text-t1'}`}>
+                                  {roleRequiresClinic(userRecord.role)
+                                    ? userRecord.accessBranches.map(branch => branch.name).join(', ') || 'Clinic assignment missing — sign-in blocked'
+                                    : 'Tenant-wide role'}
+                                </p>
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -626,6 +713,14 @@ export default function ControlPlane() {
                                 <button type="button" onClick={() => void revokeSession(userRecord.id)} disabled={!canManage || !userRecord.sessionActive || savingAction === `session:${userRecord.id}`} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40" title={!userRecord.sessionActive ? 'No active session to revoke' : ''}>
                                   Revoke session
                                 </button>
+                                <button
+                                  type="button"
+                                  onClick={() => { setResettingPasswordUserId(userRecord.id); setTemporaryPassword(''); }}
+                                  disabled={!canManage || savingAction === `password:${userRecord.id}`}
+                                  className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-50"
+                                >
+                                  Reset password
+                                </button>
                                 <button type="button" onClick={() => { setAuditTrailUserId(userRecord.id); setActiveTab('audit'); }} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition">
                                   View audit trail
                                 </button>
@@ -651,7 +746,7 @@ export default function ControlPlane() {
                       <div className="flex items-center justify-between gap-3">
                         <div>
                           <p className="text-sm font-semibold text-t1">Edit clinic access</p>
-                          <p className="text-xs text-t3">Changes are saved to the backend UserClinicAccess table.</p>
+                          <p className="text-xs text-t3">{editingRequiresClinic ? 'Changes are saved to the clinic access boundary. Shared staff can switch only between selected clinics.' : 'This role is tenant-wide. Clinic assignments are optional and do not restrict its tenant access.'}</p>
                         </div>
                         <button type="button" onClick={() => setEditingAccessUserId(null)} className="text-xs font-semibold text-t3 hover:text-t1">Close</button>
                       </div>
@@ -682,9 +777,45 @@ export default function ControlPlane() {
                           </label>
                         ))}
                       </div>
+                      {editingRequiresClinic && accessDraft.branchIds.length === 0 && (
+                        <p className="mt-3 text-xs font-semibold text-red-v" role="alert">Select at least one clinic. To remove access entirely, deactivate the account.</p>
+                      )}
                       <div className="mt-4 flex gap-2">
-                        <button type="button" onClick={() => void saveUserAccess(editingAccessUserId)} disabled={savingAction === `access:${editingAccessUserId}`} className="rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition disabled:opacity-50">Save clinic access</button>
+                        <button type="button" onClick={() => void saveUserAccess(editingAccessUserId)} disabled={(editingRequiresClinic && accessDraft.branchIds.length === 0) || savingAction === `access:${editingAccessUserId}`} className="rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition disabled:opacity-50">Save clinic access</button>
                         <button type="button" onClick={() => setEditingAccessUserId(null)} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)] transition">Cancel</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {resettingPasswordUserId && (
+                    <div className="mt-4 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-t1">Set a temporary password</p>
+                          <p className="mt-1 text-xs text-t3">This revokes the user’s current session. No email is sent; share the temporary password through an approved secure channel.</p>
+                        </div>
+                        <button type="button" onClick={() => { setResettingPasswordUserId(null); setTemporaryPassword(''); }} className="text-xs font-semibold text-t3 hover:text-t1">Close</button>
+                      </div>
+                      <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-end">
+                        <label className="flex-1 text-xs font-semibold text-t2">
+                          Temporary password
+                          <input
+                            value={temporaryPassword}
+                            onChange={event => setTemporaryPassword(event.target.value)}
+                            type="password"
+                            autoComplete="new-password"
+                            className="mt-1 w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => void resetUserPassword(resettingPasswordUserId)}
+                          disabled={temporaryPassword.length < 8 || savingAction === `password:${resettingPasswordUserId}`}
+                          className="rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition disabled:opacity-50"
+                        >
+                          Set password and revoke session
+                        </button>
+                        <button type="button" onClick={() => { setResettingPasswordUserId(null); setTemporaryPassword(''); }} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)] transition">Cancel</button>
                       </div>
                     </div>
                   )}
@@ -697,7 +828,7 @@ export default function ControlPlane() {
 
       {activeTab === 'roles' && (
         <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
-          <BentoCard title="Roles & Permissions" subtitle="Read-only matrix until permission editing endpoints are added" headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
+          <BentoCard title="Roles & Permissions" subtitle="Built-in assignable roles and tenant-defined permission records" headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
             <ResourceSection
               label="Roles and permissions"
               state={roles.state}
@@ -719,7 +850,7 @@ export default function ControlPlane() {
                         onChange={event => setRoleSelection(event.target.value)}
                         className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm font-semibold text-t1 outline-none"
                       >
-                        {data.roles.map(role => (
+                        {data.roles.filter(role => role.assignable !== false).map(role => (
                           <option key={role.enumValue} value={role.enumValue}>{role.name}</option>
                         ))}
                       </select>
@@ -729,6 +860,7 @@ export default function ControlPlane() {
                         <span className={`badge ${formatRisk(selectedRoleDetails.risk)}`}>{selectedRoleDetails.risk ?? 'low'}</span>
                         <span className="ml-2 font-semibold text-t1">{selectedRoleDetails.name}</span>
                         <span className="ml-2 text-t3">{selectedRoleDetails.clinicScope}</span>
+                        <span className="ml-2 text-t3">{selectedRoleDetails.permissionSource === 'tenant-override' ? 'Tenant override' : 'Built-in default'}</span>
                       </div>
                     )}
                   </div>
@@ -748,6 +880,7 @@ export default function ControlPlane() {
                             <td className="px-4 py-3">
                               <p className="font-semibold text-t1">{role.name}</p>
                               <p className="text-[11px] text-t3">{role.description}</p>
+                              {role.assignable === false && <p className="mt-1 text-[11px] font-semibold text-amber-v">Permission record only — not assignable as an account role</p>}
                             </td>
                             <td className="px-4 py-3 text-xs text-t2">{role.clinicScope}</td>
                             <td className="px-4 py-3 text-xs text-t2">{role.userCount}</td>
@@ -757,14 +890,18 @@ export default function ControlPlane() {
                       </tbody>
                     </table>
                   </div>
-                  <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                  <p className="mt-4 text-xs font-semibold text-t2">Effective role permissions</p>
+                  <p className="mt-1 text-[11px] text-t3">Each card resolves the grants enforced for this tenant now. A tenant override replaces—not adds to—the built-in default.</p>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
                     {data.permissionMatrix.map(row => (
                       <div key={row.role} className="rounded-2xl border border-[var(--b1)] p-4">
                         <p className="text-sm font-semibold text-t1">{row.role}</p>
                         <p className="mt-1 text-xs text-t3">{row.scope}</p>
+                        <p className="mt-2 text-[10px] font-bold uppercase tracking-widest text-t3">{row.permissionSource === 'tenant-override' ? 'Tenant override' : 'Built-in default'}</p>
                         <div className="mt-2 flex flex-wrap gap-1.5">
                           {row.modules.map(module => <span key={module} className="badge badge-indigo">{module}</span>)}
                         </div>
+                        <p className="mt-3 break-words text-[10.5px] leading-relaxed text-t3">{row.effectivePermissions.length ? row.effectivePermissions.join(' · ') : 'No effective permissions'}</p>
                       </div>
                     ))}
                   </div>
@@ -802,7 +939,7 @@ export default function ControlPlane() {
 
       {activeTab === 'clinics' && (
         <div className="space-y-4">
-          <BentoCard title="Tenant Governance" subtitle="Clinics, tenant status, user access, and security alerts">
+          <BentoCard title="Tenant Governance" subtitle="Clinics, tenant status, user access, and operational alerts">
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <ResourceSection label="Tenant" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="tenant" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
                 {data => <MetricBox label="Tenant" value={data.tenant?.name ?? 'No tenant record returned'} />}
@@ -813,8 +950,8 @@ export default function ControlPlane() {
               <ResourceSection label="Active user count" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="active user count" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
                 {data => <MetricBox label="Active users" value={String(data.summary.activeUsers)} />}
               </ResourceSection>
-              <ResourceSection label="Security alert count" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="security alert count" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
-                {data => <MetricBox label="Security alerts" value={String(data.summary.securityAlerts)} />}
+              <ResourceSection label="Workspace security warning count" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="workspace security warning count" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
+                {data => <MetricBox label="Workspace warnings" value={String(data.summary.securityAlerts)} />}
               </ResourceSection>
             </div>
           </BentoCard>
@@ -832,13 +969,45 @@ export default function ControlPlane() {
               loading={<ResourceSkeleton label="clinics" lines={4} />}
             >
               {rows => (
-                <div className="overflow-x-auto rounded-2xl border border-[var(--b1)]">
+                <>
+                  <div className="space-y-3 md:hidden">
+                    {rows.map(clinic => (
+                      <article key={`mobile-clinic-${clinic.id}`} className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4 shadow-[0_12px_32px_rgba(31,42,68,0.06)]">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-semibold text-t1">{clinic.name}</p>
+                            <p className="mt-0.5 text-xs text-t3">{clinic.location}</p>
+                          </div>
+                          <span className={`badge ${clinic.active ? 'badge-emerald' : 'badge-red'}`}>{clinic.active ? 'Active' : 'Inactive'}</span>
+                        </div>
+                        <div className="mt-4 grid grid-cols-2 gap-2">
+                          <MetricBox label="Assigned users" value={String(clinic.userCount)} />
+                          <MetricBox label="Open revenue alerts" value={String(clinic.openRevenueAlerts)} />
+                          <MetricBox label="Future appointments" value={String(clinic.futureAppointmentCount)} />
+                          <MetricBox label="Operational blockers" value={String(clinic.operationalDependencyCount)} />
+                        </div>
+                        {clinic.activeAssignedUserCount > 0 && <p className="mt-3 text-xs text-t3">{clinic.activeAssignedUserCount} active user assignment{clinic.activeAssignedUserCount === 1 ? '' : 's'} must be moved or deactivated before this clinic can be closed.</p>}
+                        {clinic.operationalDependencyCount > 0 && <p className="mt-2 text-xs text-t3">Resolve {clinic.futureAppointmentCount} future appointment{clinic.futureAppointmentCount === 1 ? '' : 's'}, {clinic.activeProviderScheduleCount} provider schedule{clinic.activeProviderScheduleCount === 1 ? '' : 's'}, {clinic.activeReceptionistLocationCount} receptionist location{clinic.activeReceptionistLocationCount === 1 ? '' : 's'}, and {clinic.activeCampaignCount} campaign{clinic.activeCampaignCount === 1 ? '' : 's'} before closure.</p>}
+                        <button
+                          type="button"
+                          onClick={() => void toggleClinicStatus(clinic.id, !clinic.active)}
+                          disabled={!canManage || savingAction === `clinic:${clinic.id}` || (clinic.active && (clinic.activeAssignedUserCount > 0 || clinic.operationalDependencyCount > 0))}
+                          className="mt-4 w-full rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {clinic.active && (clinic.activeAssignedUserCount > 0 || clinic.operationalDependencyCount > 0) ? 'Resolve dependencies first' : clinic.active ? 'Deactivate clinic' : 'Activate clinic'}
+                        </button>
+                      </article>
+                    ))}
+                  </div>
+                  <div className="hidden overflow-x-auto rounded-2xl border border-[var(--b1)] md:block">
                   <table className="min-w-full text-sm">
                     <thead className="bg-[var(--s2)] text-left text-xs text-t3">
                       <tr>
                         <th className="px-4 py-3">Clinic</th>
                         <th className="px-4 py-3">Users</th>
-                        <th className="px-4 py-3">Security alerts</th>
+                        <th className="px-4 py-3">Future appointments</th>
+                        <th className="px-4 py-3">Operational blockers</th>
+                        <th className="px-4 py-3">Open revenue alerts</th>
                         <th className="px-4 py-3">Status</th>
                         <th className="px-4 py-3">Actions</th>
                       </tr>
@@ -847,17 +1016,34 @@ export default function ControlPlane() {
                       {rows.map(clinic => (
                         <tr key={clinic.id} className="border-t border-[var(--b1)]">
                           <td className="px-4 py-3"><p className="font-semibold text-t1">{clinic.name}</p><p className="text-xs text-t3">{clinic.location}</p></td>
-                          <td className="px-4 py-3 text-xs text-t2">{clinic.userCount}</td>
-                          <td className="px-4 py-3 text-xs text-t2">{clinic.securityAlerts}</td>
+                          <td className="px-4 py-3 text-xs text-t2">
+                            <p>{clinic.userCount}</p>
+                            {!clinic.activeAssignedUserCount ? null : <p className="mt-1 text-[11px] text-t3">{clinic.activeAssignedUserCount} active assignment{clinic.activeAssignedUserCount === 1 ? '' : 's'}</p>}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-t2">{clinic.futureAppointmentCount}</td>
+                          <td className="px-4 py-3 text-xs text-t2">
+                            <p>{clinic.operationalDependencyCount}</p>
+                            {clinic.operationalDependencyCount > 0 && <p className="mt-1 text-[10px] text-t3">{clinic.activeProviderScheduleCount} schedules · {clinic.activeReceptionistLocationCount} phone locations · {clinic.activeCampaignCount} campaigns</p>}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-t2">{clinic.openRevenueAlerts}</td>
                           <td className="px-4 py-3"><span className={`badge ${clinic.active ? 'badge-emerald' : 'badge-red'}`}>{clinic.active ? 'Active' : 'Inactive'}</span></td>
                           <td className="px-4 py-3">
-                            <button type="button" onClick={() => void toggleClinicStatus(clinic.id, !clinic.active)} disabled={!canManage || savingAction === `clinic:${clinic.id}`} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-50">{clinic.active ? 'Deactivate' : 'Activate'}</button>
+                            <button
+                              type="button"
+                              onClick={() => void toggleClinicStatus(clinic.id, !clinic.active)}
+                              disabled={!canManage || savingAction === `clinic:${clinic.id}` || (clinic.active && (clinic.activeAssignedUserCount > 0 || clinic.operationalDependencyCount > 0))}
+                              title={clinic.active && (clinic.activeAssignedUserCount > 0 || clinic.operationalDependencyCount > 0) ? 'Resolve active users and clinic operations before deactivation' : ''}
+                              className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {clinic.active && (clinic.activeAssignedUserCount > 0 || clinic.operationalDependencyCount > 0) ? 'Resolve dependencies' : clinic.active ? 'Deactivate' : 'Activate'}
+                            </button>
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                </div>
+                  </div>
+                </>
               )}
             </ResourceSection>
           </BentoCard>
@@ -865,7 +1051,7 @@ export default function ControlPlane() {
       )}
 
       {activeTab === 'audit' && (
-        <BentoCard title="Audit Logs" subtitle="Real tenant audit history with filters and export controls">
+        <BentoCard title="Audit Logs" subtitle="Recorded tenant history; date filters use UTC and Through includes the full selected UTC day">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5 flex-1">
               <input value={auditFilters.userId} onChange={event => setAuditFilters(current => ({ ...current, userId: event.target.value }))} placeholder="User ID" className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm" />
@@ -954,13 +1140,14 @@ export default function ControlPlane() {
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                   <StatCard title="Auth mode" value={data.authMode} subtitle="Current session strategy" icon={<KeyRound className="w-4 h-4" />} accent="blue" />
                   <ResourceSection label="Control check score" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="control check score" lines={1} rowClassName="h-[104px] rounded-2xl" />}>
-                    {overviewData => <StatCard title="Control checks" value={`${overviewData.summary.productionReadinessScore}%`} subtitle={data.riskLabel} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />}
+                    {overviewData => <StatCard title="Configured checks" value={`${overviewData.summary.productionReadinessScore}%`} subtitle="Application and provider checks" icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />}
                   </ResourceSection>
                   <StatCard title="Alerts" value={data.alerts.length} subtitle="Security warnings" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
                   <StatCard title="Access TTL" value={`${data.accessTokenTtlMinutes}m`} subtitle="Short-lived access tokens" icon={<Lock className="w-4 h-4" />} accent="violet" />
                 </div>
                 <div className="grid gap-4 xl:grid-cols-[1fr_1fr]">
-                  <BentoCard title="Recorded security controls" subtitle="Reported authentication, access, isolation, and infrastructure checks">
+                  <BentoCard title="Application-declared security controls" subtitle="Reported application configuration—not independent infrastructure attestation">
+                    <p role="note" className="mb-3 rounded-xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-3 py-2 text-[11px] leading-relaxed text-amber-v">“Yes” means the running application reports this behavior or configuration. Validate edge proxy, TLS termination, secret custody, database policy enforcement, and monitoring with deployment evidence before certification.</p>
                     <div className="grid gap-2 sm:grid-cols-2">
                       {[
                         ['Password login', data.passwordLoginEnabled],

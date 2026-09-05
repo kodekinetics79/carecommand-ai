@@ -203,6 +203,7 @@ export interface CallLog {
   startedAt: string | null;
   endedAt: string | null;
   createdAt: string;
+  clinic?: { id: string; name: string } | null;
   campaign?: { id: string; name: string } | null;
 }
 

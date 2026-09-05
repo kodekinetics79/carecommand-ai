@@ -80,7 +80,13 @@ async function makeTenant(): Promise<TenantFixture> {
 }
 
 function headers(tenant: TenantFixture, role: Role) {
-  return { authorization: `Bearer ${app.jwt.sign({ userId: tenant.users[role], tenantId: tenant.id, role, type: 'access' })}` };
+  // This suite isolates campaign-class authority inside one clinic. Explicitly
+  // keep tenant-wide administrators in that same clinic so a 404 scope denial
+  // cannot mask the 403 class-permission behavior under test.
+  return {
+    authorization: `Bearer ${app.jwt.sign({ userId: tenant.users[role], tenantId: tenant.id, role, type: 'access' })}`,
+    'x-carecommand-clinic-id': tenant.branchId,
+  };
 }
 
 const inject = (tenant: TenantFixture, role: Role, method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, payload?: unknown) =>

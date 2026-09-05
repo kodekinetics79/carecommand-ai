@@ -376,6 +376,39 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(issued.value);
   });
 
+  app.delete('/tenants/:tenantId/pilot-status-links/:shareId', async (request, reply) => {
+    const { tenantId, shareId } = z.object({ tenantId: uuid, shareId: uuid }).parse(request.params);
+    const share = await db.pilotStatusShare.findFirst({ where: { id: shareId, tenantId }, select: { id: true, label: true, expiresAt: true } });
+    if (!share) return reply.code(404).send({ error: 'not_found', message: 'Pilot status link not found' });
+
+    const revokedAt = new Date();
+    await platformAuditEvent(request, 'pilot.status_link.revocation.requested', { type: 'tenant', id: tenantId, tenantId }, { shareId, label: share.label });
+    const changed = await db.$transaction(async tx => {
+      const update = await tx.pilotStatusShare.updateMany({
+        where: { id: shareId, tenantId, expiresAt: { gt: revokedAt } },
+        data: { expiresAt: revokedAt },
+      });
+      if (update.count === 1) {
+        await tx.auditEvent.create({
+          data: {
+            tenantId,
+            actorUserId: null,
+            action: 'pilot.status_link.revoked',
+            resource: 'pilotStatusShare',
+            resourceId: shareId,
+            requestId: request.id,
+            ipAddress: request.ip,
+            userAgent: request.headers['user-agent'],
+            metadata: { label: share.label, revokedAt: revokedAt.toISOString() },
+          },
+        });
+      }
+      return update.count === 1;
+    });
+    await platformAuditEvent(request, 'pilot.status_link.revoked', { type: 'tenant', id: tenantId, tenantId }, { shareId, changed, revokedAt: revokedAt.toISOString() });
+    return { id: shareId, active: false, alreadyInactive: !changed, revokedAt: revokedAt.toISOString() };
+  });
+
   app.post('/tenants/:tenantId/pilot-import/:entityType/preview', async request => {
     const { tenantId, entityType } = z.object({ tenantId: uuid, entityType: entityTypeSchema }).parse(request.params);
     const body = importBodySchema.parse(request.body);

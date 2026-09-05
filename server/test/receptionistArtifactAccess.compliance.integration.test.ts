@@ -30,16 +30,21 @@ async function makeTenant() {
   await db.tenantFeatureEntitlement.create({
     data: { tenantId: id, featureKey: 'ai_receptionist', enabled: true, source: 'test' },
   });
+  const [branchA, branchB] = await Promise.all([
+    db.branch.create({ data: { tenantId: id, name: 'Downtown', location: 'A' } }),
+    db.branch.create({ data: { tenantId: id, name: 'Lakeside', location: 'B' } }),
+  ]);
   const users = {} as Record<Role, string>;
   for (const role of ['ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK'] as const) {
     const user = await db.user.create({
-      data: { tenantId: id, role, active: true, email: `${role}-${id.slice(0, 8)}@receptionist-rbac.test`, displayName: role },
+      data: { tenantId: id, role, active: true, branchId: role === 'FRONT_DESK' || role === 'BILLING' ? branchA.id : null, email: `${role}-${id.slice(0, 8)}@receptionist-rbac.test`, displayName: role },
     });
     users[role] = user.id;
   }
   const clinic = await db.receptionistClinic.create({
     data: { tenantId: id, name: 'Least Privilege Clinic', phone: phoneFor(id), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
   });
+  await db.receptionistLocation.create({ data: { tenantId: id, clinicId: clinic.id, branchId: branchA.id, name: 'Downtown line', address: '1 Test Way' } });
   const call = await db.receptionistCallLog.create({
     data: {
       tenantId: id,
@@ -69,11 +74,34 @@ async function makeTenant() {
       outcome: 'BOOKED',
     },
   });
+  const otherClinic = await db.receptionistClinic.create({
+    data: { tenantId: id, name: 'Other Branch Clinic', phone: phoneFor(randomUUID()), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
+  });
+  await db.receptionistLocation.create({ data: { tenantId: id, clinicId: otherClinic.id, branchId: branchB.id, name: 'Lakeside line', address: '2 Test Way' } });
+  const otherCall = await db.receptionistCallLog.create({
+    data: { tenantId: id, clinicId: otherClinic.id, callerPhone: '+15555550777', transcriptSummary: 'Other branch call.', outcome: 'NO_ANSWER' },
+  });
+  const sharedClinic = await db.receptionistClinic.create({
+    data: { tenantId: id, name: 'Shared Network Line', phone: phoneFor(randomUUID()), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
+  });
+  await Promise.all([
+    db.receptionistLocation.create({ data: { tenantId: id, clinicId: sharedClinic.id, branchId: branchA.id, name: 'Shared downtown endpoint', address: '3 Test Way' } }),
+    db.receptionistLocation.create({ data: { tenantId: id, clinicId: sharedClinic.id, branchId: branchB.id, name: 'Shared lakeside endpoint', address: '4 Test Way' } }),
+  ]);
+  const sharedCall = await db.receptionistCallLog.create({
+    data: { tenantId: id, clinicId: sharedClinic.id, callerPhone: '+15555550666', transcriptSummary: 'Location was not durably attributed.', outcome: 'ESCALATED' },
+  });
   return {
     id,
     users,
+    branchA: branchA.id,
+    branchB: branchB.id,
     clinicId: clinic.id,
     callId: call.id,
+    otherClinicId: otherClinic.id,
+    otherCallId: otherCall.id,
+    sharedClinicId: sharedClinic.id,
+    sharedCallId: sharedCall.id,
     outboundCampaignId: outboundCampaign.id,
     outboundCallId: outboundCall.id,
   };
@@ -109,8 +137,37 @@ describe('AI receptionist call-artifact least privilege', () => {
     expect(response.statusCode).toBe(200);
     const row = (response.json().data as Array<Record<string, unknown>>).find(item => item.id === tenant.callId);
     expect(row?.transcriptSummary).toBe('Caller requested a routine appointment.');
+    expect(row?.clinic).toEqual({ id: tenant.clinicId, name: 'Least Privilege Clinic' });
     expect(row?.recordingAvailable).toBe(true);
     expect(row?.recordingUrl).toBeNull();
+    expect((response.json().data as Array<Record<string, unknown>>).some(item => item.id === tenant.otherCallId)).toBe(false);
+  });
+
+  it('keeps branch-restricted call lists, call detail and clinic metadata inside the assigned clinic', async () => {
+    const tenant = await makeTenant();
+    const list = await app.inject({ method: 'GET', url: '/v1/receptionist/call-logs', headers: auth(tenant.id, tenant.users.FRONT_DESK) });
+    expect((list.json().data as Array<{ id: string }>).map(row => row.id)).toContain(tenant.callId);
+    expect((list.json().data as Array<{ id: string }>).map(row => row.id)).not.toContain(tenant.otherCallId);
+    expect((list.json().data as Array<{ id: string }>).map(row => row.id)).not.toContain(tenant.sharedCallId);
+
+    const foreignDetail = await app.inject({ method: 'GET', url: `/v1/receptionist/call-logs/${tenant.otherCallId}`, headers: auth(tenant.id, tenant.users.FRONT_DESK) });
+    expect(foreignDetail.statusCode).toBe(404);
+    const ambiguousDetail = await app.inject({ method: 'GET', url: `/v1/receptionist/call-logs/${tenant.sharedCallId}`, headers: auth(tenant.id, tenant.users.FRONT_DESK) });
+    expect(ambiguousDetail.statusCode).toBe(404);
+
+    const clinics = await app.inject({ method: 'GET', url: '/v1/receptionist/clinics', headers: auth(tenant.id, tenant.users.FRONT_DESK) });
+    const visibleClinicIds = (clinics.json() as Array<{ id: string }>).map(row => row.id);
+    expect(visibleClinicIds).toContain(tenant.clinicId);
+    expect(visibleClinicIds).toContain(tenant.sharedClinicId);
+    expect(visibleClinicIds).not.toContain(tenant.otherClinicId);
+
+    const ownerSelectedBranch = await app.inject({ method: 'GET', url: `/v1/receptionist/call-logs?branchId=${tenant.branchB}`, headers: auth(tenant.id, tenant.users.ADMIN) });
+    expect((ownerSelectedBranch.json().data as Array<{ id: string }>).map(row => row.id)).toContain(tenant.otherCallId);
+    expect((ownerSelectedBranch.json().data as Array<{ id: string }>).map(row => row.id)).not.toContain(tenant.callId);
+    expect((ownerSelectedBranch.json().data as Array<{ id: string }>).map(row => row.id)).not.toContain(tenant.sharedCallId);
+
+    const tenantWide = await app.inject({ method: 'GET', url: '/v1/receptionist/call-logs', headers: auth(tenant.id, tenant.users.ADMIN) });
+    expect((tenantWide.json().data as Array<{ id: string }>).map(row => row.id)).toContain(tenant.sharedCallId);
   });
 
   it('discloses recording URLs only to a role with the separate recording permission and audits the read', async () => {
