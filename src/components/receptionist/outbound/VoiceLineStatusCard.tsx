@@ -44,7 +44,7 @@ export function VoiceLineStatusCard({ status, onRefresh }: { status: VoiceLineSt
         {ok ? <CircleCheck className="h-5 w-5 shrink-0 text-emerald-v" aria-hidden="true" /> : <CircleAlert className="h-5 w-5 shrink-0 text-amber-v" aria-hidden="true" />}
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-sm font-bold text-t1">Voice line {ok ? '— ready' : '— needs attention'}</h3>
+            <h3 className="text-sm font-bold text-t1">Outbound voice setup {ok ? '— configured' : '— needs attention'}</h3>
             {view.providerMode === 'mock' && <span className="badge badge-violet">mock mode</span>}
             {view.providerMode === 'unconfigured' && <span className="badge badge-amber">not connected</span>}
             {onRefresh && (
@@ -56,9 +56,9 @@ export function VoiceLineStatusCard({ status, onRefresh }: { status: VoiceLineSt
           <p className="mt-0.5 text-xs text-t3">
             {view.agentScope.agentName ? `Receptionist ${view.agentScope.agentName}. ` : ''}
             {ok
-              ? 'The line is connected and the published configuration passed its check. Each campaign still needs its own readiness checks before activation.'
+              ? 'The published agent configuration passed its check. This does not prove an inbound line is connected. Each outbound campaign and live test still needs its own authorization and readiness checks.'
               : blocking.length
-                ? `${blocking.length} blocking item${blocking.length === 1 ? '' : 's'} before calls can be placed or answered.`
+                ? `${blocking.length} blocking item${blocking.length === 1 ? '' : 's'} before outbound setup is ready.`
                 : 'No blocking items; review the warnings below.'}
           </p>
           {line && <p className={`mt-1 text-xs font-semibold ${TONE_TEXT[line.tone]}`} data-verification={view.verification.status ?? ''}>{line.text}</p>}

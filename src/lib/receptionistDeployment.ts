@@ -158,6 +158,7 @@ export function verificationLine(verification: VerificationView, now: number = D
 // --- Deployments -------------------------------------------------------------
 
 export type DeploymentStatus = 'PENDING' | 'PUBLISHED' | 'VERIFIED' | 'FAILED' | 'SUPERSEDED';
+export type DeploymentMode = 'INBOUND' | 'OUTBOUND_ONLY';
 
 export interface DeploymentStep { name: string; status: 'ok' | 'failed' | 'skipped'; at: string; providerErrorCode?: string | null }
 
@@ -174,6 +175,7 @@ export interface DeploymentStep { name: string; status: 'ok' | 'failed' | 'skipp
  */
 export interface Deployment {
   id: string;
+  deploymentMode?: DeploymentMode;
   status: DeploymentStatus;
   mock: boolean;
   /**
@@ -244,13 +246,14 @@ export interface DeployResponse {
   message?: string;
 }
 
-export type DeploymentChange = 'prompt' | 'tools' | 'intake' | 'voice' | 'language' | 'webhook' | 'beginMessage';
+export type DeploymentChange = 'prompt' | 'tools' | 'intake' | 'voice' | 'language' | 'webhook' | 'beginMessage' | 'deploymentMode';
 
 export interface ToolsDiff { added: string[]; removed: string[]; changed: string[] }
 
 export interface DeploymentDiff {
   deployment: {
     id: string; status: DeploymentStatus; verifiedAt: string | null;
+    deploymentMode?: DeploymentMode;
     configurationReference?: string | null; voiceId: string; language: string;
     mock?: boolean; publishedAt?: string | null; providerErrorCode?: string | null;
   } | null;
@@ -260,7 +263,7 @@ export interface DeploymentDiff {
    * used to ride along here are the supplier's coordinates and now stay on
    * the server.
    */
-  draft: { voiceId: string; language: string; toolNames?: string[] };
+  draft: { voiceId: string; language: string; toolNames?: string[]; deploymentMode?: DeploymentMode };
   changed: DeploymentChange[];
   /**
    * The route sends `changed` and `placeholders`, not a tools diff. It is
@@ -1061,7 +1064,7 @@ function query(params: Record<string, string | undefined>): string {
 export const deploymentApi = {
   voiceLineStatus: (scope: { clinicId?: string; campaignId?: string } = {}, signal?: AbortSignal) =>
     apiRequest<VoiceLineStatusLike>(`${base}/voice-line-status${query(scope)}`, { signal }).then(normalizeVoiceLineStatus),
-  deploy: (campaignId: string) => apiRequest<unknown>(`${base}/campaigns/${campaignId}/deploy`, { method: 'POST', body: JSON.stringify({}) })
+  deploy: (campaignId: string, deploymentMode: DeploymentMode = 'INBOUND') => apiRequest<unknown>(`${base}/campaigns/${campaignId}/deploy`, { method: 'POST', body: JSON.stringify({ deploymentMode }) })
     .then(raw => {
       const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
       const verification = body.verification && typeof body.verification === 'object'
@@ -1071,8 +1074,8 @@ export const deploymentApi = {
     }),
   latestDeployment: (campaignId: string, signal?: AbortSignal) =>
     apiRequest<unknown>(`${base}/campaigns/${campaignId}/deployments/latest`, { signal }).then(unwrapDeployment),
-  deploymentDiff: (campaignId: string, signal?: AbortSignal) =>
-    apiRequest<unknown>(`${base}/campaigns/${campaignId}/deployment-diff`, { signal }).then(normalizeDeploymentDiff),
+  deploymentDiff: (campaignId: string, signal?: AbortSignal, deploymentMode?: DeploymentMode) =>
+    apiRequest<unknown>(`${base}/campaigns/${campaignId}/deployment-diff${query({ deploymentMode })}`, { signal }).then(normalizeDeploymentDiff),
   readiness: (campaignId: string, signal?: AbortSignal) => apiRequest<ReadinessResponse>(`${base}/campaigns/${campaignId}/readiness`, { signal }),
   activate: (campaignId: string) => apiRequest<Campaign>(`${base}/campaigns/${campaignId}/activate`, { method: 'POST', body: JSON.stringify({}) }),
   pause: (campaignId: string) => apiRequest<Campaign>(`${base}/campaigns/${campaignId}/pause`, { method: 'POST', body: JSON.stringify({}) }),

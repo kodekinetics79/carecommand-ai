@@ -27,6 +27,7 @@ import { uuid, idParam, writeRoles, callArtifactRead } from './shared';
 // ===========================================================================
 
 type DeploymentRowShape = {
+  deploymentMode?: string;
   id: string; status: string; mock: boolean; providerAgentId: string | null; providerAgentVersion: number | null;
   providerLlmVersion: number | null; providerVersionTag: string; promptHash: string; toolFingerprint: string;
   intakeFingerprint: string; configFingerprint: string; voiceId: string; language: string; steps: unknown;
@@ -55,6 +56,7 @@ function deploymentProjection(row: DeploymentRowShape) {
   return {
     id: row.id,
     status: row.status,
+    deploymentMode: row.deploymentMode ?? 'INBOUND',
     mock: row.mock,
     configurationReference: configurationReference({ deploymentId: row.id }),
     voiceId: row.voiceId,
@@ -130,16 +132,22 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
     config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
   }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
+    const { deploymentMode } = z.object({
+      deploymentMode: z.enum(['INBOUND', 'OUTBOUND_ONLY']).default('INBOUND'),
+    }).parse(request.body ?? {});
     const outcome = await deployCampaignToRetell({
       tenantId: request.auth.tenantId,
       campaignId: id,
+      deploymentMode,
       actor: { userId: request.auth.userId, source: 'USER', requestId: request.id, ip: request.ip },
     });
     if (outcome.ok) {
       return reply.code(200).send({
         deployment: deploymentProjection(outcome.deployment),
         verification: { status: 'pending' as const },
-        message: `Published to the line. Run the ${VOICE.checkLower} to confirm the live line is running exactly this configuration.`,
+        message: deploymentMode === 'OUTBOUND_ONLY'
+          ? 'Published for outbound calls only. No inbound number was connected or changed. Verify the published configuration before placing calls.'
+          : `Published to the line. Run the ${VOICE.checkLower} to confirm the live line is running exactly this configuration.`,
       });
     }
     const remediation = remediationFor(outcome.code, { campaignId: id });
@@ -178,6 +186,7 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
   // acts on and the hashes are the evidence behind them.
   app.get('/campaigns/:id/deployment-diff', { preHandler: callArtifactRead }, async request => {
     const { id } = idParam.parse(request.params);
+    const query = z.object({ deploymentMode: z.enum(['INBOUND', 'OUTBOUND_ONLY']).optional() }).parse(request.query);
     const campaign = await loadCampaignGraph(db, request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
     const deployment = await db.receptionistAgentDeployment.findFirst({
@@ -188,7 +197,8 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
     if (!promptConfig) {
       throw app.httpErrors.conflict('No locale pack is available for this clinic’s country and language, so the prompt cannot be rendered. Approve a locale pack for the clinic.');
     }
-    const plan = planDeployment(promptConfig, { mock: deployment?.mock });
+    const deploymentMode = query.deploymentMode ?? (deployment?.deploymentMode === 'OUTBOUND_ONLY' ? 'OUTBOUND_ONLY' : 'INBOUND');
+    const plan = planDeployment(promptConfig, { mock: deployment?.mock, deploymentMode });
     // The diff is a set of CHIPS — "Prompt changed", "Voice changed". The
     // hashes behind them were the evidence, and shipping them let the browser
     // print `prompt a91f0c3d…` beside a version number in a card whose whole
@@ -199,11 +209,13 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
       deployment: deployment
         ? {
           id: deployment.id, status: deployment.status, verifiedAt: deployment.verifiedAt,
+          deploymentMode: deployment.deploymentMode,
           configurationReference: configurationReference({ deploymentId: deployment.id }),
           voiceId: deployment.voiceId, language: deployment.language,
         }
         : null,
       draft: {
+        deploymentMode,
         voiceId: plan.voiceId,
         language: plan.language,
         toolNames: plan.config.tools.map(tool => String(tool.name ?? '')).sort(),

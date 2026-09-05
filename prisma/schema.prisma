@@ -2275,6 +2275,8 @@ model ReceptionistAgentDeployment {
   agentId              String                       @db.Uuid
   campaignId           String                       @db.Uuid
   status               ReceptionistDeploymentStatus @default(PENDING)
+  // Publication purpose is evidence; an unbound inbound attempt is not an outbound deployment.
+  deploymentMode       String                       @default("INBOUND")
   // True when the deployment was made against the mock provider. Enforced
   // against the hash prefixes by a CHECK so mock evidence can never be read as
   // live evidence.

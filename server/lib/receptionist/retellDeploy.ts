@@ -79,6 +79,7 @@ const LIVE_DEPLOYMENT_STATUSES = ['PUBLISHED', 'VERIFIED'] as const;
 // ===========================================================================
 
 export interface DeployPlan {
+  deploymentMode: DeploymentMode;
   config: RetellConfig;
   systemPrompt: string;
   promptHash: string;
@@ -97,11 +98,14 @@ export interface DeployPlan {
  * Pure. The single source of what a deployment WOULD publish — used by deploy,
  * by the draft-versus-deployed diff, and by readiness, so all three agree.
  */
-export function planDeployment(config: PromptConfig, options: { mock?: boolean } = {}): DeployPlan {
+export type DeploymentMode = 'INBOUND' | 'OUTBOUND_ONLY';
+
+export function planDeployment(config: PromptConfig, options: { mock?: boolean; deploymentMode?: DeploymentMode } = {}): DeployPlan {
   const mock = options.mock ?? retellConfigStatus().mock;
   const built = buildRetellConfig(config, { webhookBaseUrl: env.PUBLIC_API_URL });
   const systemPrompt = generateSystemPrompt(config);
   return {
+    deploymentMode: options.deploymentMode ?? 'INBOUND',
     config: built,
     systemPrompt,
     promptHash: hashPrompt(systemPrompt, { mock }),
@@ -110,6 +114,8 @@ export function planDeployment(config: PromptConfig, options: { mock?: boolean }
     // Everything the provider agent carries that is NOT the prompt or the
     // tools, so a voice or language change is visible as its own difference.
     configFingerprint: createHash('sha256').update(JSON.stringify({
+      // Preserve historical inbound hashes; outbound purpose must have its own identity.
+      ...(options.deploymentMode === 'OUTBOUND_ONLY' ? { deploymentMode: 'OUTBOUND_ONLY' } : {}),
       voiceId: built.voiceId,
       language: built.language,
       webhookUrl: built.webhookUrl,
@@ -125,18 +131,20 @@ export function planDeployment(config: PromptConfig, options: { mock?: boolean }
   };
 }
 
-export type DeployChange = 'prompt' | 'beginMessage' | 'tools' | 'intake' | 'voice' | 'language' | 'config';
+export type DeployChange = 'prompt' | 'beginMessage' | 'tools' | 'intake' | 'voice' | 'language' | 'config' | 'deploymentMode';
 
 /** Which parts of the draft differ from what is deployed. Chips, not a diff viewer. */
 export function deploymentChanges(
-  plan: Pick<DeployPlan, 'promptHash' | 'beginMessageHash' | 'toolFingerprint' | 'intakeFingerprint' | 'configFingerprint' | 'voiceId' | 'language'>,
+  plan: Pick<DeployPlan, 'promptHash' | 'beginMessageHash' | 'toolFingerprint' | 'intakeFingerprint' | 'configFingerprint' | 'voiceId' | 'language'> & { deploymentMode?: DeploymentMode },
   deployed: {
     promptHash: string; beginMessageHash: string; toolFingerprint: string;
     intakeFingerprint: string; configFingerprint: string; voiceId: string; language: string;
+    deploymentMode?: string;
   } | null,
 ): DeployChange[] {
   if (!deployed) return ['prompt', 'beginMessage', 'tools', 'intake', 'voice', 'language', 'config'];
   const changed: DeployChange[] = [];
+  if ((plan.deploymentMode ?? 'INBOUND') !== (deployed.deploymentMode ?? 'INBOUND')) changed.push('deploymentMode');
   if (plan.promptHash !== deployed.promptHash) changed.push('prompt');
   if (plan.beginMessageHash !== deployed.beginMessageHash) changed.push('beginMessage');
   if (plan.toolFingerprint !== deployed.toolFingerprint) changed.push('tools');
@@ -159,6 +167,7 @@ export type DeployOutcome =
 export interface DeployInput {
   tenantId: string;
   campaignId: string;
+  deploymentMode?: DeploymentMode;
   actor: VerifyActor;
   now?: Date;
 }
@@ -342,14 +351,15 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     if (!promptConfig) {
       return { kind: 'error' as const, code: 'locale_pack_unavailable' as DeployFailureCode, message: 'No locale pack is available for this clinic’s country and language, so the prompt cannot be rendered.' };
     }
-    const plan = planDeployment(promptConfig, { mock: status.mock });
+    const deploymentMode = input.deploymentMode ?? 'INBOUND';
+    const plan = planDeployment(promptConfig, { mock: status.mock, deploymentMode });
     if (plan.placeholders.length) {
       return { kind: 'error' as const, code: 'placeholders_present' as ReceptionistDeployFailureCode, message: 'Replace the placeholder values before deploying.', placeholders: plan.placeholders };
     }
 
     // ---- A1: which line does THIS clinic answer on? ------------------------
-    const inboundNumber = clinicInboundNumber(campaign.clinic);
-    if (!inboundNumber) {
+    const inboundNumber = deploymentMode === 'INBOUND' ? clinicInboundNumber(campaign.clinic) : null;
+    if (deploymentMode === 'INBOUND' && !inboundNumber) {
       return { kind: 'error' as const, code: 'inbound_number_unassigned' as ReceptionistDeployFailureCode, message: 'This clinic has no inbound number, so a deployment has nothing to bind. Set the clinic’s inbound line in Studio, then deploy.' };
     }
     // Another live deployment in this tenant already owns the line. Binding
@@ -357,7 +367,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     // callers would reach this agent, this clinic's hours and this clinic's
     // branch, while both checklists still read green. (Across tenants the
     // clinic-level global unique index settles it before we get here.)
-    const numberOwner = await tx.receptionistAgentDeployment.findFirst({
+    const numberOwner = inboundNumber ? await tx.receptionistAgentDeployment.findFirst({
       where: {
         tenantId: input.tenantId,
         boundPhoneNumber: inboundNumber,
@@ -366,13 +376,13 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         clinicId: { not: campaign.clinicId },
       },
       select: { id: true, clinicId: true },
-    });
+    }) : null;
     if (numberOwner) {
       return { kind: 'error' as const, code: 'inbound_number_conflict' as ReceptionistDeployFailureCode, message: 'Another clinic’s live deployment already answers on this number. Give this clinic its own inbound line, or retire the other clinic’s deployment first — one number cannot answer for two clinics.' };
     }
     // Persist the claim so the line is an explicit fact from here on and the
     // active-unique index — not whichever deploy ran last — owns it.
-    if (campaign.clinic.inboundNumber !== inboundNumber) {
+    if (inboundNumber && campaign.clinic.inboundNumber !== inboundNumber) {
       await tx.receptionistClinic.update({ where: { id: campaign.clinicId }, data: { inboundNumber } });
     }
 
@@ -383,6 +393,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         agentId: agent.id,
         campaignId: campaign.id,
         status: 'PENDING',
+        deploymentMode,
         mock: plan.mock,
         providerVersionTag: agent.providerVersionTag,
         promptHash: plan.promptHash,
@@ -576,7 +587,9 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
   let numberBound = false;
   const targetNumber = claim.inboundNumber;
   let bindError: string | null = null;
-  if (!outOfBudget()) {
+  if (claim.deployment.deploymentMode === 'OUTBOUND_ONLY') {
+    stamp('bind_number', 'skipped', { detail: 'Outbound-only publication; no inbound number claimed or changed.' });
+  } else if (targetNumber && !outOfBudget()) {
     const bound = await updatePhoneNumberInboundAgent(targetNumber, {
       agentId: providerAgent.value.agentId,
       agentVersion: published.value.version,
@@ -644,6 +657,13 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
       data: {
         providerAgentId: providerAgent.value.agentId,
         currentDeploymentId: deployment.id,
+        // Inbound evidence belongs to the previous publication, not this
+        // outbound-only one. Historical deployment rows retain that evidence.
+        ...(deployment.deploymentMode === 'OUTBOUND_ONLY' ? {
+          providerInboundNumber: null,
+          providerInboundNumberVerifiedAt: null,
+          providerInboundNumberErrorCode: null,
+        } : {}),
         providerStatus: 'UNVERIFIED',
         providerVerifiedRevision: null,
         providerVerifiedAt: null,
@@ -675,6 +695,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         toolFingerprint: deployment.toolFingerprint,
         providerAgentVersion: deployment.providerAgentVersion,
         numberBound: deployment.numberBound,
+        deploymentMode: deployment.deploymentMode,
         boundPhoneNumber: deployment.boundPhoneNumber,
         clinicId: deployment.clinicId,
         mock: deployment.mock,
