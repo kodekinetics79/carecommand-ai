@@ -120,9 +120,9 @@ export default function Settings() {
 
       {canAdminister && <SettingsSummary overview={overview} posture={posture} />}
 
-      <div className="grid gap-4 lg:grid-cols-[220px_1fr] items-start">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[220px_minmax(0,1fr)] items-start">
         {/* Section nav */}
-        <nav className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-2 lg:sticky lg:top-4">
+        <nav aria-label="Administration sections" className="min-w-0 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-2 lg:sticky lg:top-4">
           <div className="flex lg:flex-col gap-1 overflow-x-auto">
             {visibleNav.map(item => {
               const Icon = item.icon;

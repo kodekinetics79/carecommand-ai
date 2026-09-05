@@ -187,6 +187,57 @@ succeeded. Clinical decisions, prescriptions and coverage determinations remain 
 
 ## Remaining delivery sequence
 
+### Continued customer run: clinic provisioning and release recovery
+
+- Clinic release `fdbb97cdc2c552d43a7d252379c237c37dcf9b05` pushed to main;
+  Render health confirmed that exact production SHA at 2026-09-05T12:44:47Z.
+  Production owner UI created **Bright Health — Irvine**. Duplicate submission
+  was refused with a useful conflict message and retained form values; two
+  branches remained. Local branch/HTTP/component suite: 13 passed, zero failed.
+- Receptionist location mappings now show Arlington / America/New_York and
+  Irvine / America/Los_Angeles. Both have explicitly synthetic addresses and
+  access notes. Contact numbers are authorized destinations ending 5555/5556;
+  neither this setup nor the shared outbound number is proof of inbound binding.
+- Live calls remain blocked by `agent_linked` and
+  `live_test_tenant_not_authorized`. The configured attended-test scope is not
+  Bright Health. No calls placed and no admission/security checks bypassed.
+
+#### BH-UI-001 — P1 — deployment entry failure leaves a blank workspace
+
+- Category/module: reliability defect / application startup.
+- Reproduction: keep the production app open across the frontend release;
+  reload Administration while the old document still references the prior entry.
+- Expected: current app or actionable recovery UI. Actual: blank root, no message.
+- Evidence: CUA blank-page screenshot and empty DOM; requested entry
+  `/assets/index-B29ql2ZS.js` returned HTTP 200 **text/html**, not JavaScript, at
+  12:44:46Z. A second reload after deployment settled recovered Administration.
+- Impact: staff cannot operate the application during this version-skew failure.
+- Root-cause hypothesis: missing old entry asset meets SPA catch-all; existing
+  dynamic-import recovery lives inside the entry and cannot run if it never loads.
+- Remediation: independent early bootstrap, one reload per entry signature,
+  visible static fallback/manual reload, and fail-safe behavior if storage is denied.
+  No CSP relaxation, credential access, data mutation or infinite retry loop.
+- Retest: local Chrome fault injection using built HTML and a deliberately missing
+  entry showed the recovery message. Server observed exactly two document requests
+  (initial plus one automatic retry), not a loop. Five unit tests PASS. Production
+  normal-startup retest pending the follow-up release; historical stale documents
+  without the bootstrap still need manual reload.
+- Reference: https://vite.dev/guide/build#load-error-handling distinguishes dynamic
+  import errors; this change handles the earlier entry-load failure separately.
+
+#### BH-UI-002 — P2 — Administration overflows a narrow workspace
+
+- Category/module: responsive UX defect / Administration navigation.
+- Reproduction: open Settings at a measured 675px viewport; open Add clinic and
+  focus fields. Expected: contained tabs and fully visible form. Actual: a 1062px
+  navigation grid stretched content; root scrollWidth 1077px and scrollLeft 48px
+  clipped the left side. Evidence: CUA screenshot and DOM bounding measurements.
+- Impact: narrow-window users lose labels and working space.
+- Root cause: automatic grid minimum and non-shrinkable navigation item.
+- Remediation: explicit single-column minmax grid on narrow screens and min-w-0
+  navigation; desktop content track also minmax(0,1fr).
+- Retest: structural regression test PASS; exact rendered retest pending deployment.
+
 1. Release safety fixes; approve revised locale pack and republish provider prompt.
 2. Complete Bright Health branch/provider/service/hours setup through owner UI.
 3. Prove authorized live call, task handoff, booking and provider failure recovery.

@@ -5,10 +5,19 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CareCommand AI</title>
+    <script src="/app-bootstrap.js"></script>
   </head>
   <body>
     <!-- THESIS: Today turns operational signals into accountable work and refuses the passive KPI dashboard. OWN-WORLD: deep navy rail, warm white working canvas, indigo actions, crisp hairlines, restrained semantic states. STORY: a practice manager reads the briefing, verifies source and freshness, then opens the safest source workflow. FIRST VIEWPORT: persistent scope above a morning brief, three priority actions, a dominant live ledger, capability health, and PHI-safe readiness evidence. FORM: Operational Briefing, grounded candidate 7, seed 75f25bc6. FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance -->
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <div id="root">
+      <main id="app-startup" aria-labelledby="app-startup-title" style="max-width:32rem;margin:12vh auto;padding:2rem;font-family:system-ui,sans-serif;color:#18243b;background:#fff;border:1px solid #dce2ec;border-radius:1rem">
+        <p>CareCommand AI</p>
+        <h1 id="app-startup-title">Opening your workspace…</h1>
+        <p id="app-startup-message" role="status">If this page does not open, reload to get the latest application. Your saved records are not changed.</p>
+        <a href="" id="app-startup-reload">Reload this page</a>
+        <noscript><p>JavaScript is required to use this workspace. Enable it for this site, then reload.</p></noscript>
+      </main>
+    </div>
+    <script id="carecommand-entry" type="module" src="/src/main.tsx"></script>
   </body>
 </html>

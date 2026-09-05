@@ -79,6 +79,13 @@ beforeEach(() => {
 });
 
 describe('Administration role-aware journey', () => {
+  it('contains narrow-screen navigation inside a shrinkable single-column grid', () => {
+    renderPage();
+    const navigation = screen.getByRole('navigation', { name: 'Administration sections' });
+    expect(navigation).toHaveClass('min-w-0');
+    expect(navigation.parentElement).toHaveClass('grid-cols-1');
+  });
+
   it('keeps a provider in personal settings and issues no admin-only request', () => {
     sessionState.user = { role: 'PROVIDER', effectivePermissions: [] };
     renderPage();
