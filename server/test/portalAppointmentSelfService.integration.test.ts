@@ -79,6 +79,10 @@ describe('portal self-service — patient cancels/reschedules only their own app
   it('returns the canonical provider id and patient-safe provider name for slot-based rescheduling', async () => {
     const t = await makeTenant();
     const appt = await makeAppt(t, t.patientId, at('09:00'));
+    await db.appointment.update({
+      where: { id: appt.id },
+      data: { patientConfirmedAt: new Date(), patientConfirmationSource: 'patient_portal' },
+    });
 
     const res = await app.inject({ method: 'GET', url: '/v1/portal/appointments', headers: phdr(t) });
     expect(res.statusCode, res.body).toBe(200);
@@ -157,6 +161,7 @@ describe('portal self-service — patient cancels/reschedules only their own app
     expect(res.json().startsAt).toBe(at('11:00').toISOString());
     const row = await db.appointment.findUnique({ where: { id: appt.id } });
     expect(row?.startsAt.toISOString()).toBe(at('11:00').toISOString());
+    expect(row).toMatchObject({ patientConfirmedAt: null, patientConfirmationSource: null, patientConfirmedCallLogId: null });
     const audited = await db.auditEvent.findFirst({ where: { tenantId: t.id, action: 'portal.appointment.rescheduled', resourceId: appt.id, actorUserId: null } });
     expect(audited).not.toBeNull();
   });

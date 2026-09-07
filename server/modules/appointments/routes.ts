@@ -265,7 +265,16 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       updated = await runWithTenantContext(request.auth.tenantId, async tx => {
         const changed = await tx.appointment.updateMany({
           where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
-          data: { startsAt: body.startsAt, endsAt: body.endsAt, status: nextStatus },
+          data: {
+            startsAt: body.startsAt,
+            endsAt: body.endsAt,
+            status: nextStatus,
+            // A confirmation belongs to the exact time the patient accepted.
+            // Moving the appointment must never carry that evidence forward.
+            patientConfirmedAt: null,
+            patientConfirmationSource: null,
+            patientConfirmedCallLogId: null,
+          },
         });
         if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
         return tx.appointment.findUniqueOrThrow({ where: { id } });

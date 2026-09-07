@@ -79,7 +79,16 @@ async function bookableClinic(policy: { confirmBookingsBySms?: boolean; confirmB
       phone: '+15551230000', email: `pat-${tag}@example.test`, lifecycleStage: 'ACTIVE',
     },
   });
-  await db.schedulingPolicy.create({ data: { tenantId, ...policy } });
+  const fixtureNow = new Date();
+  const quietStartMinute = (fixtureNow.getUTCHours() * 60 + fixtureNow.getUTCMinutes() + 60) % 1440;
+  const quietEndMinute = (quietStartMinute + 1) % 1440;
+  const hhmm = (minute: number) => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+  await db.schedulingPolicy.create({ data: {
+    tenantId,
+    ...policy,
+    communicationQuietHoursStart: hhmm(quietStartMinute),
+    communicationQuietHoursEnd: hhmm(quietEndMinute),
+  } });
 
   const login = await app.inject({
     method: 'POST', url: '/v1/auth/login',

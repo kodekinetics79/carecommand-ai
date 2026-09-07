@@ -53,6 +53,7 @@ type FixtureOptions = {
   maxAttempts?: number;
   nextAttemptAt?: Date | null;
   updatedAt?: Date;
+  quietHours?: { start: string; end: string };
 };
 
 async function fixture(options: FixtureOptions = {}) {
@@ -60,6 +61,15 @@ async function fixture(options: FixtureOptions = {}) {
   await db.tenant.create({
     data: { id: tenantId, name: `confirmation-${tenantId.slice(0, 8)}`, slug: `confirmation-${tenantId.slice(0, 8)}` },
   });
+  const fixtureNow = new Date();
+  const quietStartMinute = (fixtureNow.getUTCHours() * 60 + fixtureNow.getUTCMinutes() + 60) % 1440;
+  const quietEndMinute = (quietStartMinute + 1) % 1440;
+  const hhmm = (minute: number) => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+  await db.schedulingPolicy.create({ data: {
+    tenantId,
+    communicationQuietHoursStart: options.quietHours?.start ?? hhmm(quietStartMinute),
+    communicationQuietHoursEnd: options.quietHours?.end ?? hhmm(quietEndMinute),
+  } });
   const branch = await db.branch.create({
     data: { tenantId, name: 'Confirmation branch', location: 'Test', timezone: 'UTC', active: true },
   });
@@ -192,6 +202,24 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
     await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 0 });
     await expect(processConfirmations(item, true)).resolves.toMatchObject({ sms: { status: 'already_accepted', acceptedNow: false } });
     expect(sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it('defers a due confirmation during clinic-local quiet hours without consuming an attempt', async () => {
+    const now = new Date();
+    const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const hhmm = (value: number) => {
+      const normalized = (value + 1440) % 1440;
+      return `${String(Math.floor(normalized / 60)).padStart(2, '0')}:${String(normalized % 60).padStart(2, '0')}`;
+    };
+    const item = await fixture({ quietHours: { start: hhmm(minute - 1), end: hhmm(minute + 2) } });
+
+    await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 1 });
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    const event = await db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } });
+    expect(event).toMatchObject({ status: 'queued', attempts: 0, failureReason: null });
+    expect(event.nextAttemptAt && event.nextAttemptAt > now).toBe(true);
+    expect(await db.notificationDeliveryAttempt.count({ where: { notificationEventId: event.id } })).toBe(0);
   });
 
   it('honors an opt-out recorded after commit and suppresses before the provider boundary', async () => {

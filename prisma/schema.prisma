@@ -1065,6 +1065,10 @@ model SchedulingPolicy {
   // never asked to send. A clinic opts in.
   confirmBookingsBySms          Boolean  @default(false)
   confirmBookingsByEmail        Boolean  @default(false)
+  // Transactional appointment messages use the appointment branch timezone.
+  // Conservative defaults protect existing tenants until they choose a window.
+  communicationQuietHoursStart  String   @default("20:00")
+  communicationQuietHoursEnd    String   @default("08:00")
   createdAt                     DateTime @default(now())
   updatedAt                     DateTime @updatedAt
   tenant                        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
