@@ -40,14 +40,14 @@ describe('AI receptionist conversation safety contract', () => {
     expect(RECORDING_DISCLOSURE_EVIDENCE_TEMPLATE.endsWith('{{clinic_disclosure}} Is that okay?')).toBe(true);
   });
 
-  // C4 — the begin message used to be the consent question ALONE, so the first
-  // thing a patient heard was an interrogation. It is now one turn that greets
-  // first and still ends on the consent question, so the agent must stop and
-  // wait. The greeting override still waits for consent.
-  it('greets the caller in the same turn as the disclosure, and still ends on the consent question', () => {
+  // The first turn must work for both inbound and outbound calls because one
+  // shared clinic agent handles both directions. Direction-specific wording
+  // belongs after consent, when the signed provider direction is available.
+  it('opens with a direction-neutral disclosure and still ends on the consent question', () => {
     const built = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' });
 
-    expect(built.beginMessage.startsWith('Thanks for calling Example Clinic.')).toBe(true);
+    expect(built.beginMessage.startsWith("Hi, I'm Avery, an AI assistant for Example Clinic.")).toBe(true);
+    expect(built.beginMessage).not.toMatch(/Thanks for calling|you've reached/i);
     expect(built.beginMessage).toContain('This call may be recorded or monitored');
     expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
     // The campaign greeting override is still not spoken before consent.

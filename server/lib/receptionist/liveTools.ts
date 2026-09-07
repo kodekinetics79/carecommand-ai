@@ -1720,7 +1720,12 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
   }
   if (name === 'verify_patient_identity') return verifyPatientIdentity(ctx, args);
   if (name === 'request_appointment') {
-    if (!ctx.callId) return { requested: false, needs_human: true, message: 'I could not bind this request to the active call. Please contact the front desk.' };
+    const requestPack = await callPack(ctx);
+    if (!ctx.callId) return {
+      requested: false,
+      needs_human: true,
+      message: speak(requestPack, 'tool.appointment_request.unbound', {}, 'I could not bind this request to the active call. Please contact the front desk.'),
+    };
     // The signed provider envelope and persisted call own the callback number.
     // A model-supplied phone value can never redirect the request to somebody
     // else. runBookingHandoff enforces request-only behavior and idempotency.
@@ -1728,7 +1733,11 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
     delete trustedArgs.phone;
     delete trustedArgs.callback_phone;
     const result = await runBookingHandoff(ctx.callId, trustedArgs);
-    if (!result.handled) return { requested: false, needs_human: true, message: 'I could not confirm this is an authorized outbound appointment-request campaign. Please contact the front desk.' };
+    if (!result.handled) return {
+      requested: false,
+      needs_human: true,
+      message: speak(requestPack, 'tool.appointment_request.unauthorized', {}, 'I could not confirm this is an authorized outbound appointment-request campaign. Please contact the front desk.'),
+    };
     return {
       requested: Boolean(result.appointmentRequestId),
       appointment_request_id: result.appointmentRequestId,
@@ -1736,8 +1745,8 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
       duplicate: result.reason === 'duplicate_webhook' || undefined,
       booked: false,
       message: result.appointmentRequestId
-        ? 'Your appointment request is recorded for staff review. No appointment or time is booked or held yet.'
-        : 'I could not confirm that the request was recorded. Please contact the front desk.',
+        ? speak(requestPack, 'tool.appointment_request.recorded', {}, 'Your appointment request is recorded for staff review. No appointment or time is booked or held yet.')
+        : speak(requestPack, 'tool.appointment_request.failed', {}, 'I could not confirm that the request was recorded. Please contact the front desk.'),
     };
   }
   if (name === 'list_upcoming_appointments') return listUpcomingAppointments(ctx);

@@ -140,6 +140,10 @@ export const LOCALE_PACK_MESSAGE_KEYS = {
   'tool.confirm.locked': { vars: [], describe: 'confirm_appointment refused because the appointment is cancelled, completed or otherwise no longer confirmable by voice. Offers a human.' },
   'tool.message.recorded': { vars: [], describe: 'take_message recorded a new callback request.' },
   'tool.message.appended': { vars: [], describe: 'take_message appended to the callback request already open for this call.' },
+  'tool.appointment_request.unbound': { vars: [], describe: 'Outbound appointment request could not be bound to the active call.' },
+  'tool.appointment_request.unauthorized': { vars: [], describe: 'Call is not an authorized outbound appointment-request campaign.' },
+  'tool.appointment_request.recorded': { vars: [], describe: 'Appointment request recorded for staff review without claiming a booking.' },
+  'tool.appointment_request.failed': { vars: [], describe: 'Appointment request recording could not be confirmed.' },
 
   // --- The appointment an outbound reminder is actually about --------------
   // Until now a reminder campaign stated its appointment from static text in
