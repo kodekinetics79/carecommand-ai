@@ -58,6 +58,19 @@ describe('provider credential precedence', () => {
     expect(providerModeFor('email')).toBe('live_supported');
   });
 
+  it('recognizes a complete SMTP email provider and rejects partial mailbox credentials', () => {
+    __setProviderSnapshotForTests({
+      email: { provider: 'smtp', smtpHost: 'smtp.office365.com', smtpPort: '587', username: 'mail@example.test', password: 'secret', fromAddress: 'mail@example.test' },
+    });
+    expect(providerConfigured('email')).toBe(true);
+    expect(channelStatus('email')).toMatchObject({ configured: true, setupRequired: false });
+
+    __setProviderSnapshotForTests({
+      email: { provider: 'smtp', smtpHost: 'smtp.office365.com', smtpPort: '587', username: 'mail@example.test', fromAddress: 'mail@example.test' },
+    });
+    expect(providerConfigured('email')).toBe(false);
+  });
+
   /**
    * The rule, asserted against explicit inputs.
    *

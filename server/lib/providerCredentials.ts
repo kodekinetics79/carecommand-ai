@@ -38,9 +38,22 @@ export const PROVIDER_CATALOG: Record<string, ProviderDef> = {
     env: { accountSid: 'TWILIO_ACCOUNT_SID', authToken: 'TWILIO_AUTH_TOKEN', fromNumber: 'TWILIO_FROM_NUMBER' },
   },
   email: {
-    label: 'Email (HTTP API)', required: ['apiUrl', 'apiKey', 'fromAddress'],
-    fields: [{ k: 'provider', label: 'Adapter (generic or sendgrid)', secret: false }, { k: 'apiUrl', label: 'API URL', secret: false }, { k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromAddress', label: 'From Address', secret: false }],
-    env: { apiUrl: 'EMAIL_HTTP_API_URL', apiKey: 'EMAIL_HTTP_API_KEY', fromAddress: 'EMAIL_FROM_ADDRESS' },
+    label: 'Email (SMTP / HTTP API)', required: ['fromAddress'],
+    fields: [
+      { k: 'provider', label: 'Adapter (smtp, generic, or sendgrid)', secret: false },
+      { k: 'smtpHost', label: 'SMTP Host', secret: false },
+      { k: 'smtpPort', label: 'SMTP Port (465 or 587)', secret: false },
+      { k: 'username', label: 'Mailbox Username', secret: false },
+      { k: 'password', label: 'Mailbox Password', secret: true },
+      { k: 'apiUrl', label: 'HTTP API URL', secret: false },
+      { k: 'apiKey', label: 'HTTP API Key', secret: true },
+      { k: 'fromAddress', label: 'From Address', secret: false },
+    ],
+    env: {
+      provider: 'EMAIL_HTTP_PROVIDER', smtpHost: 'SMTP_HOST', smtpPort: 'SMTP_PORT',
+      username: 'SMTP_USER', password: 'SMTP_PASS', apiUrl: 'EMAIL_HTTP_API_URL',
+      apiKey: 'EMAIL_HTTP_API_KEY', fromAddress: 'EMAIL_FROM_ADDRESS',
+    },
   },
   payments: {
     label: 'Payments (Stripe)', required: ['secretKey'],
@@ -122,14 +135,31 @@ function envValues(key: string): Record<string, string> {
   for (const field of def.fields) {
     const value = (env as unknown as Record<string, unknown>)[def.env[field.k]];
     if (typeof value === 'string' && value.length > 0) values[field.k] = value;
+    else if (typeof value === 'number' || typeof value === 'boolean') values[field.k] = String(value);
   }
+  // Preserve compatibility with the existing SMTP_* deployment variables.
+  // EMAIL_HTTP_PROVIDER historically defaulted to "generic", so an explicit
+  // SMTP host is the unambiguous signal that this environment uses SMTP.
+  if (key === 'email' && values.smtpHost) values.provider = 'smtp';
   return values;
 }
 
-function isComplete(key: string, values: Record<string, string>): boolean {
+export function providerMissingFields(key: string, values: Record<string, string>): string[] {
   const def = PROVIDER_CATALOG[key];
-  if (!def) return Object.keys(values).length > 0;
-  return def.required.length > 0 && def.required.every(field => !!values[field]);
+  if (!def) return Object.keys(values).length > 0 ? [] : ['configuration'];
+  if (key === 'email') {
+    const adapter = values.provider?.toLowerCase() || (values.smtpHost ? 'smtp' : 'generic');
+    const required = adapter === 'smtp'
+      ? ['smtpHost', 'smtpPort', 'username', 'password', 'fromAddress']
+      : ['apiUrl', 'apiKey', 'fromAddress'];
+    return required.filter(field => !values[field]);
+  }
+  return def.required.filter(field => !values[field]);
+}
+
+export function providerConfigComplete(key: string, values: Record<string, string>): boolean {
+  const def = PROVIDER_CATALOG[key];
+  return !!def && def.required.length > 0 && providerMissingFields(key, values).length === 0;
 }
 
 /**
@@ -155,11 +185,12 @@ export function resolveCredentialPrecedence(
   stored: Record<string, string> | undefined,
   fromEnv: Record<string, string>,
 ): { values: Record<string, string>; source: 'db' | 'env' | null } {
-  if (stored && isComplete(key, stored)) return { values: stored, source: 'db' };
-  if (Object.keys(fromEnv).length) return { values: fromEnv, source: 'env' };
+  if (stored && providerConfigComplete(key, stored)) return { values: stored, source: 'db' };
+  if (providerConfigComplete(key, fromEnv)) return { values: fromEnv, source: 'env' };
   // A partial saved credential is still worth reporting rather than pretending
   // nothing is set - the console shows it as not configured.
   if (stored) return { values: stored, source: 'db' };
+  if (Object.keys(fromEnv).length) return { values: fromEnv, source: 'env' };
   return { values: {}, source: null };
 }
 
@@ -170,7 +201,7 @@ export function providerValue(key: string, field: string): string | undefined {
 
 /** True when every required field for this provider resolves to something. */
 export function providerConfigured(key: string): boolean {
-  return isComplete(key, providerConfig(key).values);
+  return providerConfigComplete(key, providerConfig(key).values);
 }
 
 /** Test seam: replace the snapshot without a database. */

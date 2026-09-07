@@ -1,4 +1,5 @@
 import { env } from '../config/env';
+import nodemailer from 'nodemailer';
 import { providerConfig, providerConfigured } from './providerCredentials';
 import { db } from './db';
 import {
@@ -12,7 +13,7 @@ import { claimCampaignProviderSubmission, type CampaignSubmissionTicket } from '
 // Stripe/Stedi/Retell pattern). A message is marked "sent" ONLY when the
 // provider call succeeds (or in an explicit dev mock). Never fakes delivery.
 //   - sms / whatsapp: real Twilio Messages API (Basic auth).
-//   - email: optional HTTP email API (e.g. SendGrid); else pending (no SMTP dep).
+//   - email: authenticated TLS SMTP or an HTTP email API (e.g. SendGrid).
 //   - voice: pending (reuses Retell config for status; campaign voice not wired).
 //
 // Every send passes through ONE consent/suppression + destination gate before a
@@ -107,6 +108,64 @@ async function sendEmailHttp(to: string, subject: string, body: string, idempote
   }
 }
 
+export function smtpConnectionSettings(values: Record<string, string>, timeoutMs = 8_000) {
+  const port = Number(values.smtpPort);
+  if (!values.smtpHost || !Number.isInteger(port) || ![465, 587].includes(port)) {
+    throw new Error('smtp_host_or_tls_port_invalid');
+  }
+  if (!values.username || !values.password) throw new Error('smtp_credentials_missing');
+  return {
+    host: values.smtpHost,
+    port,
+    secure: port === 465,
+    requireTLS: port === 587,
+    auth: { user: values.username, pass: values.password },
+    connectionTimeout: Math.min(4_000, timeoutMs),
+    greetingTimeout: Math.min(4_000, timeoutMs),
+    socketTimeout: timeoutMs,
+  };
+}
+
+function smtpFailureReason(error: unknown): string {
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  if (code === 'EAUTH') return 'smtp_auth_failed';
+  if (['ECONNECTION', 'ETIMEDOUT', 'ESOCKET', 'EDNS'].includes(code)) return 'smtp_connection_failed';
+  return 'smtp_send_failed';
+}
+
+export async function verifySmtpConnection(values: Record<string, string>): Promise<void> {
+  const transport = nodemailer.createTransport(smtpConnectionSettings(values));
+  try { await transport.verify(); } finally { transport.close(); }
+}
+
+async function sendEmailSmtp(to: string, subject: string, body: string, idempotencyKey?: string, timeoutMs = 8_000): Promise<SendResult> {
+  const { values } = providerConfig('email');
+  let transport: ReturnType<typeof nodemailer.createTransport> | null = null;
+  try {
+    transport = nodemailer.createTransport(smtpConnectionSettings(values, timeoutMs));
+    const info = await transport.sendMail({
+      from: values.fromAddress,
+      to,
+      subject,
+      text: body,
+      headers: idempotencyKey ? { 'X-CareCommand-Idempotency-Key': idempotencyKey } : undefined,
+    });
+    if (!info.messageId) return { ok: false, status: 'failed', mode: 'live', failureReason: 'smtp_not_accepted' };
+    return { ok: true, status: 'sent', providerMessageId: info.messageId, mode: 'live' };
+  } catch (error) {
+    return { ok: false, status: 'failed', mode: 'live', failureReason: smtpFailureReason(error) };
+  } finally {
+    transport?.close();
+  }
+}
+
+async function sendEmail(to: string, subject: string, body: string, idempotencyKey?: string, timeoutMs = 8000): Promise<SendResult> {
+  const { values } = providerConfig('email');
+  return values.provider?.toLowerCase() === 'smtp'
+    ? sendEmailSmtp(to, subject, body, idempotencyKey, timeoutMs)
+    : sendEmailHttp(to, subject, body, idempotencyKey, timeoutMs);
+}
+
 /**
  * Send a transactional authentication email.
  *
@@ -124,7 +183,7 @@ export async function sendAuthenticationEmail(to: string, subject: string, body:
   }
   // Keep the public recovery endpoint's response window bounded so provider
   // latency cannot become a practical account-existence oracle.
-  return sendEmailHttp(to.trim().toLowerCase(), subject, body, idempotencyKey, 2500);
+  return sendEmail(to.trim().toLowerCase(), subject, body, idempotencyKey, 2500);
 }
 
 // Send one message. `idempotencyKey` makes the dev-mock id deterministic so a
@@ -288,9 +347,8 @@ async function sendToConfiguredProvider(
     return sendTwilio(to, body);
   }
   if (channel === 'email') {
-    if (!providerConfig('email').values.apiUrl) return { ok: false, status: 'pending', mode: 'configured_pending_provider' };
     if (!isValidEmail(destination)) return { ok: false, status: 'failed', mode: 'live', failureReason: 'invalid_destination' };
-    return sendEmailHttp(destination.trim(), subject, body);
+    return sendEmail(destination.trim(), subject, body, idempotencyKey);
   }
   // voice campaign sending is not wired (Retell is used for receptionist calls).
   return { ok: false, status: 'pending', mode: 'configured_pending_provider' };

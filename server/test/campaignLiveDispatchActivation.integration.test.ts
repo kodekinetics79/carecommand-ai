@@ -149,12 +149,12 @@ describe('live campaign dispatch activation endpoint', () => {
     });
     expect(refused.statusCode).toBe(409);
     expect(refused.json()).toMatchObject({ error: 'provider_not_configured', channel: 'email' });
-    // The refusal states HOW FAR from ready we are — a count of the two keys
-    // this test just cleared — and names none of them. Naming them would put
+    // The refusal states HOW FAR from ready we are — a count of the URL, key,
+    // and sender address this test leaves unset — and names none of them. Naming them would put
     // CareCommand's sending supplier and its server variables on a clinic's
     // screen, where nobody can act on either (8af601d). The operator-only
     // detail stays in the Control Tower.
-    expect(refused.json().missingConfigCount).toBe(2);
+    expect(refused.json().missingConfigCount).toBe(3);
     expect(refused.json().missing).toBeUndefined();
     for (const leak of ['EMAIL_HTTP_API_URL', 'EMAIL_HTTP_API_KEY', 'http-email']) {
       expect(JSON.stringify(refused.json())).not.toContain(leak);

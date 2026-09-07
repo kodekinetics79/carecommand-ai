@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const { env } = await import('../config/env');
 const { __setProviderSnapshotForTests } = await import('../lib/providerCredentials');
 const { deliverPasswordReset, passwordResetDeliveryConfigured } = await import('../lib/passwordResetDelivery');
+const { smtpConnectionSettings } = await import('../lib/commsProvider');
 
 const original = {
   NODE_ENV: env.NODE_ENV,
@@ -68,5 +69,14 @@ describe('password reset delivery', () => {
     expect(passwordResetDeliveryConfigured()).toBe(false);
     expect((await deliverPasswordReset({ email: 'owner@bright.example', tenantName: 'Bright Health LLC', token: 'd'.repeat(43), deliveryId: 'delivery-4' })).ok).toBe(false);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('enforces encrypted TLS SMTP ports for GoDaddy-compatible mailboxes', () => {
+    expect(smtpConnectionSettings({ smtpHost: 'smtp.office365.com', smtpPort: '587', username: 'mail@example.test', password: 'secret' }))
+      .toMatchObject({ port: 587, secure: false, requireTLS: true });
+    expect(smtpConnectionSettings({ smtpHost: 'smtpout.secureserver.net', smtpPort: '465', username: 'mail@example.test', password: 'secret' }))
+      .toMatchObject({ port: 465, secure: true });
+    expect(() => smtpConnectionSettings({ smtpHost: 'smtp.example.test', smtpPort: '25', username: 'mail@example.test', password: 'secret' }))
+      .toThrow('smtp_host_or_tls_port_invalid');
   });
 });
