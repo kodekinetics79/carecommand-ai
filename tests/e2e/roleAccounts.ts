@@ -84,6 +84,9 @@ async function provisionRoleAccounts(roles: readonly CrawlRole[]): Promise<RoleA
   const password = `Role-Access-Pw-${tag}!`;
 
   await db.tenant.create({ data: { id: tenantId, name: `Role Access ${tag}`, slug: `role-access-${tag}` } });
+  const branch = await db.branch.create({
+    data: { tenantId, name: 'Main Clinic', location: 'Role access certification' },
+  });
   const plan = await ensureE2eSubscriptionPlan();
   await db.tenantSubscription.create({ data: { tenantId, planId: plan.id, status: 'ACTIVE', startedAt: new Date() } });
   await recomputeEntitlements(tenantId, db);
@@ -91,9 +94,14 @@ async function provisionRoleAccounts(roles: readonly CrawlRole[]): Promise<RoleA
   const passwordHash = await generatePasswordHash(password);
   const emails = Object.fromEntries(await Promise.all(roles.map(async role => {
     const email = `${role.toLowerCase()}-${tag}@role-access.test`;
-    await db.user.create({
+    const user = await db.user.create({
       data: { tenantId, role, active: true, email, displayName: `Role ${role}`, passwordHash, passwordChangedAt: new Date() },
     });
+    if (['FRONT_DESK', 'PROVIDER'].includes(role)) {
+      await db.userClinicAccess.create({
+        data: { tenantId, userId: user.id, branchId: branch.id, isPrimary: true },
+      });
+    }
     return [role, email] as const;
   }))) as Record<CrawlRole, string>;
 

@@ -8,6 +8,7 @@ import { recomputeEntitlements } from '../../server/lib/entitlements';
 import { assertAccessibilityContract } from './accessibility';
 import { watchNetwork } from './networkFailures';
 import { ensureE2eSubscriptionPlan } from './subscriptionFixture';
+import { clickNavDestination } from './roleAccess';
 
 const API = 'http://127.0.0.1:43201';
 const OUTBOX = '.playwright/portal-outbox.jsonl';
@@ -160,9 +161,14 @@ async function loginStaff(page: Page, data: GoldenData) {
 }
 
 async function openStaffSection(page: Page, name: string) {
-  const mobileNavigation = page.getByRole('button', { name: 'Open navigation' });
-  if (await mobileNavigation.isVisible()) await mobileNavigation.click();
-  await page.getByRole('link', { name, exact: true }).click();
+  const destinations: Record<string, string> = {
+    Scheduling: '/scheduling',
+    Patients: '/patients',
+    'Remote Monitoring': '/monitoring',
+  };
+  const href = destinations[name];
+  if (!href) throw new Error(`Unknown staff destination: ${name}`);
+  await clickNavDestination(page, href);
 }
 
 test.describe('staff authentication and accessibility contract', () => {

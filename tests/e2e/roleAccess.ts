@@ -45,11 +45,8 @@ export interface NavDestination {
  */
 export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { path: '/', label: 'Command Center', primaryCall: '/v1/dashboard/summary' },
-  { path: '/advisory', label: 'Advisory Room', primaryCall: '/v1/advisory/brief' },
-  { path: '/opportunities', label: 'Opportunity Center', primaryCall: '/v1/opportunities' },
   { path: '/patients', label: 'Patients', primaryCall: '/v1/patients' },
   { path: '/scheduling', label: 'Scheduling', primaryCall: '/v1/appointments' },
-  { path: '/patient-intake', label: 'Patient Intake', primaryCall: '/v1/intake/queue' },
   // The work the AI receptionist hands back to a human: emergency, callback and
   // service lanes. GET /v1/tasks is the lane query and the first request the
   // board makes; /v1/tasks/summary is deliberately NOT the probe here, because
@@ -57,6 +54,16 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   // issues would pass without this one loading.
   { path: '/front-desk', label: 'Front Desk', primaryCall: '/v1/tasks' },
   { path: '/ai-receptionist', label: 'AI Receptionist', primaryCall: '/v1/conversations' },
+  { path: '/revenue-protection', label: 'Revenue Protection', primaryCall: '/v1/revenue-protection/overview' },
+  { path: '/monitoring', label: 'Connected Care', primaryCall: '/v1/monitoring/overview' },
+  { path: '/clinic-radar', label: 'Insights', primaryCall: '/v1/competitors/radar' },
+  { path: '/settings', label: 'Settings', primaryCall: null },
+  // Specialist destinations appear in the closed "All capabilities" drawer,
+  // after the short daily workspace. This order is the visible information
+  // architecture, not a derivation from the component under test.
+  { path: '/advisory', label: 'Advisory Room', primaryCall: '/v1/advisory/brief' },
+  { path: '/opportunities', label: 'Opportunity Center', primaryCall: '/v1/opportunities' },
+  { path: '/patient-intake', label: 'Patient Intake', primaryCall: '/v1/intake/queue' },
   { path: '/receptionist-studio', label: 'Receptionist Studio', primaryCall: '/v1/receptionist/overview' },
   { path: '/staff', label: 'Staff Tasks', primaryCall: '/v1/staff/overview' },
   // The CRM workspace opens on its Command View, whose figures come from
@@ -70,14 +77,11 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { path: '/campaigns', label: 'Campaigns', primaryCall: '/v1/crm/campaigns' },
   { path: '/autopilot', label: 'Autopilot', primaryCall: '/v1/autopilot/playbooks' },
   { path: '/reviews', label: 'Reviews', primaryCall: '/v1/reviews' },
-  { path: '/clinic-radar', label: 'ClinicRadar', primaryCall: '/v1/competitors/radar' },
   { path: '/revenue', label: 'Revenue Leaks', primaryCall: '/v1/revenue-snapshots' },
-  { path: '/revenue-protection', label: 'Revenue Protection', primaryCall: '/v1/revenue-protection/overview' },
   { path: '/insurance', label: 'Insurance', primaryCall: '/v1/insurance/overview' },
   { path: '/insurance-eligibility', label: 'Insurance Eligibility', primaryCall: '/v1/insurance/eligibility/history' },
   { path: '/doctor-workspace', label: 'Provider Performance', primaryCall: '/v1/providers/overview' },
   { path: '/benchmarking', label: 'Multi-Clinic Benchmarking', primaryCall: '/v1/competitors/radar' },
-  { path: '/monitoring', label: 'Remote Monitoring', primaryCall: '/v1/monitoring/overview' },
   // The bands a clinic's own alerts fire on. Reading them is the whole point of
   // the screen and is on the monitoring module's role gate; writing one is
   // narrower (OWNER/ADMIN/MANAGER), which is why the probe is the read.
@@ -94,9 +98,6 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { path: '/compliance', label: 'Compliance Readiness', primaryCall: '/v1/compliance/dashboard' },
   { path: '/control-plane', label: 'Control Plane', primaryCall: '/v1/control-plane/overview' },
   { path: '/subscription', label: 'Subscription', primaryCall: '/v1/subscriptions/current' },
-  // The account page every user reaches from their own avatar. Its landing view
-  // is session-derived; the workspace-summary tiles it embeds are admin-scoped.
-  { path: '/settings', label: 'Settings', primaryCall: null },
 ];
 
 export interface RoleAccessContract {
@@ -266,7 +267,13 @@ export async function readNavDestinations(page: Page): Promise<string[]> {
 export async function clickNavDestination(page: Page, href: string): Promise<void> {
   const openNavigation = page.getByRole('button', { name: 'Open navigation' });
   if (await openNavigation.isVisible()) await openNavigation.click();
-  await page.locator(`#staff-navigation nav a[href="${href}"]`).first().click();
+  const link = page.locator(`#staff-navigation nav a[href="${href}"]`).first();
+  if (!(await link.isVisible())) {
+    const capabilities = page.locator('#staff-navigation details.sidebar-capabilities');
+    if (await capabilities.isVisible()) await capabilities.locator('summary').click();
+  }
+  await expect(link, `navigation offers a visible link to ${href}`).toBeVisible();
+  await link.click();
 }
 
 /**
