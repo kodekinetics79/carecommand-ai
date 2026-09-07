@@ -300,8 +300,11 @@ export type DeployPanelState =
 /** Pure derivation of the DeployPanel state from what the server holds (local in-flight / error states override it). */
 export function deriveDeployState(input: { status: VoiceLineStatusResponse | null; diff: DeploymentDiff | null }): DeployPanelState {
   const agentId = input.status?.agentScope.agentId ?? null;
-  const unlinked = input.status?.blockers.some(b => b.code === 'agent_unlinked') ?? false;
-  if (input.status && (!agentId || unlinked)) return 'no-agent';
+  // `agent_unlinked` can also mean that an assigned local agent has not been
+  // published to the voice provider yet. That is precisely the state the
+  // first deploy must repair, so only the absence of an assigned agent may
+  // disable the publish action.
+  if (input.status && !agentId) return 'no-agent';
   const deployment = input.diff?.deployment ?? null;
   if (!deployment) return 'never-deployed';
   if (deployment.status === 'FAILED') return 'deploy-failed';
