@@ -80,6 +80,17 @@ async function fixture(fields: Field[] = []) {
   const branch = await db.branch.create({
     data: { tenantId, name: 'Atomic branch', location: 'Test', timezone: 'UTC', active: true },
   });
+  // This suite tests provider-boundary behavior, not the clock. Keep its
+  // one-minute quiet window deterministically away from the current UTC time.
+  const fixtureNow = new Date();
+  const quietStartMinute = (fixtureNow.getUTCHours() * 60 + fixtureNow.getUTCMinutes() + 60) % 1440;
+  const quietEndMinute = (quietStartMinute + 1) % 1440;
+  const hhmm = (minute: number) => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+  await db.schedulingPolicy.create({ data: {
+    tenantId,
+    communicationQuietHoursStart: hhmm(quietStartMinute),
+    communicationQuietHoursEnd: hhmm(quietEndMinute),
+  } });
   const providerUser = await db.user.create({
     data: {
       tenantId, role: 'PROVIDER', active: true,
