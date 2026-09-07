@@ -5,6 +5,7 @@ const runJobContext = vi.hoisted(() => vi.fn(async (_tenantId: string, work: () 
 
 vi.mock('../lib/receptionist/confirmationOutbox', () => ({
   dispatchDueAppointmentConfirmations: dispatchDue,
+  dispatchDueAppointmentNotifications: dispatchDue,
 }));
 vi.mock('../lib/tenantContext', () => ({
   runWithJobTenantContext: runJobContext,

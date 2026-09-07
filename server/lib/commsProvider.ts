@@ -54,7 +54,13 @@ type ConfirmationAuthorization = {
   tenantId: string;
   eventId: string;
   attemptNumber: number;
+  source?: 'receptionist.appointment_confirmation' | 'appointment.reminder';
 };
+
+const AUTHORIZED_APPOINTMENT_NOTIFICATION_SOURCES = new Set([
+  'receptionist.appointment_confirmation',
+  'appointment.reminder',
+]);
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
   const controller = new AbortController();
@@ -276,6 +282,18 @@ export async function sendAuthorizedAppointmentConfirmation(
   idempotencyKey: string,
   authorization: ConfirmationAuthorization,
 ): Promise<SendResult> {
+  const authorizedSource = authorization.source ?? 'receptionist.appointment_confirmation';
+  if (!AUTHORIZED_APPOINTMENT_NOTIFICATION_SOURCES.has(authorizedSource)) {
+    return { ok: false, status: 'failed', mode: 'configured_pending_provider', failureReason: 'appointment_notification_source_not_allowed' };
+  }
+  // Reminder activation is deliberately mock-only in this tranche. Even a
+  // forged durable event cannot reach real provider I/O in production.
+  if (authorizedSource === 'appointment.reminder') {
+    const sms = channelStatus('sms');
+    if (env.NODE_ENV === 'production' || channel !== 'sms' || !sms.mock || sms.provider !== 'twilio') {
+      return { ok: false, status: 'setup_required', mode: 'setup_required', failureReason: 'appointment_reminder_real_egress_not_activated' };
+    }
+  }
   // Claim submission exactly once under the same event advisory lock used by
   // the outbox state machine. The provider request stays outside the database
   // transaction, but no concurrent worker can pass this boundary twice.
@@ -290,6 +308,7 @@ export async function sendAuthorizedAppointmentConfirmation(
       } },
       include: { notificationEvent: { include: {
         appointment: { select: { patient: { select: { phone: true, email: true } } } },
+        appointmentCommunicationAction: { select: { id: true } },
         deliveryAttempts: {
           where: { attemptNumber: authorization.attemptNumber, phase: { in: ['SUBMISSION_CLAIM', 'RESULT', 'RECEIPT'] } },
           select: { id: true },
@@ -302,7 +321,8 @@ export async function sendAuthorizedAppointmentConfirmation(
       ? toE164(expectedDestination ?? '') === toE164(destination)
       : (expectedDestination ?? '').trim().toLowerCase() === destination.trim().toLowerCase();
     if (!intent || intent.status !== 'provider_intent_committed' || !intent.completedAt
-      || event?.source !== 'receptionist.appointment_confirmation'
+      || event?.source !== authorizedSource
+      || (authorizedSource === 'appointment.reminder' && !event.appointmentCommunicationAction)
       || event.status !== 'retrying' || event.attempts !== authorization.attemptNumber
       || event.deliveryAttempts.length !== 0
       || event.channel !== channel || event.idempotencyKey !== idempotencyKey || !destinationMatches) {

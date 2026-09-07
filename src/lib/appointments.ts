@@ -56,7 +56,7 @@ export interface AppointmentCommunicationPlan {
   appointmentVersion: number;
   messages: Array<{
     channel: 'SMS' | 'VOICE';
-    state: 'setup_needed' | 'cancelled';
+    state: 'scheduled' | 'provider_accepted' | 'delivery_unknown' | 'setup_needed' | 'suppressed' | 'failed' | 'cancelled';
     dueAt: string;
   }>;
   summary: string;

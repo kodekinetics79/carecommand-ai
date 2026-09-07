@@ -57,6 +57,9 @@ enum AppointmentCommunicationActionStatus {
   QUEUED
   BLOCKED_SETUP
   CANCELLED
+  PROVIDER_ACCEPTED
+  DELIVERY_UNKNOWN
+  SUPPRESSED
   SENT
   FAILED
 }
@@ -615,8 +618,10 @@ model AppointmentCommunicationAction {
   tenant             Tenant                                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   appointment        Appointment                            @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Cascade, map: "AppointmentCommunicationAction_appointment_scope_fkey")
   plan               AppointmentCommunicationPlan           @relation(fields: [tenantId, appointmentId, planId], references: [tenantId, appointmentId, id], onDelete: Cascade, map: "AppointmentCommunicationAction_plan_scope_fkey")
+  notificationEvent  NotificationEvent?
 
   @@unique([tenantId, appointmentId, planRevision, kind, channel, sequence])
+  @@unique([tenantId, appointmentId, id])
   @@index([tenantId, status, dueAt])
   @@index([tenantId, appointmentId, appointmentVersion])
   @@index([tenantId, appointmentId, planId])
@@ -4315,6 +4320,7 @@ model NotificationEvent {
   tenantId        String    @db.Uuid
   alertId         String?   @db.Uuid
   appointmentId   String?   @db.Uuid
+  appointmentCommunicationActionId String? @db.Uuid
   patientId       String?   @db.Uuid
   recipientType   String // patient | doctor | nurse | care_coordinator
   recipientUserId String?   @db.Uuid
@@ -4339,6 +4345,7 @@ model NotificationEvent {
   deadLetteredAt  DateTime?
   tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   appointment     Appointment? @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Restrict)
+  appointmentCommunicationAction AppointmentCommunicationAction? @relation(fields: [tenantId, appointmentId, appointmentCommunicationActionId], references: [tenantId, appointmentId, id], onDelete: Restrict, map: "NotificationEvent_appointmentCommunicationAction_scope_fkey")
   patient         Patient?   @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict)
   deliveryAttempts NotificationDeliveryAttempt[]
 
@@ -4346,8 +4353,8 @@ model NotificationEvent {
   @@index([tenantId, createdAt])
   @@index([tenantId, alertId])
   @@index([tenantId, appointmentId])
+  @@unique([tenantId, appointmentId, appointmentCommunicationActionId])
   @@unique([tenantId, source, idempotencyKey])
-  @@unique([tenantId, appointmentId, channel, source])
 }
 
 model NotificationDeliveryAttempt {

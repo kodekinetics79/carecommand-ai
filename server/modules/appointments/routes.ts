@@ -40,7 +40,7 @@ const STATUS_TRANSITIONS: Record<'ARRIVED' | 'NO_SHOW' | 'COMPLETED', ReadonlyAr
 };
 const STAFF_CANCELLABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST', 'ARRIVED'] as const;
 const STAFF_RESCHEDULABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST', 'NO_SHOW'] as const;
-const REMINDER_ELIGIBLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST'] as const;
+const REMINDER_ELIGIBLE_STATUSES = ['CONFIRMED', 'RISKY'] as const;
 
 const appointmentQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -189,13 +189,13 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       }
 
       const nextRevision = current ? current.revision + 1 : 1;
-      const status = communicationPlanStatus(input.mode);
+      const initialStatus = communicationPlanStatus(input.mode);
       const plan = current
         ? await tx.appointmentCommunicationPlan.update({
           where: { id: current.id },
           data: {
             mode: input.mode,
-            status,
+            status: initialStatus,
             reminderLeadMinutes: input.reminderLeadMinutes,
             revision: nextRevision,
             appointmentVersion: appointment.version,
@@ -207,7 +207,7 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
             tenantId: request.auth.tenantId,
             appointmentId: id,
             mode: input.mode,
-            status,
+            status: initialStatus,
             reminderLeadMinutes: input.reminderLeadMinutes,
             revision: nextRevision,
             appointmentVersion: appointment.version,
@@ -215,7 +215,7 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
           },
         });
 
-      await replaceAppointmentCommunicationActions(tx, {
+      const smsQueued = await replaceAppointmentCommunicationActions(tx, {
         tenantId: request.auth.tenantId,
         appointmentId: id,
         planId: plan.id,
@@ -225,6 +225,10 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
         startsAt: appointment.startsAt,
         reminderLeadMinutes: input.reminderLeadMinutes,
       });
+      const status = communicationPlanStatus(input.mode, smsQueued);
+      if (status !== initialStatus) {
+        await tx.appointmentCommunicationPlan.update({ where: { id: plan.id }, data: { status } });
+      }
       await tx.auditEvent.create({ data: {
         tenantId: request.auth.tenantId,
         actorUserId: request.auth.userId,
@@ -459,11 +463,17 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     }
 
     const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockAppointmentCommunication(tx, request.auth.tenantId, id);
       const changed = await tx.appointment.updateMany({
-        where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
+        where: { id, tenantId: request.auth.tenantId, status: appointment.status, version: appointment.version, deletedAt: null },
         data: { status },
       });
       if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
+      await cancelAppointmentCommunicationPlan(tx, {
+        tenantId: request.auth.tenantId,
+        appointmentId: id,
+        appointmentVersion: appointment.version,
+      });
 
       // Completing a visit is the only moment the product learns a patient was
       // actually seen, and nothing wrote it down. Patient.lastVisitAt stayed NULL

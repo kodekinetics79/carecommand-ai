@@ -14,8 +14,10 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
+const { env } = await import('../config/env');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
+const { __setProviderSnapshotForTests } = await import('../lib/providerCredentials');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -154,6 +156,21 @@ describe('per-appointment communication plans', () => {
     expect(staleAppointment.statusCode).toBe(409);
   });
 
+  it('rejects reminders for a waitlisted appointment', async () => {
+    const tenant = await makeTenant();
+    await db.appointment.update({ where: { id: tenant.appointment.id }, data: { status: 'WAITLIST' } });
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/v1/appointments/${tenant.appointment.id}/communication-plan`,
+      headers: auth(tenant),
+      payload: { mode: 'SMS', reminderLeadMinutes: 1440, appointmentVersion: 1, revision: null },
+    });
+    expect(response.statusCode, response.body).toBe(409);
+    expect(await db.appointmentCommunicationPlan.count({ where: {
+      tenantId: tenant.id, appointmentId: tenant.appointment.id,
+    } })).toBe(0);
+  });
+
   it('rebases the plan and invalidates confirmation atomically when staff reschedules', async () => {
     const tenant = await makeTenant();
     await db.appointment.update({ where: { id: tenant.appointment.id }, data: {
@@ -220,20 +237,18 @@ describe('per-appointment communication plans', () => {
     const plan = await db.appointmentCommunicationPlan.findUniqueOrThrow({
       where: { tenantId_appointmentId: { tenantId: tenant.id, appointmentId: tenant.appointment.id } },
     });
-    for (const channel of ['SMS', 'VOICE'] as const) {
-      await expect(db.appointmentCommunicationAction.create({ data: {
-        tenantId: tenant.id,
-        appointmentId: tenant.appointment.id,
-        planId: plan.id,
-        appointmentVersion: 1,
-        planRevision: 2,
-        kind: 'REMINDER',
-        channel,
-        sequence: 1,
-        status: 'QUEUED',
-        dueAt: new Date(),
-      } })).rejects.toBeDefined();
-    }
+    await expect(db.appointmentCommunicationAction.create({ data: {
+      tenantId: tenant.id,
+      appointmentId: tenant.appointment.id,
+      planId: plan.id,
+      appointmentVersion: 1,
+      planRevision: 2,
+      kind: 'REMINDER',
+      channel: 'VOICE',
+      sequence: 1,
+      status: 'QUEUED',
+      dueAt: new Date(),
+    } })).rejects.toBeDefined();
 
     const rls = await db.$queryRaw<Array<{ tableName: string; enabled: boolean; forced: boolean }>>`
       SELECT c.relname AS "tableName", c.relrowsecurity AS enabled, c.relforcerowsecurity AS forced
@@ -270,4 +285,59 @@ describe('per-appointment communication plans', () => {
       status: { in: ['QUEUED', 'BLOCKED_SETUP'] },
     } })).toBe(0);
   });
+
+  it.each(['ARRIVED', 'NO_SHOW', 'COMPLETED'] as const)(
+    'atomically stops pending reminders when an appointment becomes %s',
+    async status => {
+      const originalNodeEnv = env.NODE_ENV;
+      const originalQueuesEnabled = env.QUEUES_ENABLED;
+      env.NODE_ENV = 'test';
+      env.QUEUES_ENABLED = true;
+      __setProviderSnapshotForTests({ sms: {
+        accountSid: 'mock_status_transition_reminders',
+        authToken: 'mock-token',
+        fromNumber: '+15550000000',
+      } });
+      try {
+        const tenant = await makeTenant();
+        const saved = await app.inject({
+          method: 'PUT', url: `/v1/appointments/${tenant.appointment.id}/communication-plan`, headers: auth(tenant),
+          payload: { mode: 'SMS', reminderLeadMinutes: 1440, appointmentVersion: 1, revision: null },
+        });
+        expect(saved.statusCode, saved.body).toBe(200);
+        expect(saved.json()).toMatchObject({ status: 'ACTIVE', messages: [{ state: 'scheduled' }] });
+        const pendingEvent = await db.notificationEvent.findFirstOrThrow({ where: {
+          tenantId: tenant.id,
+          appointmentId: tenant.appointment.id,
+          source: 'appointment.reminder',
+        } });
+
+        const transitioned = await app.inject({
+          method: 'PATCH', url: `/v1/appointments/${tenant.appointment.id}/status`, headers: auth(tenant),
+          payload: { status },
+        });
+        expect(transitioned.statusCode, transitioned.body).toBe(200);
+        expect(transitioned.json().status).toBe(status);
+
+        const plan = await db.appointmentCommunicationPlan.findUniqueOrThrow({
+          where: { tenantId_appointmentId: { tenantId: tenant.id, appointmentId: tenant.appointment.id } },
+        });
+        expect(plan).toMatchObject({ status: 'CANCELLED', revision: 2, appointmentVersion: 1 });
+        await expect(db.appointmentCommunicationAction.findFirstOrThrow({ where: {
+          tenantId: tenant.id, appointmentId: tenant.appointment.id,
+        } })).resolves.toMatchObject({ status: 'CANCELLED' });
+        await expect(db.notificationEvent.findUniqueOrThrow({ where: { id: pendingEvent.id } })).resolves.toMatchObject({
+          status: 'suppressed',
+          failureReason: 'appointment_communication_changed',
+        });
+        expect(await db.notificationDeliveryAttempt.count({ where: {
+          tenantId: tenant.id, notificationEventId: pendingEvent.id, phase: 'PROVIDER_INTENT',
+        } })).toBe(0);
+      } finally {
+        env.NODE_ENV = originalNodeEnv;
+        env.QUEUES_ENABLED = originalQueuesEnabled;
+        __setProviderSnapshotForTests({});
+      }
+    },
+  );
 });
