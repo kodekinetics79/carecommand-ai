@@ -366,6 +366,15 @@ function IntegrationForm({ provider, onChanged }: { provider: IntegrationView; o
   const field = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
   return (
     <div className="border-t border-[var(--b1)] bg-[var(--s1)] p-3 space-y-2.5">
+      {provider.key === 'email' && (
+        <div className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] p-2.5 space-y-2">
+          <p className="text-[11px] text-t2">Choose the GoDaddy mailbox type, then enter the mailbox username, password, and From Address below.</p>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={() => setVals(s => ({ ...s, provider: 'smtp', smtpHost: 'smtp.office365.com', smtpPort: '587' }))} className="rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s1)]">GoDaddy Microsoft 365</button>
+            <button type="button" onClick={() => setVals(s => ({ ...s, provider: 'smtp', smtpHost: 'smtpout.secureserver.net', smtpPort: '465' }))} className="rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s1)]">GoDaddy Professional Email</button>
+          </div>
+        </div>
+      )}
       {provider.fields.length === 0 && <p className="text-[11px] text-t3">No configuration fields yet — add one below.</p>}
       <div className="grid sm:grid-cols-2 gap-2.5">
         {provider.fields.map(f => (

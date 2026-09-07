@@ -11,7 +11,8 @@ import { env } from '../../config/env';
 import { encryptSecret, decryptSecret } from '../../lib/security';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 import { validateIanaTimezone } from '../../lib/scheduling';
-import { PROVIDER_CATALOG, PROVIDER_KEYS, providerConfig, invalidateProviderCredentials, refreshProviderCredentials, type ProviderDef as SharedProviderDef } from '../../lib/providerCredentials';
+import { PROVIDER_CATALOG, PROVIDER_KEYS, providerConfig, providerConfigComplete, providerMissingFields, invalidateProviderCredentials, refreshProviderCredentials, type ProviderDef as SharedProviderDef } from '../../lib/providerCredentials';
+import { verifySmtpConnection } from '../../lib/commsProvider';
 import { periodUsageByMetric, usagePeriodKey, USAGE_LIMIT_KEY_BY_METRIC } from '../../lib/usageMetering';
 import { TENANT_MODES, TENANT_MODE_DESCRIPTION, modeAllowsLiveCalling } from '../../lib/tenantMode';
 import { platformRemediationCatalogue } from '../../lib/receptionist/remediation';
@@ -1193,7 +1194,7 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   }
   function viewFor(key: string, def: ProviderDef, row: IntegrationRow | null) {
     const { values, source } = resolveValues(key, def, row);
-    const configured = def.required.length > 0 && def.required.every(r => !!values[r]);
+    const configured = PROVIDERS[key] ? providerConfigComplete(key, values) : def.required.length > 0 && def.required.every(r => !!values[r]);
     return {
       key, label: def.label, isCustom: !!row?.isCustom, source,
       status: configured ? 'connected' : 'disconnected',
@@ -1254,7 +1255,13 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     const current = decryptConfig(row);
     for (const [k, v] of Object.entries(body.fields)) { if (!allowed.has(k)) continue; if (v.trim() === '') delete current[k]; else current[k] = v.trim(); }
     const setFields = Object.keys(current);
-    const configured = def.required.length > 0 && def.required.every(r => !!current[r]);
+    if (key === 'email' && current.provider && !['smtp', 'generic', 'sendgrid'].includes(current.provider.toLowerCase())) {
+      throw app.httpErrors.badRequest('Email adapter must be smtp, generic, or sendgrid');
+    }
+    if (key === 'email' && current.provider?.toLowerCase() === 'smtp' && current.smtpPort && !['465', '587'].includes(current.smtpPort)) {
+      throw app.httpErrors.badRequest('SMTP port must be 465 (TLS) or 587 (STARTTLS)');
+    }
+    const configured = PROVIDERS[key] ? providerConfigComplete(key, current) : def.required.length > 0 && def.required.every(r => !!current[r]);
     const configEnc = setFields.length ? encryptSecret(JSON.stringify(current)) : null;
     await runPlatformAuditedMutation(request, {
       action: 'integration.updated', target: { type: 'integration', id: key }, metadata: { fields: Object.keys(body.fields), configured },
@@ -1290,12 +1297,15 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     const def = defFor(key, row);
     if (!def) throw app.httpErrors.notFound('Unknown integration');
     const { values } = resolveValues(key, def, row);
-    const missing = def.required.filter(r => !values[r]);
+    const missing = PROVIDERS[key] ? providerMissingFields(key, values) : def.required.filter(r => !values[r]);
     let status = 'ok'; let detail: string;
     if (def.required.length && missing.length) { status = 'failed'; detail = `Missing: ${missing.join(', ')}`; }
     else {
       try {
-        if (key === 'payments') {
+        if (key === 'email' && values.provider?.toLowerCase() === 'smtp') {
+          await verifySmtpConnection(values);
+          detail = 'SMTP server accepted the encrypted mailbox credentials';
+        } else if (key === 'payments') {
           const res = await withTimeout(fetch('https://api.stripe.com/v1/balance', { headers: { Authorization: `Bearer ${values.secretKey}` } }), 4000);
           status = res.ok ? 'ok' : 'failed'; detail = res.ok ? 'Stripe API reachable' : `Stripe returned ${res.status}`;
         } else if (key === 'sms') {
@@ -1316,7 +1326,13 @@ export const platformRoutes: FastifyPluginAsync = async app => {
           status = 'not_verified';
           detail = 'Credentials are present. This provider has no connection test, so nothing has been verified.';
         }
-      } catch (e) { status = 'failed'; detail = `Connection error: ${(e as Error).message.slice(0, 80)}`; }
+      } catch (e) {
+        status = 'failed';
+        if (key === 'email' && values.provider?.toLowerCase() === 'smtp') {
+          const code = typeof e === 'object' && e && 'code' in e ? String(e.code).slice(0, 30) : 'connection_failed';
+          detail = `SMTP connection failed (${code})`;
+        } else detail = `Connection error: ${(e as Error).message.slice(0, 80)}`;
+      }
     }
     await runPlatformAuditedMutation(request, {
       action: 'integration.tested', target: { type: 'integration', id: key }, metadata: { status },

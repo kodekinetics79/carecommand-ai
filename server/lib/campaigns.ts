@@ -1,6 +1,6 @@
 import { db } from './db';
 import { env } from '../config/env';
-import { providerConfig } from './providerCredentials';
+import { providerConfig, providerMissingFields } from './providerCredentials';
 import { runWithTenantContext, type TenantTxClient } from './tenantContext';
 import type { CampaignLiveDispatchActivation, ReceptionistOptOutChannel } from '../generated/prisma/client';
 import { canonicalDncDestination, isDestinationOptedOutTx } from './receptionist/dncFence';
@@ -255,12 +255,10 @@ export function channelStatus(channel: CommChannel): ChannelStatus {
   }
   if (channel === 'email') {
     const { values } = providerConfig('email');
-    const missing = [
-      ['apiUrl', 'EMAIL_HTTP_API_URL'],
-      ['apiKey', 'EMAIL_HTTP_API_KEY'],
-    ].filter(([field]) => !values[field]).map(([, envKey]) => envKey);
+    const missing = providerMissingFields('email', values);
     const configured = missing.length === 0;
-    return { channel, provider: 'http-email', configured, mock: (values.apiUrl ?? '').startsWith('mock'), setupRequired: !configured, missing };
+    const smtp = values.provider?.toLowerCase() === 'smtp';
+    return { channel, provider: smtp ? 'smtp' : 'http-email', configured, mock: (values.apiUrl ?? '').startsWith('mock'), setupRequired: !configured, missing };
   }
   // voice reuses the Retell receptionist configuration.
   const missing = ['RETELL_API_KEY', 'RETELL_FROM_NUMBER'].filter(k => !env[k as keyof typeof env]);
@@ -275,10 +273,10 @@ export function providerModeFor(channel: CommChannel): ProviderMode {
   const s = channelStatus(channel);
   if (!s.configured) return 'unconfigured';
   if (s.mock && env.NODE_ENV !== 'production') return 'mock_dev';
-  // SMS/WhatsApp have a real Twilio sender wired; email is live only with an HTTP
-  // email API; voice campaign sending is not wired (Retell is receptionist-only).
+  // SMS/WhatsApp and email have real provider senders wired; voice campaign
+  // sending is not wired (Retell is receptionist-only).
   if (channel === 'sms' || channel === 'whatsapp') return 'live_supported';
-  if (channel === 'email') return providerConfig('email').values.apiUrl ? 'live_supported' : 'configured_pending_provider';
+  if (channel === 'email') return 'live_supported';
   return 'configured_pending_provider';
 }
 

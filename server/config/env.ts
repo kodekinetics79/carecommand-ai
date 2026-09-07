@@ -222,8 +222,7 @@ const baseEnvSchema = z.object({
   TWILIO_AUTH_TOKEN: z.string().optional(),
   TWILIO_FROM_NUMBER: z.string().optional(),
   TWILIO_BASE_URL: z.string().url().default('https://api.twilio.com'),
-  // Optional HTTP email API (e.g. SendGrid) so email can really send without an
-  // SMTP TCP library. If unset, email stays configured_pending_provider.
+  // Transactional email can use an HTTP API or authenticated TLS SMTP.
   EMAIL_HTTP_PROVIDER: z.enum(['generic', 'sendgrid']).default('generic'),
   EMAIL_HTTP_API_URL: z.string().url().optional(),
   EMAIL_HTTP_API_KEY: z.string().optional(),
@@ -231,6 +230,7 @@ const baseEnvSchema = z.object({
   // Signing secret for the campaign delivery/status webhook (provider callbacks).
   CAMPAIGN_WEBHOOK_SECRET: z.string().optional(),
   SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535).default(587),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
   WHATSAPP_ACCESS_TOKEN: z.string().optional(),
