@@ -54,6 +54,7 @@ import { loadHoursSource } from './hoursSource';
 import { hoursConfigured, resolveEffectiveHours, spokenDate } from './clinicHours';
 import type { LocaleFormat, LocalePackMessageKey } from './localePacks/types';
 import { runBookingHandoff } from '../../modules/receptionist/handoff';
+import { advanceCommunicationPlanAfterReschedule, cancelAppointmentCommunicationPlan, lockAppointmentCommunication } from '../appointmentCommunicationPlans';
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
@@ -742,7 +743,7 @@ export async function cancelAppointment(ctx: ToolContext, args: Record<string, u
   const patientId = await verifiedPatientForCall(ctx);
   const appointmentId = str(args.appointment_id, 40);
   if (!patientId || !appointmentId || !UUID_RE.test(appointmentId)) return { cancelled: false, needs_human: true, message: 'I cannot securely identify that appointment. I can connect you with the front desk.' };
-  const current = await db.appointment.findFirst({ where: { id: appointmentId, tenantId: ctx.tenantId, patientId, deletedAt: null }, select: { id: true, startsAt: true, status: true } });
+  const current = await db.appointment.findFirst({ where: { id: appointmentId, tenantId: ctx.tenantId, patientId, deletedAt: null }, select: { id: true, startsAt: true, status: true, version: true } });
   if (!current) return { cancelled: false, needs_human: true, message: 'I cannot securely identify that appointment. I can connect you with the front desk.' };
   if (current.status === 'CANCELED') return { cancelled: true, duplicate: true, appointment_id: current.id, message: 'That appointment is already cancelled.' };
   const pending = await loadPendingAppointmentChange(ctx, args, 'cancel');
@@ -756,9 +757,11 @@ export async function cancelAppointment(ctx: ToolContext, args: Record<string, u
   }
   const reason = sanitizeText(args.reason, 240);
   const outcome = await db.$transaction(async tx => {
+    await lockAppointmentCommunication(tx, ctx.tenantId, appointmentId);
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-cancel:${ctx.tenantId}:${appointmentId}`})::bigint)`;
-    const changed = await tx.appointment.updateMany({ where: { id: appointmentId, tenantId: ctx.tenantId, patientId, status: { in: [...VOICE_MUTABLE_STATUSES] }, deletedAt: null }, data: { status: 'CANCELED' } });
+    const changed = await tx.appointment.updateMany({ where: { id: appointmentId, tenantId: ctx.tenantId, patientId, status: { in: [...VOICE_MUTABLE_STATUSES] }, version: current.version, deletedAt: null }, data: { status: 'CANCELED' } });
     if (changed.count !== 1) return null;
+    await cancelAppointmentCommunicationPlan(tx, { tenantId: ctx.tenantId, appointmentId, appointmentVersion: current.version });
     const requirements = await tx.depositRequirement.findMany({ where: { tenantId: ctx.tenantId, appointmentId, status: { notIn: ['cancelled', 'waived'] } }, select: { id: true, status: true } });
     const needsManualRefund = requirements.some(row => row.status === 'collected');
     for (const requirement of requirements.filter(row => row.status !== 'collected')) {
@@ -806,7 +809,7 @@ export async function confirmAppointment(ctx: ToolContext, args: Record<string, 
   }
   const current = await db.appointment.findFirst({
     where: { id: appointmentId, tenantId: ctx.tenantId, patientId, deletedAt: null },
-    select: { id: true, status: true, startsAt: true, patientConfirmedAt: true },
+    select: { id: true, status: true, startsAt: true, version: true, patientConfirmedAt: true, patientConfirmedAppointmentVersion: true },
   });
   if (!current) return { confirmed: false, needs_human: true, message: 'I cannot securely identify that appointment. I can connect you with the front desk.' };
   const pack = await callPack(ctx);
@@ -828,16 +831,18 @@ export async function confirmAppointment(ctx: ToolContext, args: Record<string, 
     : null;
   const confirmedAt = new Date();
   const written = await db.$transaction(async tx => {
+    await lockAppointmentCommunication(tx, ctx.tenantId, appointmentId);
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-confirm:${ctx.tenantId}:${appointmentId}`})::bigint)`;
     const changed = await tx.appointment.updateMany({
       where: {
         id: appointmentId, tenantId: ctx.tenantId, patientId, deletedAt: null,
-        patientConfirmedAt: null, status: { in: [...VOICE_MUTABLE_STATUSES] },
+        patientConfirmedAt: null, version: current.version, status: { in: [...VOICE_MUTABLE_STATUSES] },
       },
       data: {
         patientConfirmedAt: confirmedAt,
         patientConfirmationSource: 'receptionist_call',
         patientConfirmedCallLogId: callLog?.id ?? null,
+        patientConfirmedAppointmentVersion: current.version,
       },
     });
     if (changed.count !== 1) return false;
@@ -883,24 +888,33 @@ export async function rescheduleAppointment(ctx: ToolContext, args: Record<strin
   const endsAt = new Date(startsAt.getTime() + service.durationMin * 60_000);
   try {
     const moved = await db.$transaction(async tx => {
+      await lockAppointmentCommunication(tx, ctx.tenantId, appointmentId);
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-reschedule:${ctx.tenantId}:${appointmentId}`})::bigint)`;
       const conflict = await findSlotConflict({ tenantId: ctx.tenantId, providerProfileId: appt.providerProfileId!, startsAt, durationMin: service.durationMin, excludeAppointmentId: appointmentId }, tx);
       if (conflict) return { conflict } as const;
       const changed = await tx.appointment.updateMany({
-        where: { id: appointmentId, tenantId: ctx.tenantId, patientId, status: appt.status, deletedAt: null },
+        where: { id: appointmentId, tenantId: ctx.tenantId, patientId, status: appt.status, version: appt.version, deletedAt: null },
         data: {
           startsAt,
           endsAt,
           service: service.name,
           serviceCatalogItemId: service.id,
+          version: { increment: 1 },
           // The call confirmed the change, not attendance at the new time.
           // Discard confirmation evidence tied to the previous appointment.
           patientConfirmedAt: null,
           patientConfirmationSource: null,
           patientConfirmedCallLogId: null,
+          patientConfirmedAppointmentVersion: null,
         },
       });
       if (changed.count !== 1) return { conflict: 'already_booked' as const };
+      await advanceCommunicationPlanAfterReschedule(tx, {
+        tenantId: ctx.tenantId,
+        appointmentId,
+        appointmentVersion: appt.version + 1,
+        startsAt,
+      });
       await tx.auditEvent.create({ data: { tenantId: ctx.tenantId, actorUserId: null, action: 'receptionist.appointment.rescheduled', resource: 'appointment', resourceId: appointmentId, userAgent: 'retell-webhook', metadata: { startsAt: startsAt.toISOString(), via: 'verified_live_call' } } });
       await tx.businessEvent.create({ data: { tenantId: ctx.tenantId, eventType: 'appointment.rescheduled', entityType: 'appointment', entityId: appointmentId, sourceModule: 'receptionist', payload: { startsAt: startsAt.toISOString() } } });
       await tx.idempotencyKey.delete({ where: { scope_key: { scope: 'receptionist.voice-change-confirmation', key: pendingChangeKey(ctx, pending.token) } } });

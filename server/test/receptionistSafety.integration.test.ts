@@ -207,7 +207,7 @@ describe('AI receptionist safety workflows', () => {
     const service = await db.serviceCatalogItem.create({ data: { tenantId: tenant.id, name: 'Consultation', category: 'general', defaultDurationMinutes: 30, active: true } });
     const patient = await db.patient.create({ data: { tenantId: tenant.id, branchId: tenant.branchId, firstName: 'Voice', lastName: 'Patient', phone: '+12125550122', dateOfBirth: new Date('1980-01-02T00:00:00.000Z') } });
     const originalStart = new Date(`${new Date(Date.now() + 5 * 86_400_000).toISOString().slice(0, 10)}T09:00:00.000Z`);
-    const appointment = await db.appointment.create({ data: { tenantId: tenant.id, branchId: tenant.branchId, patientId: patient.id, providerProfileId: provider.id, providerRef: provider.id, service: service.name, serviceCatalogItemId: service.id, startsAt: originalStart, endsAt: new Date(originalStart.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'CALL', patientConfirmedAt: new Date(), patientConfirmationSource: 'staff' } });
+    const appointment = await db.appointment.create({ data: { tenantId: tenant.id, branchId: tenant.branchId, patientId: patient.id, providerProfileId: provider.id, providerRef: provider.id, service: service.name, serviceCatalogItemId: service.id, startsAt: originalStart, endsAt: new Date(originalStart.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'CALL', patientConfirmedAt: new Date(), patientConfirmationSource: 'staff', patientConfirmedAppointmentVersion: 1 } });
     const ctx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550122', providerInvocationId: randomUUID() };
 
     await expect(trustedTool(ctx, 'list_upcoming_appointments', {})).resolves.toMatchObject({ verified: false, appointments: [] });
@@ -219,10 +219,12 @@ describe('AI receptionist safety workflows', () => {
     const preparedMove = await trustedTool(ctx, 'prepare_appointment_change', { action: 'reschedule', appointment_id: appointment.id, appointment_date: moveDate, appointment_time: '10:00' }) as { confirmation_token: string };
     await expect(trustedTool(ctx, 'reschedule_appointment', { appointment_id: appointment.id, appointment_date: moveDate, appointment_time: '10:00', confirmation_token: preparedMove.confirmation_token, confirmed: true })).resolves.toMatchObject({ rescheduled: true, appointment_id: appointment.id });
     expect(await db.appointment.findUniqueOrThrow({ where: { id: appointment.id } })).toMatchObject({
+      version: 2,
       startsAt: new Date(`${moveDate}T10:00:00.000Z`),
       patientConfirmedAt: null,
       patientConfirmationSource: null,
       patientConfirmedCallLogId: null,
+      patientConfirmedAppointmentVersion: null,
     });
 
     await expect(trustedTool(ctx, 'cancel_appointment', { appointment_id: appointment.id, reason: 'Schedule changed' })).resolves.toMatchObject({ cancelled: false, confirmation_required: true });

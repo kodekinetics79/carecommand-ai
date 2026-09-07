@@ -29,6 +29,38 @@ enum AppointmentStatus {
   WAITLIST
 }
 
+enum AppointmentCommunicationMode {
+  NONE
+  SMS
+  VOICE
+  BOTH
+}
+
+enum AppointmentCommunicationPlanStatus {
+  ACTIVE
+  PAUSED
+  BLOCKED_SETUP
+  COMPLETED
+  CANCELLED
+}
+
+enum AppointmentCommunicationActionKind {
+  REMINDER
+}
+
+enum AppointmentCommunicationActionChannel {
+  SMS
+  VOICE
+}
+
+enum AppointmentCommunicationActionStatus {
+  QUEUED
+  BLOCKED_SETUP
+  CANCELLED
+  SENT
+  FAILED
+}
+
 enum LifecycleStage {
   NEW
   ACTIVE
@@ -161,6 +193,8 @@ model Tenant {
   staffProfiles                       StaffProfile[]
   staffTasks                          StaffTask[]
   appointmentNotes                    AppointmentNote[]
+  appointmentCommunicationPlans       AppointmentCommunicationPlan[]
+  appointmentCommunicationActions     AppointmentCommunicationAction[]
   revenueSnapshots                    RevenueSnapshot[]
   conversations                       Conversation[]
   conversationReplyAttempts           ConversationReplyAttempt[]
@@ -319,6 +353,7 @@ model User {
   receptionistKnowledgeEdited    ReceptionistClinicKnowledge[]   @relation("ReceptionistKnowledgeEditor")
   receptionistLocalePacksApproved ReceptionistLocalePack[]       @relation("ReceptionistLocalePackApprover")
   receptionistLocalePacksCreated ReceptionistLocalePack[]        @relation("ReceptionistLocalePackCreator")
+  appointmentCommunicationPlansUpdated AppointmentCommunicationPlan[] @relation("AppointmentCommunicationPlanUpdatedBy")
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -496,6 +531,10 @@ model Appointment {
   patientConfirmedAt             DateTime?
   patientConfirmationSource      String?
   patientConfirmedCallLogId      String?                         @db.Uuid
+  // Incremented whenever the booked time changes. Confirmation and reminder
+  // work are valid only for the exact version they name.
+  version                         Int                             @default(1)
+  patientConfirmedAppointmentVersion Int?
   notes                          String?
   deletedAt                      DateTime?
   createdAt                      DateTime                        @default(now())
@@ -520,6 +559,8 @@ model Appointment {
   receptionistCallTargets        ReceptionistCallTarget[]        @relation("ReceptionistCallTargetAppointment")
   // Append-only note history (C4). The scalar `notes` string stays for old readers.
   noteEntries                    AppointmentNote[]
+  communicationPlan              AppointmentCommunicationPlan?
+  communicationActions           AppointmentCommunicationAction[]
 
   @@unique([tenantId, id])
   @@unique([tenantId, receptionistCallLogId])
@@ -532,6 +573,53 @@ model Appointment {
   @@index([tenantId, status, startsAt])
   @@index([tenantId, patientConfirmedAt, startsAt])
   @@index([tenantId, providerProfileId, startsAt])
+}
+
+model AppointmentCommunicationPlan {
+  id                  String                              @id @default(uuid()) @db.Uuid
+  tenantId            String                              @db.Uuid
+  appointmentId       String                              @db.Uuid
+  mode                AppointmentCommunicationMode        @default(NONE)
+  status              AppointmentCommunicationPlanStatus  @default(PAUSED)
+  reminderLeadMinutes Int                                 @default(1440)
+  revision            Int                                 @default(1)
+  appointmentVersion  Int                                 @default(1)
+  updatedByUserId     String                              @db.Uuid
+  createdAt           DateTime                            @default(now())
+  updatedAt           DateTime                            @updatedAt
+  tenant              Tenant                              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  appointment         Appointment                         @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Cascade, map: "AppointmentCommunicationPlan_appointment_scope_fkey")
+  updatedBy           User                                @relation("AppointmentCommunicationPlanUpdatedBy", fields: [tenantId, updatedByUserId], references: [tenantId, id], onDelete: Restrict, map: "AppointmentCommunicationPlan_updatedBy_scope_fkey")
+  actions             AppointmentCommunicationAction[]
+
+  @@unique([tenantId, appointmentId])
+  @@unique([tenantId, appointmentId, id])
+  @@index([tenantId, status, updatedAt])
+  @@index([tenantId, updatedByUserId])
+}
+
+model AppointmentCommunicationAction {
+  id                 String                                 @id @default(uuid()) @db.Uuid
+  tenantId           String                                 @db.Uuid
+  appointmentId      String                                 @db.Uuid
+  planId             String                                 @db.Uuid
+  appointmentVersion Int
+  planRevision       Int
+  kind               AppointmentCommunicationActionKind     @default(REMINDER)
+  channel            AppointmentCommunicationActionChannel
+  sequence           Int                                    @default(1)
+  status             AppointmentCommunicationActionStatus
+  dueAt              DateTime
+  createdAt          DateTime                               @default(now())
+  updatedAt          DateTime                               @updatedAt
+  tenant             Tenant                                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  appointment        Appointment                            @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Cascade, map: "AppointmentCommunicationAction_appointment_scope_fkey")
+  plan               AppointmentCommunicationPlan           @relation(fields: [tenantId, appointmentId, planId], references: [tenantId, appointmentId, id], onDelete: Cascade, map: "AppointmentCommunicationAction_plan_scope_fkey")
+
+  @@unique([tenantId, appointmentId, planRevision, kind, channel, sequence])
+  @@index([tenantId, status, dueAt])
+  @@index([tenantId, appointmentId, appointmentVersion])
+  @@index([tenantId, appointmentId, planId])
 }
 
 // ===========================================================================

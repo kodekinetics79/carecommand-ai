@@ -109,7 +109,7 @@ describe('appointment correctness — name, double-book, reschedule, DOB', () =>
     const bId = b.json().id;
     await db.appointment.update({
       where: { id: bId },
-      data: { patientConfirmedAt: new Date(), patientConfirmationSource: 'staff' },
+      data: { patientConfirmedAt: new Date(), patientConfirmationSource: 'staff', patientConfirmedAppointmentVersion: 1 },
     });
     // Move B onto A's 09:00 slot → conflict.
     const clash = await app.inject({ method: 'PATCH', url: `/v1/appointments/${bId}/reschedule`, headers: staff(t), payload: { startsAt: at('09:00'), endsAt: at('09:30') } });
@@ -118,9 +118,11 @@ describe('appointment correctness — name, double-book, reschedule, DOB', () =>
     const ok = await app.inject({ method: 'PATCH', url: `/v1/appointments/${bId}/reschedule`, headers: staff(t), payload: { startsAt: at('11:00'), endsAt: at('11:30') } });
     expect(ok.statusCode).toBe(200);
     expect(ok.json()).toMatchObject({
+      version: 2,
       patientConfirmedAt: null,
       patientConfirmationSource: null,
       patientConfirmedCallLogId: null,
+      patientConfirmedAppointmentVersion: null,
     });
   });
 

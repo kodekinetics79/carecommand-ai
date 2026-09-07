@@ -81,7 +81,7 @@ describe('portal self-service — patient cancels/reschedules only their own app
     const appt = await makeAppt(t, t.patientId, at('09:00'));
     await db.appointment.update({
       where: { id: appt.id },
-      data: { patientConfirmedAt: new Date(), patientConfirmationSource: 'patient_portal' },
+      data: { patientConfirmedAt: new Date(), patientConfirmationSource: 'patient_portal', patientConfirmedAppointmentVersion: 1 },
     });
 
     const res = await app.inject({ method: 'GET', url: '/v1/portal/appointments', headers: phdr(t) });
@@ -161,7 +161,7 @@ describe('portal self-service — patient cancels/reschedules only their own app
     expect(res.json().startsAt).toBe(at('11:00').toISOString());
     const row = await db.appointment.findUnique({ where: { id: appt.id } });
     expect(row?.startsAt.toISOString()).toBe(at('11:00').toISOString());
-    expect(row).toMatchObject({ patientConfirmedAt: null, patientConfirmationSource: null, patientConfirmedCallLogId: null });
+    expect(row).toMatchObject({ version: 2, patientConfirmedAt: null, patientConfirmationSource: null, patientConfirmedCallLogId: null, patientConfirmedAppointmentVersion: null });
     const audited = await db.auditEvent.findFirst({ where: { tenantId: t.id, action: 'portal.appointment.rescheduled', resourceId: appt.id, actorUserId: null } });
     expect(audited).not.toBeNull();
   });

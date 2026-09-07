@@ -46,10 +46,39 @@ export interface TimeOffResponse {
   timeOff: TimeOffEntry[];
 }
 
+export type AppointmentCommunicationMode = 'NONE' | 'SMS' | 'VOICE' | 'BOTH';
+
+export interface AppointmentCommunicationPlan {
+  mode: AppointmentCommunicationMode;
+  status: 'ACTIVE' | 'PAUSED' | 'BLOCKED_SETUP' | 'COMPLETED' | 'CANCELLED';
+  reminderLeadMinutes: number;
+  revision: number | null;
+  appointmentVersion: number;
+  messages: Array<{
+    channel: 'SMS' | 'VOICE';
+    state: 'setup_needed' | 'cancelled';
+    dueAt: string;
+  }>;
+  summary: string;
+}
+
 const base = '/v1/appointments';
 const schedulingBase = '/v1/scheduling';
 
 export const appointmentsApi = {
+  communicationPlan: (id: string) =>
+    apiRequest<AppointmentCommunicationPlan>(`${base}/${id}/communication-plan`),
+
+  saveCommunicationPlan: (id: string, input: {
+    mode: AppointmentCommunicationMode;
+    reminderLeadMinutes?: number;
+    appointmentVersion: number;
+    revision: number | null;
+  }) => apiRequest<AppointmentCommunicationPlan>(`${base}/${id}/communication-plan`, {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  }),
+
   // Lifecycle transitions (validated server-side; a disallowed jump returns 409).
   setStatus: (id: string, status: LifecycleStatus) =>
     apiRequest<{ id: string; status: string }>(`${base}/${id}/status`, {

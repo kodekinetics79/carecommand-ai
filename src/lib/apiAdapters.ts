@@ -142,6 +142,7 @@ export interface ApiProviderProfile {
 
 export interface ApiAppointment extends PatientConfirmationFields {
   id: string;
+  version?: number;
   branchId: string;
   patientId: string;
   patientName?: string | null;
@@ -443,6 +444,7 @@ export function mapAppointment(row: ApiAppointment): Appointment {
     || 'Provider not linked';
   return {
     id: row.id,
+    version: row.version ?? 1,
     startsAt: row.startsAt,
     patientId: row.patientId,
     // Real patient name from the API (list/detail now include it); fall back only
