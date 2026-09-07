@@ -970,9 +970,12 @@ async function probeRetellEmptyTagDefaults(
     // tag it does not use.
     //
     // Missing metadata on the tag we actually asked about is still a hard
-    // failure: there the provider owes us an answer and did not give one.
+    // failure for a tag-addressed deployment: there the provider owes us an
+    // answer and did not give one. A CareCommand deployment is pinned to an
+    // exact numeric version, however, so an unassigned provider placeholder
+    // named `prod` or `staging` is not part of the deployed configuration.
     if (version === null) {
-      if (tagName === versionTag) return { ok: false, error: 'invalid_response' };
+      if (!options.pinned && tagName === versionTag) return { ok: false, error: 'invalid_response' };
       continue;
     }
     const relevant = tagName === versionTag || version === expectedVersion;
