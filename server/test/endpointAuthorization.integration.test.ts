@@ -424,8 +424,16 @@ describe('cross-module endpoint authorization', () => {
       db.reputationCase.create({ data: reputationData(tenant.branchB, 'Branch B complaint') }),
     ]);
 
+    // Keep this branch-scope assertion about authorization. Telehealth's
+    // product default is the clinic-local day, which can legitimately exclude
+    // a just-created future fixture when CI crosses a date boundary.
+    const branchTelehealthWindow = new URLSearchParams({
+      branchId: tenant.branchB,
+      from: new Date(now).toISOString(),
+      to: new Date(now + 10800000).toISOString(),
+    });
     const reads: Array<[string, string, string]> = [
-      [`/v1/telehealth/sessions?branchId=${tenant.branchB}`, appointmentA.id, appointmentB.id],
+      [`/v1/telehealth/sessions?${branchTelehealthWindow}`, appointmentA.id, appointmentB.id],
       [`/v1/reviews?branchId=${tenant.branchB}`, reviewA.id, reviewB.id],
       [`/v1/inventory?branchId=${tenant.branchB}`, inventoryA.id, inventoryB.id],
       [`/v1/partner-reports?branchId=${tenant.branchB}`, reportA.id, reportB.id],
