@@ -238,7 +238,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
             <label className="relative block flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-t3" aria-hidden="true" />
               <span className="sr-only">Search patients</span>
-              <input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search by name or phone" className="h-10 w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] pl-9 pr-3 text-sm text-t1 outline-none transition focus:border-indigo focus:ring-2 focus:ring-indigo/20" />
+              <input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search by name or phone" className="h-10 w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] pl-9 pr-3 text-sm text-t1 outline-none transition focus:border-indigo focus:ring-2 focus:ring-[var(--indigo)]/20" />
             </label>
             <label className="inline-flex min-h-10 cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--indigo-soft)]">
               <input ref={selectAllRef} type="checkbox" checked={allVisibleSelected} disabled={selectableVisible.length === 0} onChange={toggleAllVisible} className="h-5 w-5 rounded border-[var(--b2)] text-indigo focus:ring-indigo" />
