@@ -42,6 +42,7 @@ async function fillRequired() {
   if (script) fireEvent.change(script, { target: { value: 'Salam. Calling from Brightsmile Dental Group.' } });
   fireEvent.change(screen.getByPlaceholderText('21:00'), { target: { value: '23:50' } });
   fireEvent.change(screen.getByPlaceholderText('08:00'), { target: { value: '23:55' } });
+  fireEvent.change(screen.getByPlaceholderText('OUTBOUND-2026-01'), { target: { value: 'OUTBOUND-2026-01' } });
 }
 
 beforeEach(() => {
@@ -53,6 +54,17 @@ beforeEach(() => {
 });
 
 describe('a campaign is created with a receptionist attached', () => {
+  it('preserves appointment follow-up intent when opened from that workspace', async () => {
+    render(
+      <CampaignBuilder
+        clinicId="clinic-1" bookingAuthorities={[]} locations={[]} timezone="America/New_York"
+        initialPurpose="APPOINTMENT_REMINDER" onSaved={() => {}} onCancel={() => {}}
+      />,
+    );
+    expect(screen.getByRole('heading', { name: 'New appointment follow-up list' })).toBeInTheDocument();
+    expect((screen.getByLabelText('Call purpose') as HTMLSelectElement).value).toBe('APPOINTMENT_REMINDER');
+  });
+
   it('sends the clinic’s only published receptionist without asking', async () => {
     renderBuilder();
     await waitFor(() => expect(screen.getByLabelText('Receptionist placing these calls')).toBeTruthy());

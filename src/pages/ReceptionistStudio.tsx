@@ -341,9 +341,9 @@ export default function ReceptionistStudio() {
           </button>
         </div>
       ) : (
-        <div className="grid gap-4 xl:grid-cols-[260px_minmax(0,1fr)]">
+        <div className="grid min-w-0 gap-4 xl:grid-cols-[260px_minmax(0,1fr)]">
           {/* Left rail: clinic + campaign selectors */}
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4">
             <div className="cc-card p-3 space-y-2">
               <div className="flex items-center justify-between px-1">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Clinics</p>
@@ -398,7 +398,7 @@ export default function ReceptionistStudio() {
           </div>
 
           {/* Main editing surface */}
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4">
             {/*
               SF-3 / SF-4. The strip and the rail sit above the tabs on every
               screen, so "is the line answering, and what is blocking it" is

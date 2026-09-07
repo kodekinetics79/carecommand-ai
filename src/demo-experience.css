@@ -9,7 +9,7 @@
 :root {
   --bg: #eef3f9;
   --s0: #ffffff;
-  --s1: rgba(255, 255, 255, 0.92);
+  --s1: #ffffff;
   --s2: #f7f9fc;
   --s3: #eef2f7;
   --s4: #e2e8f0;
@@ -348,13 +348,21 @@ body::before {
 .cc-card,
 .metric-card,
 .cockpit-card,
-.glass-card,
 .ai-briefing {
   border-radius: var(--cc-radius-md) !important;
   border-color: rgba(148,163,184,0.20) !important;
-  background: rgba(255,255,255,0.84) !important;
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
-  backdrop-filter: blur(14px) saturate(140%);
+  background: #ffffff !important;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: var(--cc-shadow-sm) !important;
+}
+
+.glass-card {
+  border-radius: var(--cc-radius-md) !important;
+  border-color: rgba(255,255,255,0.72) !important;
+  background: rgba(255,255,255,0.78) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(145%);
+  backdrop-filter: blur(16px) saturate(145%);
   box-shadow: var(--cc-shadow-sm) !important;
 }
 

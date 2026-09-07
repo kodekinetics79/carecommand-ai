@@ -1941,7 +1941,13 @@ describe('AI receptionist outbound authority and target integrity', () => {
     });
     expect(listed.statusCode).toBe(200);
     expect(listed.json()).toEqual([
-      expect.objectContaining({ patientId: patient.id, firstName: patient.firstName, lastName: patient.lastName }),
+      expect.objectContaining({
+        patientId: patient.id,
+        firstName: patient.firstName,
+        lastName: patient.lastName,
+        voiceAuthorizationReady: true,
+        voiceAuthorizationReason: 'treatment_operations',
+      }),
     ]);
   });
 

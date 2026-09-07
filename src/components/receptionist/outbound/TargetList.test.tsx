@@ -94,6 +94,16 @@ describe('TargetList — candidate states are not interchangeable', () => {
     expect(screen.queryByText(POLICY_MISSING_GUIDANCE)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Close patient picker' })).toBeEnabled();
   });
+
+  it('searches the full server-side patient list instead of filtering only the first page', async () => {
+    respond = path => path.startsWith(CANDIDATES_PATH) ? Promise.resolve([]) : Promise.reject(new Error(`Unexpected request in test: ${path}`));
+    renderList(undefined, { purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: 'care-v1' });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add patients' }));
+    fireEvent.change(screen.getByPlaceholderText('Search by name or phone'), { target: { value: 'Alex 555' } });
+
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith(`${CANDIDATES_PATH}&q=Alex%20555`));
+  });
 });
 
 describe('TargetList — appointment reminders are about one real appointment', () => {
@@ -186,7 +196,7 @@ describe('TargetList — appointment reminders are about one real appointment', 
 
     renderList(undefined, { purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: 'care-v1' });
     fireEvent.click(await screen.findByRole('button', { name: 'Add patients' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Select all shown (2)' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all shown (2)' }));
     expect(screen.getByText('2 selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Save to list' }));
 

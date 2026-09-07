@@ -514,7 +514,7 @@ function CampaignCreator({ defaults, branches, branchError, user, onCreated, onC
       )}
       <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Name</span>
         <input className={inputCls} value={name} onChange={e => setName(e.target.value)} placeholder="Q3 reactivation" /></label>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid gap-3 sm:grid-cols-3">
         <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Type</span>
           <select aria-label="Campaign type" className={inputCls} value={campaignType} onChange={e => setType(e.target.value as CampaignType | '')}>
             <option value="">Select a type</option>
@@ -643,8 +643,13 @@ function CampaignDetail({ campaign, canManage, onChanged, onDeleted }: { campaig
   }
 
   const actions = canManage ? campaign.allowedActions : [];
+  const voiceUnavailable = campaign.channel?.toLowerCase() === 'voice';
 
   async function prepareConfirmation(kind: 'approve' | 'launch') {
+    if (voiceUnavailable) {
+      setError('Voice marketing is not connected. Choose SMS, email, or WhatsApp before approval or launch.');
+      return;
+    }
     await run(async () => {
       const exactPreview = await crmApi.launchPreview(campaign.id);
       setConfirmation({ kind, preview: exactPreview });
@@ -703,14 +708,15 @@ function CampaignDetail({ campaign, canManage, onChanged, onDeleted }: { campaig
         {campaign.messageTemplate && <p className="text-xs text-t3 whitespace-pre-wrap rounded-lg border border-[var(--b1)] p-2.5">{campaign.messageSubject ? `${campaign.messageSubject}\n` : ''}{campaign.messageTemplate}</p>}
         {notice && <p className="text-[11px] text-emerald-v">{notice}</p>}
         {error && <p className="text-[11px] text-red-v">{error}</p>}
+        {voiceUnavailable && <p role="alert" className="rounded-lg border border-amber-v/30 bg-amber-v/5 px-3 py-2 text-[11px] font-semibold text-amber-v">Voice marketing is unavailable. Edit this legacy campaign and choose SMS, email, or WhatsApp; no voice launch action is exposed.</p>}
         <div className="flex flex-wrap gap-2">
           {actions.includes('generate_draft') && (
             <button type="button" disabled={busy} onClick={() => run(async () => { const d = await crmApi.generateDraft(campaign.id); setDraft(d); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><Sparkles className="w-3.5 h-3.5" /> Generate draft (rule-based)</button>
           )}
-          {actions.includes('approve') && (
+          {actions.includes('approve') && !voiceUnavailable && (
             <button type="button" disabled={busy} onClick={() => void prepareConfirmation('approve')} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><CheckCircle2 className="w-3.5 h-3.5" /> Review and approve</button>
           )}
-          {actions.includes('launch') && (
+          {actions.includes('launch') && !voiceUnavailable && (
             <button type="button" disabled={busy} onClick={() => void prepareConfirmation('launch')} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><Send className="w-3.5 h-3.5" /> Review and launch</button>
           )}
           {actions.includes('pause') && (
@@ -744,13 +750,13 @@ function CampaignDetail({ campaign, canManage, onChanged, onDeleted }: { campaig
         )}
         {launch?.setupRequired && (
           <div className="flex items-center gap-2 rounded-lg border border-red-v/40 bg-red-v/5 px-2.5 py-1.5 text-[11px] text-red-v">
-            <AlertCircle className="w-3.5 h-3.5" /> The {launch.provider.channel} service is not configured ({launch.provider.missingConfigCount} setting{launch.provider.missingConfigCount === 1 ? '' : 's'} missing — ask your CareCommand administrator). Nothing was submitted.
+            <AlertCircle className="w-3.5 h-3.5" /> Delivery setup is incomplete. Nothing was sent. Ask your CareCommand administrator to finish Marketing setup.
           </div>
         )}
         {confirmation && (
           <ConfirmationModal
             title={confirmation.kind === 'approve' ? 'Authorize this exact campaign preview?' : 'Dispatch this exact campaign preview?'}
-            message={`${confirmation.preview.confirmationStatement} Eligible: ${confirmation.preview.audience.eligible}; consent record required: ${confirmation.preview.audience.authorityRequired}; live safety control pending: ${confirmation.preview.audience.atomicBoundaryBlocked}; suppressed: ${confirmation.preview.audience.suppressed}; missing contact: ${confirmation.preview.audience.missingContact}; channel: ${displayLabel(confirmation.preview.channel)}; provider mode: ${displayLabel(confirmation.preview.providerMode)}${confirmation.preview.scheduledAt ? `; scheduled: ${new Date(confirmation.preview.scheduledAt).toLocaleString()}` : ''}.`}
+            message={`Review this exact audience and message before continuing: ${confirmation.preview.audience.eligible} eligible, ${confirmation.preview.audience.suppressed} excluded by consent or contact preferences, and ${confirmation.preview.audience.missingContact} missing contact details. ${confirmation.preview.audience.authorityRequired > 0 ? `${confirmation.preview.audience.authorityRequired} need a current consent record. ` : ''}${confirmation.preview.audience.atomicBoundaryBlocked > 0 ? `${confirmation.preview.audience.atomicBoundaryBlocked} cannot be contacted until safety checks pass. ` : ''}Channel: ${displayLabel(confirmation.preview.channel)}.${confirmation.preview.scheduledAt ? ` Scheduled for ${new Date(confirmation.preview.scheduledAt).toLocaleString()}.` : ''}`}
             confirmLabel={confirmation.kind === 'approve' ? 'Authorize exact preview' : 'Dispatch exact preview'}
             tone="amber"
             onConfirm={confirmExactPreview}
@@ -892,7 +898,7 @@ function CampaignEditForm({ campaign, onSaved, onError }: { campaign: Campaign; 
       <p className="text-[11px] font-bold uppercase tracking-wide text-t3">Edit campaign</p>
       <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Name</span>
         <input className={inputCls} value={name} onChange={e => setName(e.target.value)} /></label>
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid gap-3 sm:grid-cols-2">
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Message subject (email)</span>
           <input className={inputCls} value={subject} onChange={e => setSubject(e.target.value)} placeholder="Optional" /></label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Channel</span>
@@ -908,7 +914,7 @@ function CampaignEditForm({ campaign, onSaved, onError }: { campaign: Campaign; 
         <span className="block text-[10px] text-t3">The scheduler will run only after you review and authorize the exact server preview. Any eligibility, template, channel, or provider-mode change requires a new authorization.</span>
       </label>
       <div className="flex gap-2">
-        <button type="button" disabled={saving || name.trim().length < 2} onClick={save} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />} Save changes</button>
+        <button type="button" disabled={saving || name.trim().length < 2 || channel === 'voice'} onClick={save} title={channel === 'voice' ? 'Choose SMS, email, or WhatsApp before saving.' : undefined} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />} Save changes</button>
         <button type="button" onClick={() => onSaved()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]"><X className="w-3.5 h-3.5" /> Close</button>
       </div>
     </div>

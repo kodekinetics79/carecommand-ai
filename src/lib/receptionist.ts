@@ -376,6 +376,9 @@ export interface CallTarget {
   /** The appointment this target is being called ABOUT; null for a recall or reactivation call. */
   appointmentId: string | null;
   createdAt: string;
+  /** Recomputed from current suppression and consent evidence whenever targets are listed. */
+  voiceAuthorizationReady?: boolean;
+  voiceAuthorizationReason?: OutboundTargetCandidate['voiceAuthorizationReason'];
 }
 
 export interface OutboundReconciliationEvidence {

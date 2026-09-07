@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Phone, PhoneOutgoing, Search, Settings2, UsersRound } from 'lucide-react';
 import { Select } from '../../ui/Field';
 import { receptionistApi as api, type OutboundCampaign, type CallTarget, type OutboundTargetCandidate, type OutboundTargetCandidateAppointment } from '../../../lib/receptionist';
@@ -65,35 +65,40 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
     .join(',');
   const [pickerOpen, setPickerOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const selectAllRef = useRef<HTMLInputElement>(null);
   const [selectedCandidates, setSelectedCandidates] = useState<string[]>([]);
+  const [selectedCandidateRows, setSelectedCandidateRows] = useState<Record<string, OutboundTargetCandidate>>({});
   const [selectedAppointments, setSelectedAppointments] = useState<Record<string, string>>({});
   const addState = useMutationState();
   const removeState = useMutationState();
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const busy = isBusy(addState.state) || isBusy(removeState.state);
 
-  const loadCandidates = useCallback(async () => {
+  const loadCandidates = useCallback(async (search = query) => {
     setCandidateState({ status: 'loading' });
     try {
-      const rows = await api.listOutboundTargetCandidates(campaign.id);
+      const rows = await api.listOutboundTargetCandidates(campaign.id, search.trim());
       setCandidates(rows);
       setCandidateState({ status: 'ready' });
     } catch (error) {
       setCandidateState(candidateFailureState(error));
     }
-  }, [campaign.id]);
+  }, [campaign.id, query]);
 
   useEffect(() => {
     let active = true;
-    void api.listOutboundTargetCandidates(campaign.id).then(rows => {
-      if (!active) return;
-      setCandidates(rows);
-      setCandidateState({ status: 'ready' });
-    }).catch(error => {
-      if (active) setCandidateState(candidateFailureState(error));
-    });
-    return () => { active = false; };
-  }, [campaign.id, targetIdentityKey]);
+    const timer = window.setTimeout(() => {
+      setCandidateState({ status: 'loading' });
+      void api.listOutboundTargetCandidates(campaign.id, query.trim()).then(rows => {
+        if (!active) return;
+        setCandidates(rows);
+        setCandidateState({ status: 'ready' });
+      }).catch(error => {
+        if (active) setCandidateState(candidateFailureState(error));
+      });
+    }, query.trim() ? 250 : 0);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [campaign.id, query, targetIdentityKey]);
 
   const reminderCampaign = campaign.purpose === 'APPOINTMENT_REMINDER';
   const candidateKey = (candidate: OutboundTargetCandidate) => `${candidate.type}:${candidate.id}`;
@@ -101,17 +106,26 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
   const candidateIsSelectable = (candidate: OutboundTargetCandidate) => candidate.voiceAuthorizationReady
     && !alreadyAdded.has(candidateKey(candidate))
     && (!reminderCampaign || (candidate.type === 'patient' && candidate.appointments.length > 0));
-  const normalizedQuery = query.trim().toLowerCase();
-  const visibleCandidates = candidates.filter(candidate => candidate.type === 'patient' && (!normalizedQuery
-    || candidate.name.toLowerCase().includes(normalizedQuery)
-    || candidate.phone.includes(normalizedQuery)));
+  const visibleCandidates = candidates.filter(candidate => candidate.type === 'patient');
   const selectableVisible = visibleCandidates.filter(candidateIsSelectable);
   const allVisibleSelected = selectableVisible.length > 0 && selectableVisible.every(candidate => selectedCandidates.includes(candidateKey(candidate)));
+  const someVisibleSelected = selectableVisible.some(candidate => selectedCandidates.includes(candidateKey(candidate)));
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someVisibleSelected && !allVisibleSelected;
+  }, [allVisibleSelected, someVisibleSelected]);
 
   function toggleCandidate(candidate: OutboundTargetCandidate) {
     if (!candidateIsSelectable(candidate)) return;
     const key = candidateKey(candidate);
-    setSelectedCandidates(current => current.includes(key) ? current.filter(value => value !== key) : [...current, key]);
+    const selecting = !selectedCandidates.includes(key);
+    setSelectedCandidates(current => selecting ? [...current, key] : current.filter(value => value !== key));
+    setSelectedCandidateRows(current => {
+      if (selecting) return { ...current, [key]: candidate };
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
     if (reminderCampaign && candidate.type === 'patient' && candidate.appointments.length === 1) {
       setSelectedAppointments(current => ({ ...current, [key]: candidate.appointments[0].appointmentId }));
     }
@@ -122,6 +136,12 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
     setSelectedCandidates(current => allVisibleSelected
       ? current.filter(key => !visibleKeys.includes(key))
       : Array.from(new Set([...current, ...visibleKeys])));
+    setSelectedCandidateRows(current => {
+      const next = { ...current };
+      if (allVisibleSelected) visibleKeys.forEach(key => { delete next[key]; });
+      else selectableVisible.forEach(candidate => { next[candidateKey(candidate)] = candidate; });
+      return next;
+    });
     if (!allVisibleSelected && reminderCampaign) {
       setSelectedAppointments(current => ({
         ...current,
@@ -133,7 +153,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
   }
 
   async function addSelected() {
-    const selectedRows = candidates.filter(candidate => selectedCandidates.includes(candidateKey(candidate)) && candidateIsSelectable(candidate));
+    const selectedRows = selectedCandidates.flatMap(key => selectedCandidateRows[key] ? [selectedCandidateRows[key]] : []).filter(candidateIsSelectable);
     const payload = selectedRows.flatMap(candidate => {
       const appointmentId = selectedAppointments[candidateKey(candidate)];
       if (reminderCampaign && (!appointmentId || candidate.type !== 'patient')) return [];
@@ -146,6 +166,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
     await addState.run(async () => {
       await api.addTargets(campaign.id, payload);
       setSelectedCandidates([]);
+      setSelectedCandidateRows({});
       setSelectedAppointments({});
       setQuery('');
       setPickerOpen(false);
@@ -166,7 +187,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
   }
 
   const policyMissing = candidateState.status === 'policy_missing';
-  const selectedRows = candidates.filter(candidate => selectedCandidates.includes(candidateKey(candidate)));
+  const selectedRows = selectedCandidates.flatMap(key => selectedCandidateRows[key] ? [selectedCandidateRows[key]] : []);
   const selectedMissingAppointment = reminderCampaign && selectedRows.some(candidate => !selectedAppointments[candidateKey(candidate)]);
   const addDisabled = busy || selectedRows.length === 0 || selectedMissingAppointment;
 
@@ -219,10 +240,12 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
               <span className="sr-only">Search patients</span>
               <input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search by name or phone" className="h-10 w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] pl-9 pr-3 text-sm text-t1 outline-none transition focus:border-indigo focus:ring-2 focus:ring-indigo/20" />
             </label>
-            <button type="button" disabled={selectableVisible.length === 0} onClick={toggleAllVisible} className="rounded-lg px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--indigo-soft)] disabled:opacity-50">
-              {allVisibleSelected ? 'Clear shown' : `Select all shown (${selectableVisible.length})`}
-            </button>
+            <label className="inline-flex min-h-10 cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--indigo-soft)]">
+              <input ref={selectAllRef} type="checkbox" checked={allVisibleSelected} disabled={selectableVisible.length === 0} onChange={toggleAllVisible} className="h-5 w-5 rounded border-[var(--b2)] text-indigo focus:ring-indigo" />
+              {allVisibleSelected ? 'Clear all shown' : `Select all shown (${selectableVisible.length})`}
+            </label>
           </div>
+          <p className="border-b border-[var(--b1)] px-3 py-2 text-[11px] text-t3">Showing up to 50 patients. Search checks the full patient list.</p>
           <div className="max-h-[420px] overflow-y-auto">
             {candidateState.status === 'loading' && <p className="p-5 text-sm text-t3">Loading patients…</p>}
             {candidateState.status === 'ready' && visibleCandidates.length === 0 && <p className="p-5 text-sm text-t3">No patients match this search.</p>}
@@ -240,11 +263,11 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
               return (
                 <div key={key} className={`border-b border-[var(--b1)] px-3 py-3 last:border-b-0 ${selected ? 'bg-[var(--indigo-soft)]' : ''}`}>
                   <div className="flex items-start gap-3">
-                    <input type="checkbox" aria-label={`Select ${candidate.name}`} checked={selected} disabled={!selectable} onChange={() => toggleCandidate(candidate)} className="mt-1 h-4 w-4 rounded border-[var(--b2)] text-indigo focus:ring-indigo" />
-                    <button type="button" disabled={!selectable} onClick={() => toggleCandidate(candidate)} className="min-w-0 flex-1 text-left disabled:cursor-not-allowed">
+                    <input type="checkbox" aria-label={`Select ${candidate.name}`} checked={selected} disabled={!selectable} onChange={() => toggleCandidate(candidate)} className="mt-0.5 h-5 w-5 shrink-0 rounded border-[var(--b2)] text-indigo focus:ring-indigo" />
+                    <div className="min-w-0 flex-1 text-left">
                       <span className="block text-sm font-semibold text-t1">{candidate.name}</span>
-                      <span className="mt-0.5 block text-xs text-t3">{maskedPhone(candidate.phone)} · {candidate.type === 'patient' ? 'Patient' : 'Lead'}</span>
-                    </button>
+                      <span className="mt-0.5 block text-xs text-t3">{maskedPhone(candidate.phone)} · Patient</span>
+                    </div>
                     {unavailableReason ? <span className="rounded-full bg-[var(--s3)] px-2 py-1 text-[10px] font-semibold text-t3">{unavailableReason}</span> : <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-v"><Check className="h-3 w-3" aria-hidden="true" /> Ready</span>}
                   </div>
                   {reminderCampaign && selected && candidate.type === 'patient' && (
@@ -269,15 +292,31 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
       )}
       <MutationNotice state={addState.state} onRetry={selectedRows.length > 0 && !selectedMissingAppointment ? addSelected : undefined} />
       <MutationNotice state={removeState.state} showSaved={false} />
-      {targets.length > 0 && (
-        <div className="overflow-x-auto rounded-2xl border border-[var(--b1)]">
+      {targets.length > 0 && (<>
+        <div className="space-y-2 sm:hidden">
+          {targets.map(t => {
+            const candidate = candidates.find(item => item.id === (t.patientId ?? t.leadId));
+            const consentReady = t.voiceAuthorizationReady ?? candidate?.voiceAuthorizationReady === true;
+            const displayName = [t.firstName, t.lastName].filter(Boolean).join(' ') || candidate?.name || 'Saved contact';
+            const callTitle = !consentReady ? `Target is not authorized for this exact campaign (${t.voiceAuthorizationReason ?? candidate?.voiceAuthorizationReason ?? 'authorization evidence unavailable'})` : !canCall ? 'List must be approved, provider-ready, and not emergency-stopped' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target';
+            return <div key={t.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
+              <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold text-t1">{displayName}</p><p className="text-xs text-t3">{maskedPhone(t.phone)}</p></div><span className="badge badge-blue">{formatEnumLabel(t.status)}</span></div>
+              <p className="mt-2 text-xs text-t3">{t.appointmentId ? 'Appointment linked' : 'No visit linked'}</p>
+              <div className="mt-3 flex gap-2">
+                <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={callTitle} onClick={() => onCall(t)} className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-2 text-xs font-semibold text-indigo disabled:opacity-50"><PhoneOutgoing className="h-3.5 w-3.5" /> Call</button>
+                <ConfirmedButton dialogTitle="Remove outbound target?" message={`Remove ${displayName} from this campaign? No call is placed by this action.`} confirmLabel="Remove target" tone="red" disabled={busy || deletingId === t.id} onConfirm={() => remove(t)} className="flex-1 rounded-lg border border-[var(--b1)] px-2.5 py-2 text-xs font-semibold text-red-v disabled:opacity-50">{deletingId === t.id ? 'Removing…' : 'Remove'}</ConfirmedButton>
+              </div>
+            </div>;
+          })}
+        </div>
+        <div className="hidden overflow-x-auto rounded-2xl border border-[var(--b1)] sm:block">
           <table className="min-w-[680px] w-full text-left text-xs">
             <thead className="bg-[var(--s2)] text-t3"><tr><th className="px-3 py-2.5 font-semibold">Person</th><th className="px-3 py-2.5 font-semibold">Status</th><th className="px-3 py-2.5 font-semibold">Visit</th><th className="px-3 py-2.5 text-right font-semibold">Actions</th></tr></thead>
             <tbody>
               {targets.map(t => (
                 (() => {
                   const candidate = candidates.find(item => item.id === (t.patientId ?? t.leadId));
-                  const consentReady = candidate?.voiceAuthorizationReady === true;
+                  const consentReady = t.voiceAuthorizationReady ?? candidate?.voiceAuthorizationReady === true;
                   const displayName = [t.firstName, t.lastName].filter(Boolean).join(' ') || candidate?.name || 'Saved contact';
                   return (
                 <tr key={t.id} className="border-t border-[var(--b1)] first:border-t-0">
@@ -285,7 +324,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
                   <td className="px-3 py-3"><span className="badge badge-blue">{formatEnumLabel(t.status)}</span></td>
                   <td className="px-3 py-3 text-t3">{t.appointmentId ? 'Appointment linked' : '—'}</td>
                   <td className="px-3 py-3"><div className="flex justify-end gap-2">
-                    <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={!consentReady ? `Target is not authorized for this exact campaign (${candidate?.voiceAuthorizationReason ?? 'authorization evidence unavailable'})` : !canCall ? 'Campaign must be running, provider-ready, and not emergency-stopped' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target'} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
+                    <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={!consentReady ? `Target is not authorized for this exact campaign (${t.voiceAuthorizationReason ?? candidate?.voiceAuthorizationReason ?? 'authorization evidence unavailable'})` : !canCall ? 'List must be approved, provider-ready, and not emergency-stopped' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target'} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
                       <PhoneOutgoing className="w-3 h-3" /> Call
                     </button>
                     <ConfirmedButton
@@ -307,7 +346,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
             </tbody>
           </table>
         </div>
-      )}
+      </>)}
       </div>
     </div>
   );

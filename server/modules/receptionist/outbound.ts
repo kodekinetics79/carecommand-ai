@@ -989,14 +989,16 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             { phone: { contains: query } },
           ] } : {}),
         },
-        select: { id: true, firstName: true, lastName: true, phone: true }, take: 50,
+        select: { id: true, firstName: true, lastName: true, phone: true },
+        orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }, { id: 'asc' }],
+        take: 50,
       }),
       tx.lead.findMany({
         where: {
           tenantId: request.auth.tenantId, phone: { not: null },
           ...(query ? { OR: [{ name: { contains: query, mode: 'insensitive' } }, { phone: { contains: query } }] } : {}),
         },
-        select: { id: true, name: true, phone: true }, take: 50,
+        select: { id: true, name: true, phone: true }, orderBy: [{ name: 'asc' }, { id: 'asc' }], take: 50,
       }),
     ]));
     // The appointments a target may be created FROM. A reminder campaign that
@@ -1088,8 +1090,41 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
   app.get('/outbound-campaigns/:id/targets', { preHandler: callArtifactRead }, async request => {
     const { id } = idParam.parse(request.params);
-    const rows = await db.receptionistCallTarget.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'asc' } });
-    return rows.map(row => ({ ...row, phone: maskPhone(row.phone) }));
+    const tenantId = request.auth.tenantId;
+    return runWithTenantContext(tenantId, async tx => {
+      const campaign = await tx.receptionistOutboundCampaign.findFirst({
+        where: { id, tenantId },
+        select: { purpose: true, legalBasis: true, policyVersion: true },
+      });
+      // Preserve the existing non-disclosure contract: a foreign or unknown
+      // campaign has the same empty target-list response.
+      if (!campaign) return [];
+      const rows = await tx.receptionistCallTarget.findMany({ where: { tenantId, campaignId: id }, orderBy: { createdAt: 'asc' } });
+      const requiresImmutableConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
+      return Promise.all(rows.map(async row => {
+        const targetIdentity = { patientId: row.patientId, leadId: row.leadId };
+        const suppressed = await isChannelSuppressedTx(tx, { tenantId, destination: row.phone, channel: 'voice', ...targetIdentity });
+        const consent = !suppressed && requiresImmutableConsent && campaign.purpose && campaign.policyVersion
+          ? await compatibleVoiceConsentEventTx(tx, {
+              tenantId,
+              ...targetIdentity,
+              purpose: campaign.purpose as (typeof OUTBOUND_PURPOSES)[number],
+              policyVersion: campaign.policyVersion,
+            })
+          : null;
+        const voiceAuthorizationReason = suppressed
+          ? 'suppressed' as const
+          : requiresImmutableConsent
+            ? consent ? 'compatible_immutable_consent' as const : 'consent_missing_or_incompatible' as const
+            : 'treatment_operations' as const;
+        return {
+          ...row,
+          phone: maskPhone(row.phone),
+          voiceAuthorizationReady: !suppressed && (!requiresImmutableConsent || consent !== null),
+          voiceAuthorizationReason,
+        };
+      }));
+    });
   });
 
   /**

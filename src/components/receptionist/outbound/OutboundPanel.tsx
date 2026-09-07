@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type KeyboardEvent } from 'react';
 import { CalendarClock, Loader2, Megaphone, PhoneCall, Plus, Settings2 } from 'lucide-react';
 import { Link } from 'react-router';
 import { useSession } from '../../../hooks/useSession';
@@ -31,6 +31,7 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
   const [loadErrors, setLoadErrors] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string>('');
   const [creating, setCreating] = useState(false);
+  const [draftPurpose, setDraftPurpose] = useState<'CARE_COORDINATION' | 'APPOINTMENT_REMINDER'>('CARE_COORDINATION');
   const [workspace, setWorkspace] = useState<'lists' | 'appointments' | 'marketing' | 'setup'>('lists');
   const [loading, setLoading] = useState(true);
 
@@ -102,6 +103,16 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
       ? { label: 'Calling ready', className: 'text-emerald-v bg-[var(--emerald-soft)]' }
       : { label: 'Setup needed', className: 'text-amber-v bg-[var(--amber-soft)]' };
 
+  function moveTabFocus(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    const id = tabs[next].id;
+    setWorkspace(id);
+    setCreating(false);
+    event.currentTarget.parentElement?.querySelector<HTMLButtonElement>(`#outreach-tab-${id}`)?.focus();
+  }
+
   return (
     <div className="space-y-5">
       <section className="glass-card overflow-hidden p-4 sm:p-5" aria-labelledby="outreach-title">
@@ -114,9 +125,9 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
             <button type="button" onClick={() => setWorkspace('setup')} className={`rounded-full px-3 py-1.5 text-xs font-bold ${callingStatus.className}`}>{callingStatus.label}</button>
           </div>
           <div role="tablist" aria-label="Patient outreach sections" className="flex max-w-full gap-1 overflow-x-auto rounded-xl border border-white/70 bg-white/60 p-1 shadow-sm">
-            {tabs.map(item => {
+            {tabs.map((item, index) => {
               const Icon = item.icon;
-              return <button key={item.id} role="tab" aria-selected={workspace === item.id} type="button" onClick={() => { setWorkspace(item.id); setCreating(false); }} className={`inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition ${workspace === item.id ? 'bg-[var(--s1)] text-t1 shadow-sm' : 'text-t3 hover:text-t1'}`}><Icon className="h-3.5 w-3.5" aria-hidden="true" />{item.label}</button>;
+              return <button key={item.id} id={`outreach-tab-${item.id}`} role="tab" aria-selected={workspace === item.id} aria-controls={`outreach-panel-${item.id}`} tabIndex={workspace === item.id ? 0 : -1} type="button" onKeyDown={event => moveTabFocus(event, index)} onClick={() => { setWorkspace(item.id); setCreating(false); }} className={`inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition ${workspace === item.id ? 'bg-[var(--s1)] text-t1 shadow-sm' : 'text-t3 hover:text-t1'}`}><Icon className="h-3.5 w-3.5" aria-hidden="true" />{item.label}</button>;
             })}
           </div>
         </div>
@@ -133,14 +144,16 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
         </div>
       )}
 
-      {(workspace === 'lists' || workspace === 'appointments') && <div className="grid gap-5 lg:grid-cols-[260px_1fr]">
+      {(workspace === 'lists' || workspace === 'appointments') && <div id={`outreach-panel-${workspace}`} role="tabpanel" aria-labelledby={`outreach-tab-${workspace}`} className="space-y-5">
+      {workspace === 'appointments' && <div className="rounded-xl border border-amber-v/30 bg-[var(--amber-soft)] p-3 text-xs text-t2"><p className="font-bold text-t1">Manual calling today</p><p className="mt-1">Choose patients and use Call one at a time. Automatic call/SMS reminders and provider-unavailable rebooking are not connected yet, so approving a list does not schedule or dispatch anything.</p></div>}
+      <div className="grid gap-5 lg:grid-cols-[260px_minmax(0,1fr)]">
         {/* Campaign list */}
         <div className="cc-card p-3 space-y-1.5 h-max">
           <div className="flex items-center justify-between px-1 pb-1">
             <span className="text-[11px] font-bold uppercase tracking-wide text-t3">{workspace === 'appointments' ? 'Reminder lists' : 'Calling lists'}</span>
-            <button type="button" aria-label="New calling list" title="New calling list" onClick={() => { setWorkspace('setup'); setCreating(true); setSelectedId(''); }} className="text-indigo hover:opacity-80"><Plus className="w-4 h-4" /></button>
+            <button type="button" onClick={() => { setDraftPurpose(workspace === 'appointments' ? 'APPOINTMENT_REMINDER' : 'CARE_COORDINATION'); setWorkspace('setup'); setCreating(true); setSelectedId(''); }} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80"><Plus className="w-4 h-4" /> New</button>
           </div>
-          {operationalCampaigns.length === 0 && loadErrors.length === 0 && <div className="px-1 py-4"><p className="text-xs font-semibold text-t2">No {workspace === 'appointments' ? 'appointment reminder lists' : 'calling lists'} yet.</p><button type="button" onClick={() => { setWorkspace('setup'); setCreating(true); }} className="mt-2 text-xs font-semibold text-indigo">Create one in Setup</button></div>}
+          {operationalCampaigns.length === 0 && loadErrors.length === 0 && <div className="px-1 py-4"><p className="text-xs font-semibold text-t2">No {workspace === 'appointments' ? 'appointment reminder lists' : 'calling lists'} yet.</p><button type="button" onClick={() => { setDraftPurpose(workspace === 'appointments' ? 'APPOINTMENT_REMINDER' : 'CARE_COORDINATION'); setWorkspace('setup'); setCreating(true); }} className="mt-2 text-xs font-semibold text-indigo">Create one in Setup</button></div>}
           {operationalCampaigns.map(c => (
             <button
               key={c.id}
@@ -163,16 +176,17 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
             <div className="cc-card p-10 text-center text-sm text-t3">Choose New calling list to get started.</div>
           )}
         </div>
-      </div>}
+      </div>
 
       {workspace === 'appointments' && <>
         <BookingRequestQueue requests={requests} onChanged={reload} />
         <ConfirmationDeliveryQueue deliveries={deliveries} loadFailed={loadErrors.some(error => error.startsWith('confirmation delivery evidence'))} onRetry={reload} />
         <div className="cc-card flex flex-wrap items-center justify-between gap-3 p-4"><div><p className="text-sm font-bold text-t1">Manage appointments</p><p className="mt-1 text-xs text-t3">Book, move, or cancel the canonical visit from Scheduling.</p></div><Link to="/scheduling" className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-indigo">Open Scheduling</Link></div>
       </>}
+      </div>}
 
       {workspace === 'marketing' && (
-        <div className="cc-card p-6 sm:p-8">
+        <div id="outreach-panel-marketing" role="tabpanel" aria-labelledby="outreach-tab-marketing" className="cc-card p-6 sm:p-8">
           <div className="max-w-2xl">
             <Megaphone className="h-8 w-8 text-indigo" aria-hidden="true" />
             <h3 className="mt-4 text-xl font-bold tracking-[-0.02em] text-t1">Marketing campaigns</h3>
@@ -182,7 +196,7 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
         </div>
       )}
 
-      {workspace === 'setup' && <div className="space-y-5">
+      {workspace === 'setup' && <div id="outreach-panel-setup" role="tabpanel" aria-labelledby="outreach-tab-setup" className="space-y-5">
         <VoiceLineStatusCard status={status} />
         <OutboundStopCard control={control} result={stopResult} canStop={canStop} stopping={stopping} error={stopError} onStop={stopOutbound} onRetry={reload} />
         <div className="grid gap-5 lg:grid-cols-[260px_1fr]">
@@ -191,7 +205,7 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
             {campaigns.map(campaign => <button key={campaign.id} type="button" onClick={() => { setSelectedId(campaign.id); setCreating(false); }} className={`w-full rounded-lg px-2.5 py-2 text-left text-sm ${selected?.id === campaign.id && !creating ? 'bg-[var(--s2)] text-t1' : 'text-t2 hover:bg-[var(--s2)]'}`}><span className="block truncate font-semibold">{campaign.name}</span><span className="text-[10px] text-t3">{formatEnumLabel(campaign.status)} · {campaign._count?.targets ?? 0} people</span></button>)}
           </div>
           <div className="space-y-5">
-            {creating && <CampaignBuilder clinicId={clinic.id} bookingAuthorities={bookingAuthorities} locations={clinic.locations ?? []} timezone={clinic.timezone} onCancel={() => setCreating(false)} onSaved={async id => { setCreating(false); await reload(); setSelectedId(id); }} />}
+            {creating && <CampaignBuilder clinicId={clinic.id} bookingAuthorities={bookingAuthorities} locations={clinic.locations ?? []} timezone={clinic.timezone} initialPurpose={draftPurpose} onCancel={() => setCreating(false)} onSaved={async id => { setCreating(false); await reload(); setSelectedId(id); }} />}
             {!creating && selected && <CampaignDetail key={selected.id} campaign={selected} status={status} outboundStopped={control?.stopped !== false} onChanged={reload} mode="setup" />}
             {!creating && !selected && <div className="cc-card p-10 text-center text-sm text-t3">Select a list or create one.</div>}
           </div>
