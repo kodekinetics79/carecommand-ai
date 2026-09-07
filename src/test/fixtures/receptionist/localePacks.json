@@ -59,11 +59,15 @@
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
           "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "tool.appointment_request.unbound": "I could not bind this request to the active call. Please contact reception.",
+          "tool.appointment_request.unauthorized": "I could not confirm this is an authorised outbound appointment-request campaign. Please contact reception.",
+          "tool.appointment_request.recorded": "Your appointment request is recorded for the team to review. No appointment or time is booked or held yet.",
+          "tool.appointment_request.failed": "I could not confirm that the request was recorded. Please contact reception.",
           "reminder.appointment.line": "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
           "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
-      "evidenceHash": "2546a3632580137b0e0eecf4b36ea30bf78ded8c6427944b9ba2e3625bc98ee2",
+      "evidenceHash": "e08ac1f1f15f8c1422ab02fab3ac7347c868fab27409d9234d447a93825fa4ac",
       "approvedAt": "2026-08-28T09:00:00.000Z",
       "approvedBy": {
         "id": "3f1c9a52-8b47-4c1e-9a6d-2f70b58c4d11",
@@ -133,11 +137,15 @@
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
           "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "tool.appointment_request.unbound": "I could not bind this request to the active call. Please contact reception.",
+          "tool.appointment_request.unauthorized": "I could not confirm this is an authorised outbound appointment-request campaign. Please contact reception.",
+          "tool.appointment_request.recorded": "Your appointment request is recorded for the team to review. No appointment or time is booked or held yet.",
+          "tool.appointment_request.failed": "I could not confirm that the request was recorded. Please contact reception.",
           "reminder.appointment.line": "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
           "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
-      "evidenceHash": "0ed160780d2b0d119ccf306e1784a763e5b0ae5d5de63e6ba3bb77e637b95b25",
+      "evidenceHash": "998ca964aed641c6b9ad07696e8219e09c7f1e37555d08823952518425e0b97b",
       "approvedAt": null,
       "approvedBy": null,
       "retiredAt": null,
@@ -194,11 +202,15 @@
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
           "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "tool.appointment_request.unbound": "I could not bind this request to the active call. Please contact the front desk.",
+          "tool.appointment_request.unauthorized": "I could not confirm this is an authorized outbound appointment-request campaign. Please contact the front desk.",
+          "tool.appointment_request.recorded": "Your appointment request is recorded for staff review. No appointment or time is booked or held yet.",
+          "tool.appointment_request.failed": "I could not confirm that the request was recorded. Please contact the front desk.",
           "reminder.appointment.line": "I'm calling about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
           "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
-      "evidenceHash": "96593e692983930812319ce82ddd8aaca9f667057d78b592741329ac00e83240"
+      "evidenceHash": "a4a48f55fed8160da7a6e5447081d1e997ce2d4be1809d958d713e7a9ac2d55a"
     },
     {
       "language": "en-GB",
@@ -247,11 +259,15 @@
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
           "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "tool.appointment_request.unbound": "I could not bind this request to the active call. Please contact reception.",
+          "tool.appointment_request.unauthorized": "I could not confirm this is an authorised outbound appointment-request campaign. Please contact reception.",
+          "tool.appointment_request.recorded": "Your appointment request is recorded for the team to review. No appointment or time is booked or held yet.",
+          "tool.appointment_request.failed": "I could not confirm that the request was recorded. Please contact reception.",
           "reminder.appointment.line": "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
           "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
-      "evidenceHash": "ce30e8be04af5d9273c10270af44ab4f0470f6a326fab3de601f66b1455b5045"
+      "evidenceHash": "70efb728f8fe8bb5cbdf82de0fd6123ffee309ecf9505f68faeeb93fc5fe2595"
     }
   ]
 }

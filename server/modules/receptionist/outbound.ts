@@ -2288,9 +2288,12 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         live_test_disclosure: liveTest ? liveCallUatDisclosure(null) : '',
         consent_text: campaign.consentText ?? '',
         human_handoff: campaign.humanHandoffInstruction ?? '',
-        script: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
+        outbound_script: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
           ? authorizedCampaign.receptionistCampaign!.offerScript
           : campaign.script,
+        outbound_campaign_name: campaign.name,
+        outbound_booking_mode: campaign.bookingMode,
+        outbound_first_name: dialIdentity.firstName ?? '',
         required_fields: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
           ? ''
           : campaign.requiredFields.join(', '),

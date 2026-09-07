@@ -283,6 +283,9 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
 
   try {
     const providerWebhookUrl = providerReachableWebhookUrl(input.webhookUrl);
+    const providerMetadata = Object.fromEntries(
+      Object.entries(input.metadata).filter(([, value]) => value !== null && value !== undefined),
+    );
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/create-phone-call`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${retellCredentials().apiKey}`, 'Content-Type': 'application/json' },
@@ -306,7 +309,7 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
           },
         },
         retell_llm_dynamic_variables: input.dynamicVariables,
-        metadata: input.metadata,
+        metadata: providerMetadata,
       }),
     });
     const body = await response.json().catch(() => null) as {
@@ -314,6 +317,8 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
       callId?: string;
       agent_id?: string;
       agent_version?: number;
+      metadata?: Record<string, unknown>;
+      retell_llm_dynamic_variables?: Record<string, unknown>;
     } | null;
     if (!response.ok) {
       // Only responses that definitively reject the request before call creation
@@ -330,6 +335,32 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
       return {
         ok: false,
         error: 'retell_deployment_mismatch',
+        acceptance: stopped.ok && stopped.applied ? 'rejected' : 'unknown',
+        callId,
+        providerStopApplied: stopped.ok && stopped.applied,
+        ...(!stopped.ok ? { providerStopError: stopped.error } : {}),
+      };
+    }
+    // The provider's 201 body is the first evidence that the campaign context
+    // was actually attached to this call. A real production call once returned
+    // empty metadata and dynamic variables while still accepting the dial; the
+    // shared agent then spoke its generic inbound workflow. Stop immediately
+    // rather than placing an untraceable or misleading campaign call.
+    const echoedMetadata = body.metadata && typeof body.metadata === 'object' ? body.metadata : {};
+    const echoedVariables = body.retell_llm_dynamic_variables && typeof body.retell_llm_dynamic_variables === 'object'
+      ? body.retell_llm_dynamic_variables
+      : {};
+    const contextEchoMatches = Object.entries(providerMetadata).every(([key, value]) => echoedMetadata[key] === value)
+      && Object.entries(input.dynamicVariables).every(([key, value]) => echoedVariables[key] === value);
+    // Older simulated providers omitted these documented response fields. A
+    // live Retell response includes them; when it does, an empty/partial echo is
+    // a hard failure rather than permission to continue a contextless call.
+    const providerReturnedContext = body.metadata !== undefined || body.retell_llm_dynamic_variables !== undefined;
+    if (providerReturnedContext && !contextEchoMatches) {
+      const stopped = await stopPhoneCall(callId);
+      return {
+        ok: false,
+        error: 'retell_call_context_mismatch',
         acceptance: stopped.ok && stopped.applied ? 'rejected' : 'unknown',
         callId,
         providerStopApplied: stopped.ok && stopped.applied,

@@ -100,6 +100,10 @@ const EN_US_V1: PlatformLocalePack = {
       'tool.confirm.locked': "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
       'tool.message.recorded': "Thank you. I've recorded your message for the front desk. I cannot confirm a callback or response time.",
       'tool.message.appended': "Thank you. I've added that to the same note for the front desk. I cannot confirm a callback or response time.",
+      'tool.appointment_request.unbound': 'I could not bind this request to the active call. Please contact the front desk.',
+      'tool.appointment_request.unauthorized': 'I could not confirm this is an authorized outbound appointment-request campaign. Please contact the front desk.',
+      'tool.appointment_request.recorded': 'Your appointment request is recorded for staff review. No appointment or time is booked or held yet.',
+      'tool.appointment_request.failed': 'I could not confirm that the request was recorded. Please contact the front desk.',
       // The reminder, in this patient's own details. The holes are runtime
       // variables resolved at dial time from the appointment the call target is
       // bound to; the campaign script no longer gets to state them.
@@ -186,6 +190,10 @@ const EN_GB_V1: PlatformLocalePack = {
       'tool.confirm.locked': "That appointment can no longer be confirmed automatically. I can put you through to reception.",
       'tool.message.recorded': "Thank you. I've recorded your message for reception. I cannot confirm a callback or response time.",
       'tool.message.appended': "Thank you. I've added that to the same note for reception. I cannot confirm a callback or response time.",
+      'tool.appointment_request.unbound': 'I could not bind this request to the active call. Please contact reception.',
+      'tool.appointment_request.unauthorized': 'I could not confirm this is an authorised outbound appointment-request campaign. Please contact reception.',
+      'tool.appointment_request.recorded': 'Your appointment request is recorded for the team to review. No appointment or time is booked or held yet.',
+      'tool.appointment_request.failed': 'I could not confirm that the request was recorded. Please contact reception.',
       'reminder.appointment.line': "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
       'reminder.appointment.clinician': "You're booked in with {{appointment_clinician}}.",
     },

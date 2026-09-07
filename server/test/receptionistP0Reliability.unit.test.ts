@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
 import { createPhoneCall, getPhoneCall, stopPhoneCall } from '../lib/retell';
-import { buildRetellConfig, generateSamples, generateSystemPrompt, inboundGreeting, type PromptConfig } from '../modules/receptionist/promptService';
+import { buildRetellConfig, generateSamples, generateSystemPrompt, type PromptConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
 
 const originalRetell = {
@@ -152,6 +152,32 @@ describe('receptionist P0 reliability', () => {
     })).resolves.toEqual({ ok: true, callId: 'call-v0', mock: false });
   });
 
+  it('stops a provider-accepted call when Retell drops its campaign context', async () => {
+    env.RETELL_API_KEY = 'real-retell-key';
+    env.RETELL_FROM_NUMBER = '+12125550199';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+    const fetchMock = vi.fn<typeof fetch>(async (_url, init) => {
+      if (init?.method === 'POST' && String(_url).includes('/v2/create-phone-call')) {
+        return new Response(JSON.stringify({
+          call_id: 'call-contextless', agent_id: 'agent-v0', agent_version: 0,
+          metadata: {}, retell_llm_dynamic_variables: {},
+        }), { status: 201 });
+      }
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(createPhoneCall({
+      toNumber: '+12125550101', agentId: 'agent-v0', agentVersion: 0,
+      dynamicVariables: { outbound_script: 'Approved outreach purpose.' },
+      metadata: { carecommand_call_log_id: 'log-1' },
+    })).resolves.toEqual({
+      ok: false, error: 'retell_call_context_mismatch', acceptance: 'rejected',
+      callId: 'call-contextless', providerStopApplied: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     [400, 'rejected'], [401, 'rejected'], [403, 'rejected'], [404, 'rejected'], [422, 'rejected'],
     [408, 'unknown'], [409, 'unknown'], [425, 'unknown'], [429, 'unknown'], [500, 'unknown'], [503, 'unknown'],
@@ -238,15 +264,16 @@ describe('receptionist P0 reliability', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  // C4 — a greeting, then the fully rendered disclosure, in one turn that still
-  // ends on the consent question. The campaign greeting override still waits
-  // for consent, and the preview still shows exactly the deployed turn.
-  it('greets before the fully rendered consent turn, and still waits for the answer', () => {
+  // C4 — the fully rendered, direction-neutral disclosure is one turn that
+  // still ends on the consent question. Direction-specific language follows
+  // only after the signed call direction and explicit consent are available.
+  it('uses a direction-neutral disclosure and still waits for the answer', () => {
     const built = buildRetellConfig(promptConfig, { webhookBaseUrl: 'https://api.example.test/' });
     const disclosure = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
 
-    expect(built.beginMessage).toBe(`${inboundGreeting(promptConfig)} ${disclosure} Clinic-specific compliance language. Is that okay?`);
-    expect(built.beginMessage.startsWith('Thanks for calling Example Clinic.')).toBe(true);
+    expect(built.beginMessage).toBe(`${disclosure} Clinic-specific compliance language. Is that okay?`);
+    expect(built.beginMessage).not.toContain('Thanks for calling');
+    expect(built.beginMessage).not.toContain("You've reached");
     expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
     expect(built.beginMessage).not.toContain('I can help you schedule today.');
     expect(generateSamples(promptConfig).greeting).toBe(built.beginMessage);
@@ -263,7 +290,7 @@ describe('receptionist P0 reliability', () => {
     const expected = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
 
     expect(buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' }).beginMessage)
-      .toBe(`${inboundGreeting(config)} ${expected} Is that okay?`);
+      .toBe(`${expected} Is that okay?`);
     const prompt = generateSystemPrompt(config);
     expect(prompt).toContain(expected);
     expect(prompt).toContain('must not be shortened, paraphrased, reordered, skipped or replaced');

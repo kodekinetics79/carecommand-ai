@@ -332,7 +332,15 @@ describe('cross-module endpoint authorization', () => {
     const integrationA = await db.integration.create({ data: { tenantId: tenantA.id, key: 'tenant-a', name: 'Tenant A Integration', category: 'Test' } });
     const integrationB = await db.integration.create({ data: { tenantId: tenantB.id, key: 'tenant-b', name: 'Tenant B Integration', category: 'Test' } });
 
-    const sessions = (await app.inject({ method: 'GET', url: '/v1/telehealth/sessions', headers: headers(tenantB, 'OWNER') })).json() as Array<{ id: string }>;
+    // The product endpoint defaults to each clinic's local "today" window.
+    // Pin this authorization assertion to the records it just created so a
+    // timezone/day-boundary cannot turn a tenant-isolation test into an empty
+    // dashboard test.
+    const telehealthWindow = new URLSearchParams({
+      from: new Date(now).toISOString(),
+      to: new Date(now + 10800000).toISOString(),
+    });
+    const sessions = (await app.inject({ method: 'GET', url: `/v1/telehealth/sessions?${telehealthWindow}`, headers: headers(tenantB, 'OWNER') })).json() as Array<{ id: string }>;
     expect(sessions.map(row => row.id)).toContain(appointmentB.id);
     expect(sessions.map(row => row.id)).not.toContain(appointmentA.id);
     const reports = (await app.inject({ method: 'GET', url: '/v1/partner-reports', headers: headers(tenantB, 'OWNER') })).json() as Array<{ id: string }>;
@@ -416,8 +424,16 @@ describe('cross-module endpoint authorization', () => {
       db.reputationCase.create({ data: reputationData(tenant.branchB, 'Branch B complaint') }),
     ]);
 
+    // Keep this branch-scope assertion about authorization. Telehealth's
+    // product default is the clinic-local day, which can legitimately exclude
+    // a just-created future fixture when CI crosses a date boundary.
+    const branchTelehealthWindow = new URLSearchParams({
+      branchId: tenant.branchB,
+      from: new Date(now).toISOString(),
+      to: new Date(now + 10800000).toISOString(),
+    });
     const reads: Array<[string, string, string]> = [
-      [`/v1/telehealth/sessions?branchId=${tenant.branchB}`, appointmentA.id, appointmentB.id],
+      [`/v1/telehealth/sessions?${branchTelehealthWindow}`, appointmentA.id, appointmentB.id],
       [`/v1/reviews?branchId=${tenant.branchB}`, reviewA.id, reviewB.id],
       [`/v1/inventory?branchId=${tenant.branchB}`, inventoryA.id, inventoryB.id],
       [`/v1/partner-reports?branchId=${tenant.branchB}`, reportA.id, reportB.id],

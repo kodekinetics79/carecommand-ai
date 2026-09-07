@@ -158,7 +158,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
       setLaunchMsg({
         kind: result.outcome === 'ESCALATED' ? 'warn' : 'ok',
         text: result.outcome === 'ESCALATED'
-          ? 'The provider call ended without signed analyzed-webhook evidence. CareCommand created a staff review task instead of fabricating a successful outcome.'
+          ? 'The provider call ended without a conclusive automated outcome. CareCommand routed it to staff review instead of fabricating a successful result.'
           : `Provider lifecycle synchronized as ${formatEnumLabel(result.providerStatus)}.`,
       });
       await reloadDetail();
