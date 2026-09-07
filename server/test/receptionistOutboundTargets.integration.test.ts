@@ -2523,7 +2523,15 @@ describe('an outbound reminder states the appointment it is actually about', () 
       method: 'POST',
       url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
       headers: auth(tenant),
-      payload: { targets: [{ patientId: patient.id, phone: patient.phone, appointmentId: appointment.id }] },
+      payload: {
+        targets: [{
+          patientId: patient.id,
+          phone: patient.phone,
+          firstName: patient.firstName,
+          lastName: patient.lastName,
+          appointmentId: appointment.id,
+        }],
+      },
     });
     expect(created.statusCode).toBe(201);
     const target = await db.receptionistCallTarget.findFirstOrThrow({
@@ -2541,6 +2549,11 @@ describe('an outbound reminder states the appointment it is actually about', () 
     expect(response.statusCode).toBe(201);
 
     const variables = dialVariablesFrom(providerFetch);
+    expect(variables.outbound_script).toBe('Call the patient about care coordination.');
+    expect(variables.outbound_campaign_name).toBeTruthy();
+    expect(variables.outbound_booking_mode).toBe('APPOINTMENT_REQUEST_ONLY');
+    expect(variables.outbound_first_name).toBe(patient.firstName);
+    expect(variables).not.toHaveProperty('script');
     expect(variables.appointment_id).toBe(appointment.id);
     expect(variables.appointment_clinician).toBe('Dr Amara Osei');
     // en-US pack: 12-hour clock, weekday-month-day, rendered in the branch tz.

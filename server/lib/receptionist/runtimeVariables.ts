@@ -43,6 +43,12 @@ export const RUNTIME_DYNAMIC_VARIABLES = [
   { name: 'appointment_time', default: '' },
   { name: 'appointment_service', default: '' },
   { name: 'appointment_location', default: '' },
+  // Outbound campaign context is chosen at dial time, not when the shared
+  // clinic agent is published. These stay empty on inbound calls.
+  { name: 'outbound_script', default: '' },
+  { name: 'outbound_campaign_name', default: '' },
+  { name: 'outbound_booking_mode', default: '' },
+  { name: 'outbound_first_name', default: '' },
 ] as const;
 
 export type RuntimeDynamicVariable = (typeof RUNTIME_DYNAMIC_VARIABLES)[number]['name'];

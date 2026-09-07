@@ -3,7 +3,6 @@ import {
   buildRetellConfig,
   generateSampleTranscripts,
   generateSystemPrompt,
-  inboundGreeting,
   openingTurn,
   type PromptConfig,
 } from '../modules/receptionist/promptService';
@@ -89,10 +88,11 @@ for (const locale of LOCALES) {
 
     // C4 — the caller used to hear the consent question first, with no
     // greeting anywhere in the tree.
-    it('greets the caller before asking them to agree to anything', () => {
+    it('opens without falsely claiming the caller placed an outbound call', () => {
       const turn = openingTurn(config);
-      expect(turn.startsWith(inboundGreeting(config))).toBe(true);
-      expect(inboundGreeting(config)).toContain(config.clinic.name);
+      expect(turn).not.toContain("Thanks for calling");
+      expect(turn).not.toContain("You've reached");
+      expect(turn).toContain(config.clinic.name);
       expect(turn).toContain('This call may be recorded');
       // ...and the turn still ends on the consent question, so the agent stops.
       expect(turn.endsWith('Is that okay?')).toBe(true);
@@ -105,6 +105,16 @@ for (const locale of LOCALES) {
       // C13 — the preview cannot drift from the deployment, because it is the
       // same rendered artefact and not a hand-written turn.
       expect(generateSampleTranscripts(config).openingSequence[0].text).toBe(built.beginMessage);
+    });
+
+    it('binds outbound calls to their call-scoped script and request workflow', () => {
+      const built = buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' });
+      const prompt = generateSystemPrompt(config);
+      expect(prompt).toContain('{{outbound_script}}');
+      expect(prompt).toContain('{{outbound_booking_mode}}');
+      expect(prompt).toContain('Never replace it with "How can I help you today?"');
+      expect(prompt).toContain('call request_appointment');
+      expect(built.tools).toContainEqual(expect.objectContaining({ name: 'request_appointment', type: 'custom' }));
     });
 
     it('leaves the caller a warm hand-back instead of retention jargon', () => {
@@ -138,13 +148,11 @@ for (const locale of LOCALES) {
 }
 
 describe('the two locales are genuinely different, not one translated badly', () => {
-  it('speaks each jurisdiction’s own front desk, clock and emergency number', () => {
+  it('speaks each jurisdiction’s own handoff language, clock and emergency number', () => {
     const us = generateSystemPrompt(promptFixture('us-full'));
     const gb = generateSystemPrompt(promptFixture('gb-full'));
     expect(us).toContain('911');
     expect(gb).toContain('999');
-    expect(us).toContain("You've reached the front desk");
-    expect(gb).toContain("You've reached reception");
     const gbStrings = platformLocalePack('en-GB', 'GB')!.strings;
     const usStrings = platformLocalePack('en-US', 'US')!.strings;
     expect(usStrings.messages['handoff.spoken']).toContain('front desk');

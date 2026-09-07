@@ -41,7 +41,7 @@ async function makeTenant() {
   const providerAgentId = `agent_${id.replaceAll('-', '')}`;
   const providerAgentVersion = 2;
   const verifiedAt = new Date();
-  await db.receptionistAgent.create({ data: {
+  const agent = await db.receptionistAgent.create({ data: {
     tenantId: id, clinicId: clinic.id, name: 'Avery', active: true,
     providerAgentId, providerVersionTag: 'prod', providerVersion: providerAgentVersion, providerStatus: 'VERIFIED',
     providerPublished: true, providerAssignedTags: ['prod'],
@@ -53,7 +53,7 @@ async function makeTenant() {
     providerFingerprint: 'c'.repeat(64), providerConfigRevision: 1, providerVerifiedRevision: 1,
     providerVerifiedAt: verifiedAt, providerVerificationExpiresAt: new Date(verifiedAt.getTime() + 60 * 60_000),
   } });
-  return { id, userId: user.id, clinicId: clinic.id, providerAgentId, providerAgentVersion };
+  return { id, userId: user.id, clinicId: clinic.id, agentId: agent.id, providerAgentId, providerAgentVersion };
 }
 const authFor = (t: { id: string; userId: string }) => ({ authorization: `Bearer ${app.jwt.sign({ userId: t.userId, tenantId: t.id, role: 'OWNER', type: 'access' })}` });
 
@@ -93,6 +93,89 @@ afterAll(async () => {
 });
 
 describe('receptionist inbound-call lifecycle (event webhook)', () => {
+  it('records an outbound appointment request during the call and trusts only the persisted callback number', async () => {
+    const t = await makeTenant();
+    const trustedPhone = '+15551239010';
+    const campaign = await db.receptionistOutboundCampaign.create({
+      data: {
+        tenantId: t.id,
+        clinicId: t.clinicId,
+        agentId: t.agentId,
+        name: 'Request-only pilot',
+        script: 'Offer a new-patient visit.',
+        requiredFields: ['firstName', 'lastName', 'phone'],
+        bookingMode: 'APPOINTMENT_REQUEST_ONLY',
+      },
+    });
+    const callId = `call-${randomUUID()}`;
+    const callLog = await db.receptionistCallLog.create({
+      data: {
+        tenantId: t.id,
+        clinicId: t.clinicId,
+        outboundCampaignId: campaign.id,
+        retellCallId: callId,
+        callerPhone: trustedPhone,
+        direction: 'outbound',
+        outcome: 'IN_PROGRESS',
+      },
+    });
+
+    const consent = await webhookTool(t.clinicId, {
+      name: 'record_recording_preference',
+      args: { recording_decision: 'GRANTED', jurisdiction: 'US-NY' },
+      call: {
+        call_id: callId,
+        agent_id: t.providerAgentId,
+        agent_version: t.providerAgentVersion,
+        to_number: trustedPhone,
+        direction: 'outbound',
+      },
+    });
+    expect(consent.statusCode).toBe(200);
+    expect(consent.json()).toMatchObject({ recorded: true });
+
+    const response = await webhookTool(t.clinicId, {
+      name: 'request_appointment',
+      args: {
+        first_name: 'Jordan',
+        last_name: 'Test',
+        phone: '+15550000000',
+        preferred_date: '2030-02-02',
+        preferred_time: '10:00',
+        preferred_service: 'New patient visit',
+      },
+      call: {
+        call_id: callId,
+        agent_id: t.providerAgentId,
+        agent_version: t.providerAgentVersion,
+        to_number: trustedPhone,
+        direction: 'outbound',
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({ requested: true, booked: false, status: 'PENDING_REVIEW' });
+    expect(response.json().message).toContain('No appointment or time is booked or held yet');
+    const request = await db.appointmentRequest.findFirstOrThrow({ where: { tenantId: t.id, callLogId: callLog.id } });
+    expect(request).toMatchObject({ collectedName: 'Jordan Test', collectedPhone: trustedPhone, status: 'PENDING_REVIEW' });
+    expect(request.rawCollectedFields).not.toHaveProperty('phone');
+
+    const replay = await webhookTool(t.clinicId, {
+      name: 'request_appointment',
+      args: { first_name: 'Jordan', last_name: 'Test' },
+      call: {
+        call_id: callId,
+        agent_id: t.providerAgentId,
+        agent_version: t.providerAgentVersion,
+        to_number: trustedPhone,
+        direction: 'outbound',
+      },
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ requested: true, duplicate: true, booked: false });
+    expect(await db.appointmentRequest.count({ where: { tenantId: t.id, callLogId: callLog.id } })).toBe(1);
+  });
+
   it('a verified mapped call never treats provider analysis alone as a canonical booking and remains idempotent', async () => {
     const t = await makeTenant();
     const callId = `call-${randomUUID()}`;
