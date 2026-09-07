@@ -135,7 +135,8 @@ test.describe('growth campaign money path', () => {
     await page.getByRole('button', { name: /review and launch/i }).click();
     const launchDialog = page.getByRole('dialog');
     await expect(launchDialog).toBeVisible();
-    await expect(launchDialog.getByText(/suppressed: 1/i)).toBeVisible();
+    await expect(launchDialog.getByText(/1 excluded by consent or contact preferences/i)).toBeVisible();
+    await expect(launchDialog.getByText(/1 missing contact details/i)).toBeVisible();
     const launched = page.waitForResponse(r => /\/launch$/.test(new URL(r.url()).pathname) && r.request().method() === 'POST');
     await launchDialog.getByRole('button', { name: /dispatch exact preview/i }).click();
     const launchResponse = await launched;
