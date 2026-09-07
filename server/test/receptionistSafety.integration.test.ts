@@ -73,7 +73,7 @@ describe('AI receptionist safety workflows', () => {
     expect(first.transfer_attempted).toBe(false);
     expect(first.queue).toBe('front_desk');
     expect(first.message).not.toMatch(/not acknowledged|no transfer has occurred|front desk queue/i);
-    expect(first.message).toMatch(/passed this to (the front desk|reception)/i);
+    expect(first.message).toMatch(/recorded your request for (the front desk|reception)/i);
     expect(first.message).not.toMatch(/task|queue id|acknowledg/i);
     expect(replay).toMatchObject({ duplicate: true, task_id: first.task_id });
     expect(await db.staffTask.count({ where: { tenantId: tenant.id } })).toBe(1);

@@ -176,7 +176,9 @@ describe('sample transcripts', () => {
 
   it('says it cannot book when no intake field is configured', () => {
     const noIntake = { ...baseConfig, intakeFields: [] };
-    expect(generateSampleTranscripts(noIntake).inboundSample.some(turn => /written down for/i.test(turn.text))).toBe(true);
+    expect(generateSampleTranscripts(noIntake).inboundSample.some(turn =>
+      turn.text === noIntake.localePack.strings.messages['tool.message.recorded'],
+    )).toBe(true);
     // Every agent turn in the preview traces back to a rendered artefact: the
     // deployed begin message, a locale-pack key, or a configured value.
     const packLines = new Set(Object.values(noIntake.localePack.strings.messages));
