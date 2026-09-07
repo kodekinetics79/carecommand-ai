@@ -461,6 +461,31 @@ describe('Retell agent provider contract', () => {
     await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'invalid_response' });
   });
 
+  it('ignores an unassigned empty tag placeholder when the deployment is pinned by exact version', async () => {
+    // Observed on the live Bright Health deployment on 2026-09-07: Retell
+    // returned `assigned_tags: []` for the exact published V0 while
+    // v2/list-agents returned placeholder objects for both prod and staging.
+    // The numeric version is the deployment coordinate; neither empty tag is
+    // assigned to it and therefore neither may block verification.
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => {
+      if (String(url).includes('/get-retell-llm/')) {
+        return new Response(JSON.stringify({ llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, general_tools: [bookingTool()] }), { status: 200 });
+      }
+      if (String(url).includes('list-agents')) {
+        return new Response(JSON.stringify({
+          has_more: false,
+          items: [{
+            agent_id: 'agent_pilot', agent_name: 'Pilot agent', channel: 'voice', user_modified_timestamp: 1,
+            tags: { prod: {}, staging: {} },
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(providerAgent({ version: 12, assigned_tags: [] })), { status: 200 });
+    }));
+    await expect(probeRetellAgent('agent_pilot', 'prod', { pinnedVersion: 12 })).resolves.toMatchObject({ ok: true });
+  });
+
   it('accepts provider write-time defaults on tools we authored', async () => {
     // The bug this pins: deploy fingerprints the object we are ABOUT to send;
     // verification fingerprints what the provider stored. Retell fills in
