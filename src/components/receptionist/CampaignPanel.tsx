@@ -26,10 +26,11 @@ const CHANNEL_BADGE: Record<ChannelStatus['status'], string> = {
 function ChannelToggle({ label, channel, checked, onChange }: {
   label: string; channel: ChannelStatus | null; checked: boolean; onChange: (next: boolean) => void;
 }) {
-  // A toggle for a channel that cannot deliver would promise a confirmation
-  // no patient receives; it stays disabled with the server's own reason.
+  // A toggle for a channel that cannot deliver must not be switchable on, but
+  // a legacy/default-on campaign still needs a safe escape hatch to turn it
+  // off. Otherwise an unconfigured provider permanently blocks every save.
   const usable = channelUsable(channel);
-  const disabled = channel !== null && !usable;
+  const disabled = channel !== null && !usable && !checked;
   return (
     <div className="space-y-1">
       <div className={disabled ? 'opacity-50' : undefined} aria-disabled={disabled || undefined}>

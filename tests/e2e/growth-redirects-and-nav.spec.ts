@@ -38,7 +38,7 @@ test.describe('growth navigation and retired campaign paths', () => {
   test('owner: Growth offers five entries and every retired path redirects into /campaigns', async ({ page }) => {
     await signIn(page, tenant.emails.OWNER!, GROWTH_PASSWORD);
 
-    // --- Sidebar: the Growth group is the five merged destinations ----------
+    // --- Sidebar: daily Insights plus the four specialist Growth entries ----
     const offered = await readNavDestinations(page);
     for (const path of GROWTH_GROUP_PATHS) {
       expect(offered, `owner navigation offers ${path}`).toContain(path);
@@ -47,12 +47,13 @@ test.describe('growth navigation and retired campaign paths', () => {
       expect(offered, `${retired} must no longer be offered anywhere`).not.toContain(retired);
     }
     const growthSection = page
-      .locator('#staff-navigation nav > div')
-      .filter({ has: page.getByRole('button', { name: 'Growth', exact: true }) });
+      .locator('#staff-navigation .sidebar-capability-list > div')
+      .filter({ has: page.getByText('Growth', { exact: true }) });
     const growthHrefs = await growthSection
       .locator('a')
       .evaluateAll(anchors => anchors.map(a => a.getAttribute('href')));
-    expect(growthHrefs, 'the Growth group is exactly the five merged destinations, in order').toEqual(GROWTH_GROUP_PATHS);
+    expect(growthHrefs, 'the specialist Growth group contains the four non-daily destinations, in order')
+      .toEqual(GROWTH_GROUP_PATHS.filter(path => path !== '/clinic-radar'));
 
     // --- Cold loads of the retired paths (bookmark / shared link case) ------
     for (const retired of RETIRED_PATHS) {

@@ -113,7 +113,7 @@ test.describe('Connected Care — the clinic journey', () => {
       await page.goto('/enrollments');
       await assertAccessibilityContract(page, 'device enrolments');
       await page.getByRole('button', { name: /Enrol patient/i }).click();
-      await page.getByLabel('Patient').selectOption({ label: data.patientName });
+      await page.getByLabel('Patient', { exact: true }).selectOption({ label: data.patientName });
       await page.getByLabel('Device provider').selectOption('withings');
       await page.getByLabel('Device', { exact: true }).selectOption(data.deviceId);
       await page.getByRole('button', { name: /^Enrol$/ }).click();
