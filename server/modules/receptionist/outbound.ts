@@ -1181,8 +1181,18 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       for (const target of body.targets) {
         if (Boolean(target.patientId) === Boolean(target.leadId)) throw new Error('target_exact_identity_required');
         const identity = target.patientId
-          ? await tx.patient.findFirst({ where: { id: target.patientId, tenantId: request.auth.tenantId, deletedAt: null }, select: { phone: true } })
-          : await tx.lead.findFirst({ where: { id: target.leadId!, tenantId: request.auth.tenantId }, select: { phone: true } });
+          ? await tx.patient.findFirst({
+              where: { id: target.patientId, tenantId: request.auth.tenantId, deletedAt: null },
+              select: { phone: true, firstName: true, lastName: true, email: true },
+            }).then(patient => patient ? { ...patient } : null)
+          : await tx.lead.findFirst({
+              where: { id: target.leadId!, tenantId: request.auth.tenantId, deletedAt: null },
+              select: { phone: true, name: true, email: true },
+            }).then(lead => {
+              if (!lead) return null;
+              const [firstName = lead.name, ...remainingName] = lead.name.trim().split(/\s+/);
+              return { phone: lead.phone, email: lead.email, firstName, lastName: remainingName.join(' ') || null };
+            });
         if (!identity) throw new Error('target_identity_foreign_or_inactive');
         const identityPhone = toE164(identity.phone ?? '');
         if (!isValidE164(identityPhone)) throw new Error('target_phone_invalid');
@@ -1218,7 +1228,17 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         if (await tx.receptionistCallTarget.count({ where: { tenantId: request.auth.tenantId, campaignId: id, phone: identityPhone } })) {
           throw new Error('target_destination_duplicate');
         }
-        rows.push({ ...target, phone: identityPhone });
+        rows.push({
+          ...target,
+          phone: identityPhone,
+          // A patient selected from the CRM should remain recognizable after
+          // saving. Persist canonical identity values from the tenant record;
+          // never trust a browser-supplied display name for an identity-bound
+          // target.
+          firstName: identity.firstName,
+          lastName: identity.lastName ?? undefined,
+          email: identity.email ?? undefined,
+        });
       }
       return rows;
     }).catch(error => {

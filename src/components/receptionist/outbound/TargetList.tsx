@@ -102,9 +102,9 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
     && !alreadyAdded.has(candidateKey(candidate))
     && (!reminderCampaign || (candidate.type === 'patient' && candidate.appointments.length > 0));
   const normalizedQuery = query.trim().toLowerCase();
-  const visibleCandidates = candidates.filter(candidate => !normalizedQuery
+  const visibleCandidates = candidates.filter(candidate => candidate.type === 'patient' && (!normalizedQuery
     || candidate.name.toLowerCase().includes(normalizedQuery)
-    || candidate.phone.includes(normalizedQuery));
+    || candidate.phone.includes(normalizedQuery)));
   const selectableVisible = visibleCandidates.filter(candidateIsSelectable);
   const allVisibleSelected = selectableVisible.length > 0 && selectableVisible.every(candidate => selectedCandidates.includes(candidateKey(candidate)));
 
@@ -278,9 +278,10 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
                 (() => {
                   const candidate = candidates.find(item => item.id === (t.patientId ?? t.leadId));
                   const consentReady = candidate?.voiceAuthorizationReady === true;
+                  const displayName = [t.firstName, t.lastName].filter(Boolean).join(' ') || candidate?.name || 'Saved contact';
                   return (
                 <tr key={t.id} className="border-t border-[var(--b1)] first:border-t-0">
-                  <td className="px-3 py-3"><span className="block font-semibold text-t1">{[t.firstName, t.lastName].filter(Boolean).join(' ') || 'Saved contact'}</span><span className="text-t3">{maskedPhone(t.phone)}</span></td>
+                  <td className="px-3 py-3"><span className="block font-semibold text-t1">{displayName}</span><span className="text-t3">{maskedPhone(t.phone)}</span></td>
                   <td className="px-3 py-3"><span className="badge badge-blue">{formatEnumLabel(t.status)}</span></td>
                   <td className="px-3 py-3 text-t3">{t.appointmentId ? 'Appointment linked' : '—'}</td>
                   <td className="px-3 py-3"><div className="flex justify-end gap-2">
@@ -289,7 +290,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
                     </button>
                     <ConfirmedButton
                       dialogTitle="Remove outbound target?"
-                      message={`Remove ${[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone} from this campaign? No call is placed by this action.`}
+                      message={`Remove ${displayName} from this campaign? No call is placed by this action.`}
                       confirmLabel="Remove target"
                       tone="red"
                       disabled={busy || deletingId === t.id}

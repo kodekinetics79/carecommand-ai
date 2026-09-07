@@ -1921,6 +1921,30 @@ describe('AI receptionist outbound authority and target integrity', () => {
     `).rejects.toThrow();
   });
 
+  it('persists the canonical patient name when the picker submits only an identity', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant);
+    const patient = await createPatient(tenant, 14);
+
+    const added = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+      payload: { targets: [{ patientId: patient.id }] },
+    });
+    expect(added.statusCode).toBe(201);
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toEqual([
+      expect.objectContaining({ patientId: patient.id, firstName: patient.firstName, lastName: patient.lastName }),
+    ]);
+  });
+
   it('rejects duplicate destinations both within a batch and against an existing campaign target', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant);

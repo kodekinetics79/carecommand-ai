@@ -341,7 +341,7 @@ export default function ReceptionistStudio() {
           </button>
         </div>
       ) : (
-        <div className="grid gap-4 xl:grid-cols-[260px_1fr]">
+        <div className="grid gap-4 xl:grid-cols-[260px_minmax(0,1fr)]">
           {/* Left rail: clinic + campaign selectors */}
           <div className="space-y-4">
             <div className="cc-card p-3 space-y-2">

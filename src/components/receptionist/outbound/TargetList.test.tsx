@@ -144,7 +144,7 @@ describe('TargetList — appointment reminders are about one real appointment', 
     }));
   });
 
-  it('does not offer leads or patients with no upcoming appointment as reminder targets', async () => {
+  it('keeps CRM leads out of the patient picker and disables patients with no upcoming appointment', async () => {
     respond = path => path === CANDIDATES_PATH ? Promise.resolve([
       {
         type: 'lead', id: 'lead-1', name: 'Lead Person', phone: '+15714305556',
@@ -163,10 +163,9 @@ describe('TargetList — appointment reminders are about one real appointment', 
     });
 
     fireEvent.click(await screen.findByRole('button', { name: 'Add patients' }));
-    expect(await screen.findByText('Lead Person')).toBeInTheDocument();
-    expect(screen.getByText('No Appointment Patient')).toBeInTheDocument();
-    expect(screen.getAllByText('No upcoming appointment')).toHaveLength(2);
-    expect(screen.getByRole('checkbox', { name: 'Select Lead Person' })).toBeDisabled();
+    expect(await screen.findByText('No Appointment Patient')).toBeInTheDocument();
+    expect(screen.queryByText('Lead Person')).not.toBeInTheDocument();
+    expect(screen.getByText('No upcoming appointment')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Select No Appointment Patient' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Save to list' })).toBeDisabled();
   });

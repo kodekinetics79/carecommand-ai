@@ -399,7 +399,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged, m
       </div>}
 
       {/* Targets */}
-      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} onConfigure={goToCampaignSettings} />
+      <TargetList campaign={campaign} targets={targets} onAdded={() => void Promise.all([reloadDetail(), onChanged()])} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} onConfigure={goToCampaignSettings} />
 
       {/* Call logs */}
       <div className="cc-card p-5">
