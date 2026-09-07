@@ -247,7 +247,7 @@ describe('ReceptionistStudio', () => {
     // is the tab strip a clinic owner reads top to bottom.
     expect(screen.getAllByRole('tab').map(tab => tab.textContent?.trim())).toEqual([
       'Clinic Profile', 'Knowledge', 'Agent & Campaign', 'Intake Builder',
-      'Preview', 'Go live', 'Outbound Calls', 'Activity',
+      'Preview', 'Go live', 'Outreach', 'Activity',
     ]);
   });
 });

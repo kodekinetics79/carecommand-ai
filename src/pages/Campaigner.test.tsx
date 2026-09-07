@@ -542,6 +542,15 @@ describe('Campaigner handoff', () => {
     fireEvent.change(screen.getByPlaceholderText('Q3 reactivation'), { target: { value: 'Failed card recovery' } });
     expect(screen.getByRole('button', { name: /^Create$/ })).toBeDisabled();
   });
+
+  it('does not offer unwired voice delivery in Marketing', async () => {
+    stubLoadedPage();
+    renderPage({ goal: 'winback', channel: 'voice' });
+
+    const channel = await screen.findByLabelText('Channel') as HTMLSelectElement;
+    expect(channel.value).toBe('sms');
+    expect(within(channel).queryByRole('option', { name: /voice/i })).not.toBeInTheDocument();
+  });
 });
 
 describe('Campaigner governed workflow', () => {

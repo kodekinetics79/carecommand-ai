@@ -49,7 +49,7 @@ const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'intake', label: 'Intake Builder', icon: ListChecks },
   { id: 'preview', label: 'Preview', icon: Eye },
   { id: 'deploy', label: 'Go live', icon: Rocket },
-  { id: 'outbound', label: 'Outbound Calls', icon: PhoneOutgoing },
+  { id: 'outbound', label: 'Outreach', icon: PhoneOutgoing },
   { id: 'activity', label: 'Activity', icon: Activity },
 ];
 

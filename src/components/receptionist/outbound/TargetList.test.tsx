@@ -55,7 +55,7 @@ describe('TargetList — candidate states are not interchangeable', () => {
     expect(screen.getByText(/purpose, policy version, and legal basis are required/)).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText(/could not be loaded/)).not.toBeInTheDocument();
-    expect(screen.getByRole('combobox', { name: 'Authorized outbound target' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add patients' })).toBeDisabled();
 
     fireEvent.click(screen.getByRole('button', { name: 'Go to campaign settings' }));
     expect(onConfigure).toHaveBeenCalledTimes(1);
@@ -87,10 +87,12 @@ describe('TargetList — candidate states are not interchangeable', () => {
     respond = path => path === CANDIDATES_PATH ? Promise.resolve([]) : Promise.reject(new Error(`Unexpected request in test: ${path}`));
     renderList();
 
-    expect(await screen.findByText('No authorized identity with a canonical phone yet')).toBeInTheDocument();
+    await screen.findByRole('button', { name: 'Add patients' });
+    fireEvent.click(screen.getByRole('button', { name: 'Add patients' }));
+    expect(await screen.findByText('No patients match this search.')).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText(POLICY_MISSING_GUIDANCE)).not.toBeInTheDocument();
-    expect(screen.getByRole('combobox', { name: 'Authorized outbound target' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Close patient picker' })).toBeEnabled();
   });
 });
 
@@ -129,14 +131,14 @@ describe('TargetList — appointment reminders are about one real appointment', 
       policyVersion: 'appointment-reminder-v1',
     });
 
-    const patient = await screen.findByRole('combobox', { name: 'Authorized outbound target' });
-    fireEvent.change(patient, { target: { value: 'patient:patient-1' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Add patients' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select Jordan Test' }));
 
-    const appointment = screen.getByRole('combobox', { name: 'Appointment to confirm' }) as HTMLSelectElement;
+    const appointment = screen.getByRole('combobox', { name: 'Appointment for Jordan Test' }) as HTMLSelectElement;
     await waitFor(() => expect(appointment.value).toBe('appointment-1'));
     expect(screen.getByText(/choose the patient and the exact upcoming visit/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save to list' }));
     await waitFor(() => expect(posted).toEqual({
       targets: [{ patientId: 'patient-1', appointmentId: 'appointment-1' }],
     }));
@@ -160,9 +162,37 @@ describe('TargetList — appointment reminders are about one real appointment', 
       policyVersion: 'appointment-reminder-v1',
     });
 
-    expect(await screen.findByText('No authorized patient with an upcoming appointment yet')).toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: /Lead Person/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: /No Appointment Patient/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
+    fireEvent.click(await screen.findByRole('button', { name: 'Add patients' }));
+    expect(await screen.findByText('Lead Person')).toBeInTheDocument();
+    expect(screen.getByText('No Appointment Patient')).toBeInTheDocument();
+    expect(screen.getAllByText('No upcoming appointment')).toHaveLength(2);
+    expect(screen.getByRole('checkbox', { name: 'Select Lead Person' })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: 'Select No Appointment Patient' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Save to list' })).toBeDisabled();
+  });
+
+  it('adds one or many existing patients in a single save action', async () => {
+    let posted: unknown = null;
+    respond = async (path, init) => {
+      if (path === CANDIDATES_PATH) return [
+        { type: 'patient', id: 'patient-1', name: 'Jordan Test', phone: '+15714305555', voiceAuthorizationReady: true, voiceAuthorizationReason: 'treatment_operations', appointments: [] },
+        { type: 'patient', id: 'patient-2', name: 'Casey Test', phone: '+15714305556', voiceAuthorizationReady: true, voiceAuthorizationReason: 'treatment_operations', appointments: [] },
+      ];
+      if (path === TARGETS_PATH && init?.method === 'POST') {
+        posted = JSON.parse(String(init.body));
+        return { added: 2 };
+      }
+      throw new Error(`Unexpected request in test: ${path}`);
+    };
+
+    renderList(undefined, { purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: 'care-v1' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Add patients' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Select all shown (2)' }));
+    expect(screen.getByText('2 selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save to list' }));
+
+    await waitFor(() => expect(posted).toEqual({
+      targets: [{ patientId: 'patient-1' }, { patientId: 'patient-2' }],
+    }));
   });
 });

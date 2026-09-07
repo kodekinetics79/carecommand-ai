@@ -43,7 +43,7 @@ import {
  * this screen's job is to show it truthfully.
  */
 
-const CHANNELS: CommChannel[] = ['sms', 'email', 'voice', 'whatsapp'];
+const MARKETING_CHANNELS: CommChannel[] = ['sms', 'email', 'whatsapp'];
 
 const GOAL_ORDER = Object.keys(CAMPAIGN_GOALS) as CampaignGoal[];
 
@@ -474,7 +474,7 @@ function CampaignCreator({ defaults, branches, branchError, user, onCreated, onC
   const [name, setName] = useState(resolved.name);
   const [campaignType, setType] = useState<CampaignType | ''>(resolved.campaignType ?? '');
   const [audienceType, setAudience] = useState<AudienceType | ''>(resolved.audienceType ?? '');
-  const [channel, setChannel] = useState<CommChannel>(resolved.channel);
+  const [channel, setChannel] = useState<CommChannel>(resolved.channel === 'voice' ? 'sms' : resolved.channel);
   const tenantWideScope = user?.role === 'OWNER' || user?.role === 'ADMIN';
   const assignedBranchId = user?.branchId ?? user?.clinicAccesses?.find(row => row.isPrimary)?.id ?? '';
   const [branchId, setBranchId] = useState(tenantWideScope ? '' : assignedBranchId);
@@ -526,7 +526,7 @@ function CampaignCreator({ defaults, branches, branchError, user, onCreated, onC
             {AUDIENCE_TYPES.map(t => <option key={t} value={t}>{displayLabel(t)}</option>)}
           </select></label>
         <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Channel</span>
-          <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>{CHANNELS.map(c => <option key={c} value={c}>{displayLabel(c)}</option>)}</select></label>
+          <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>{MARKETING_CHANNELS.map(c => <option key={c} value={c}>{displayLabel(c)}</option>)}</select></label>
       </div>
       {tenantWideScope ? (
         <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Clinic scope</span>
@@ -896,7 +896,10 @@ function CampaignEditForm({ campaign, onSaved, onError }: { campaign: Campaign; 
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Message subject (email)</span>
           <input className={inputCls} value={subject} onChange={e => setSubject(e.target.value)} placeholder="Optional" /></label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Channel</span>
-          <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>{CHANNELS.map(c => <option key={c} value={c}>{c}</option>)}</select></label>
+          <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>
+            {channel === 'voice' && <option value="voice" disabled>Voice — move this campaign to AI Receptionist</option>}
+            {MARKETING_CHANNELS.map(c => <option key={c} value={c}>{displayLabel(c)}</option>)}
+          </select></label>
       </div>
       <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Message template</span>
         <textarea className={`${inputCls} min-h-[80px] resize-y`} value={template} onChange={e => setTemplate(e.target.value)} placeholder="Hi {{firstName}}, …" /></label>

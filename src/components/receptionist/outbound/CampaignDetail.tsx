@@ -11,7 +11,7 @@ import { ConfirmedButton } from '../shared';
 import { MutationNotice } from '../MutationNotice';
 import { TargetList } from './TargetList';
 
-export function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: VoiceLineStatusLike | null; outboundStopped: boolean; onChanged: () => void }) {
+export function CampaignDetail({ campaign, status, outboundStopped, onChanged, mode = 'operations' }: { campaign: OutboundCampaign; status: VoiceLineStatusLike | null; outboundStopped: boolean; onChanged: () => void; mode?: 'operations' | 'setup' }) {
   const transportAmbiguityKey = transportAmbiguityStorageKey(campaign.id);
   const [targets, setTargets] = useState<CallTarget[]>([]);
   const [logs, setLogs] = useState<CallLog[]>([]);
@@ -213,14 +213,14 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         </div>
       )}
       {transportAmbiguous && (
-        <div role="alert" aria-live="assertive" className="cc-card border-l-4 border-l-red-v p-4">
+        <div role="alert" aria-live="assertive" className="cc-card border border-red-v/40 bg-[var(--red-soft)] p-4">
           <p className="text-sm font-bold text-red-v">{OUTBOUND_RECONCILIATION_WARNING}</p>
           <p className="mt-1 text-xs text-t2">The launch transport failed after submission. Launch controls remain blocked until provider and durable call evidence are independently reconciled.</p>
           <button type="button" disabled={launching} onClick={() => void verifyAndClearTransportAmbiguity()} className="mt-2 rounded-lg border border-red-v/40 px-3 py-1.5 text-xs font-semibold text-red-v disabled:opacity-50">Refresh all durable evidence and clear only if no reconciliation remains</button>
         </div>
       )}
       {reconciliations.length > 0 && (
-        <div role="alert" aria-live="assertive" className="cc-card border-l-4 border-l-red-v p-4">
+        <div role="alert" aria-live="assertive" className="cc-card border border-red-v/40 bg-[var(--red-soft)] p-4">
           <p className="text-sm font-bold text-red-v">Critical reconciliation required: {OUTBOUND_RECONCILIATION_WARNING}</p>
           <p className="mt-1 text-xs text-t2">This warning was reconstructed from durable call and target evidence and remains after refresh or navigation until backend reconciliation evidence is resolved.</p>
           <div className="mt-3 space-y-2">
@@ -268,7 +268,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
             ? ` · approved ${new Date(campaign.authorityApprovedAt).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
             : ' · not approved yet'}
         </p>
-        <details className="group">
+        {mode === 'setup' && <details className="group">
           <summary className="cursor-pointer list-none text-[11px] font-semibold text-t3 hover:text-t2 marker:content-none">
             <span className="group-open:hidden">Show compliance record</span>
             <span className="hidden group-open:inline">Hide compliance record</span>
@@ -283,9 +283,9 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
             {campaign.authorityApprovedById && (<><dt className="text-t3">Approved by</dt><dd className="font-mono break-all">{campaign.authorityApprovedById}</dd></>)}
             {campaign.authorityFingerprint && (<><dt className="text-t3">Evidence</dt><dd className="font-mono break-all">{campaign.authorityFingerprint}</dd></>)}
           </dl>
-        </details>
+        </details>}
         <MutationNotice state={campaignAction.state} />
-        <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>
+        {mode === 'setup' && <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>}
         <div className="flex flex-wrap gap-1.5">
           {campaign.requiredFields.map(f => <span key={f} className="badge badge-violet">{f}</span>)}
           <span className="badge badge-blue">{campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? 'Direct booking' : 'Request only'}</span>
@@ -332,8 +332,8 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         )}
       </div>
 
-      {uat?.enabled && (
-        <div className={`cc-card border-l-4 p-4 ${uat.active ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
+      {mode === 'setup' && uat?.enabled && (
+        <div className={`cc-card border p-4 ${uat.active ? 'border-emerald-v/40 bg-[var(--emerald-soft)]' : 'border-amber-v/40 bg-[var(--amber-soft)]'}`}>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               {/* "Attended synthetic live voice UAT" is what we call this to
@@ -364,7 +364,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
       )}
 
       {/* Launch test call */}
-      <div className="cc-card p-5 space-y-3">
+      {mode === 'setup' && <div className="cc-card p-5 space-y-3">
         <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><PhoneCall className="w-4 h-4 text-indigo" /> Launch a call</h4>
         {outboundStopped && (
           <div role="alert" className="flex items-center gap-2 rounded-lg border border-red-v/40 bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
@@ -396,7 +396,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         {launchMsg && (
           <p role={launchMsg.kind === 'err' ? 'alert' : 'status'} aria-live={launchMsg.kind === 'err' ? 'assertive' : 'polite'} className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
         )}
-      </div>
+      </div>}
 
       {/* Targets */}
       <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} onConfigure={goToCampaignSettings} />

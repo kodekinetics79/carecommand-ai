@@ -77,17 +77,17 @@ beforeEach(() => {
 
 describe('CampaignDetail reads the shape the server actually sends', () => {
   it('does not claim the voice line is disconnected when the server says it is configured', () => {
-    render(<CampaignDetail campaign={campaign()} status={serverStatus()} outboundStopped={false} onChanged={() => {}} />);
+    render(<CampaignDetail campaign={campaign()} status={serverStatus()} outboundStopped={false} onChanged={() => {}} mode="setup" />);
     expect(screen.queryByText(/phone line isn.t set up yet/i)).toBeNull();
   });
 
   it('still says so when the server really does report it unconfigured', () => {
-    render(<CampaignDetail campaign={campaign()} status={serverStatus({ providerConfigured: false })} outboundStopped={false} onChanged={() => {}} />);
+    render(<CampaignDetail campaign={campaign()} status={serverStatus({ providerConfigured: false })} outboundStopped={false} onChanged={() => {}} mode="setup" />);
     expect(screen.getByText(/phone line isn.t set up yet/i)).toBeTruthy();
   });
 
   it('renders the attended live-UAT card from attendedUat, with its real limits', () => {
-    render(<CampaignDetail campaign={campaign()} status={serverStatus()} outboundStopped={false} onChanged={() => {}} />);
+    render(<CampaignDetail campaign={campaign()} status={serverStatus()} outboundStopped={false} onChanged={() => {}} mode="setup" />);
     expect(screen.getByText(/Test calling — one approved number/i)).toBeTruthy();
     // The masked destination and caps must be the server's, not placeholders.
     expect(screen.getByText(/\*\*\*-\*\*\*-5555/)).toBeTruthy();
@@ -96,14 +96,14 @@ describe('CampaignDetail reads the shape the server actually sends', () => {
   });
 
   it('offers no attach control when the server sent no attended-UAT block', () => {
-    render(<CampaignDetail campaign={campaign()} status={serverStatus({ attendedUat: null })} outboundStopped={false} onChanged={() => {}} />);
+    render(<CampaignDetail campaign={campaign()} status={serverStatus({ attendedUat: null })} outboundStopped={false} onChanged={() => {}} mode="setup" />);
     expect(screen.queryByText(/Test calling — one approved number/i)).toBeNull();
   });
 
   it('names the reason instead of hiding it when the authorization is blocked', () => {
     const blocked = serverStatus();
     const status = serverStatus({ attendedUat: { ...blocked.attendedUat!, active: false, blockingReason: 'outside_window' } });
-    render(<CampaignDetail campaign={campaign()} status={status} outboundStopped={false} onChanged={() => {}} />);
+    render(<CampaignDetail campaign={campaign()} status={status} outboundStopped={false} onChanged={() => {}} mode="setup" />);
     expect(screen.getByRole('alert')).toHaveTextContent(/Blocked:/i);
   });
 });
