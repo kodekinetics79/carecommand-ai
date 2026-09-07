@@ -82,6 +82,24 @@ export default function ServiceCatalogPanel({ user, onCatalogChanged }: Props) {
     }
   }
 
+  async function toggleVoiceBooking(item: ServiceCatalogItem) {
+    setRowBusy(item.id);
+    setNotice(null);
+    try {
+      const updated = await servicesApi.update(item.id, { bookableByVoice: !item.bookableByVoice });
+      setNotice({
+        kind: 'ok',
+        text: `${updated.name} is ${updated.bookableByVoice ? 'now bookable by the AI receptionist' : 'now staff-booking only'}.`,
+      });
+      await load();
+      onCatalogChanged?.();
+    } catch (err) {
+      setNotice({ kind: 'error', text: describeFailure(err).message });
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
   const live = activeServices(items);
   const governs = live.length > 0;
 
@@ -129,17 +147,28 @@ export default function ServiceCatalogPanel({ user, onCatalogChanged }: Props) {
                           {item.defaultAppointmentValue != null && ` · ${item.defaultAppointmentValue}`}
                         </p>
                       </div>
-                      <div className="flex shrink-0 items-center gap-2">
+                      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
                         <span className={`badge ${item.active ? 'badge-emerald' : 'badge-red'}`}>{item.active ? 'Bookable' : 'Off'}</span>
+                        <span className={`badge ${item.bookableByVoice ? 'badge-blue' : 'badge-slate'}`}>{item.bookableByVoice ? 'AI voice' : 'Staff only'}</span>
                         {canManage && (
-                          <button
-                            type="button"
-                            disabled={rowBusy === item.id}
-                            onClick={() => void toggleActive(item)}
-                            className="rounded-lg border border-[var(--b1)] px-2 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s1)] disabled:opacity-50"
-                          >
-                            {item.active ? 'Stop offering' : 'Offer again'}
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              disabled={rowBusy === item.id}
+                              onClick={() => void toggleVoiceBooking(item)}
+                              className="rounded-lg border border-[var(--b1)] px-2 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s1)] disabled:opacity-50"
+                            >
+                              {item.bookableByVoice ? 'Disable AI booking' : 'Enable AI booking'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={rowBusy === item.id}
+                              onClick={() => void toggleActive(item)}
+                              className="rounded-lg border border-[var(--b1)] px-2 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s1)] disabled:opacity-50"
+                            >
+                              {item.active ? 'Stop offering' : 'Offer again'}
+                            </button>
+                          </>
                         )}
                       </div>
                     </li>
@@ -181,7 +210,10 @@ function AddServiceModal({ firstService, onClose, onSaved }: {
   onClose: () => void;
   onSaved: () => void | Promise<void>;
 }) {
-  const [form, setForm] = useState({ name: '', category: 'general', defaultDurationMinutes: 30, defaultAppointmentValue: '' });
+  const [form, setForm] = useState({
+    name: '', category: 'general', defaultDurationMinutes: 30, defaultAppointmentValue: '',
+    spokenDescription: '', bookableByVoice: false,
+  });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -195,6 +227,8 @@ function AddServiceModal({ firstService, onClose, onSaved }: {
         category: form.category.trim() || 'general',
         defaultDurationMinutes: form.defaultDurationMinutes,
         defaultAppointmentValue: value ? Number(value) : null,
+        spokenDescription: form.spokenDescription.trim() || null,
+        bookableByVoice: form.bookableByVoice,
       });
       await onSaved();
     } catch (err) {
@@ -254,6 +288,23 @@ function AddServiceModal({ firstService, onClose, onSaved }: {
             placeholder="Default value (optional)"
             className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
           />
+          <input
+            aria-label="Caller-facing service description"
+            value={form.spokenDescription}
+            onChange={e => setForm(f => ({ ...f, spokenDescription: e.target.value }))}
+            placeholder="How the AI receptionist describes this service (optional)"
+            className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
+          />
+          <label className="flex items-start gap-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1">
+            <input
+              aria-label="Allow AI receptionist booking"
+              type="checkbox"
+              checked={form.bookableByVoice}
+              onChange={e => setForm(f => ({ ...f, bookableByVoice: e.target.checked }))}
+              className="mt-0.5"
+            />
+            <span><strong>Allow AI receptionist booking</strong><br /><span className="text-[11px] text-t3">Only enable this after the service wording, duration, providers, and locations are ready.</span></span>
+          </label>
         </div>
 
         <div className="mt-4 flex justify-end gap-2">

@@ -12,7 +12,8 @@ function service(overrides: Partial<ServiceCatalogItem> = {}): ServiceCatalogIte
   return {
     id: 'a', name: 'Annual exam', category: 'general',
     defaultDurationMinutes: 30, defaultAppointmentValue: null,
-    depositRuleId: null, active: true,
+    depositRuleId: null, active: true, spokenDescription: null,
+    bookableByVoice: false, voiceDurationMinutes: null, priceFrom: null,
     createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
     ...overrides,
   };

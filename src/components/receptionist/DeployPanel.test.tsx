@@ -325,6 +325,21 @@ describe('DeployPanel', () => {
     expect(screen.getByRole('button', { name: /Publish to the line/ })).toBeDisabled();
   });
 
+  it('allows the first publish when an assigned agent is not linked at the provider yet', async () => {
+    respond = routes({
+      status: () => Promise.resolve(status({
+        agentReady: false,
+        agentScope: { clinicId: 'clinic-1', campaignId: 'camp-1', agentId: 'agent-1', agentName: 'Bright Health Scheduling Assistant' },
+        blockers: [{ code: 'agent_unlinked', severity: 'blocking', title: 'Agent not published', action: 'Publish this agent.', fixHref: '/receptionist-studio?tab=deploy', scope: 'agent' }],
+      })),
+      diff: () => Promise.resolve(diff({ deployment: null })),
+    });
+    renderPanel();
+
+    expect(await screen.findByRole('button', { name: /Publish to the line/ })).toBeEnabled();
+    expect(screen.queryByText('No receptionist is assigned to this campaign.')).not.toBeInTheDocument();
+  });
+
   it('names a failed provider-status load instead of rendering an empty ready state', async () => {
     respond = routes({ status: () => Promise.reject(new ApiError(500, 'An unexpected error occurred', 'INTERNAL_SERVER_ERROR')) });
     renderPanel();
