@@ -238,7 +238,61 @@ succeeded. Clinical decisions, prescriptions and coverage determinations remain 
   navigation; desktop content track also minmax(0,1fr).
 - Retest: structural regression test PASS; exact rendered retest pending deployment.
 
-1. Release safety fixes; approve revised locale pack and republish provider prompt.
+### Release boundary and outbound-only implementation
+
+- Backend production: `13818258840fef1557005488003a61184a49ba4b`, Render deployment
+  `dep-dae104e7bikc73cvgd8g`, live in 1m16s; health verified 12:57:48Z.
+- Frontend production remains **fdbb97cdc2c552d43a7d252379c237c37dcf9b05**:
+  GitHub Vercel status says deployment completed for that SHA. For `1381825`,
+  status is failure: **Deployment rate limited — retry in 24 hours.** The actual
+  production HTML still has the prior entry and no startup bootstrap.
+  Consequently BH-UI-001 normal-startup release retest and BH-UI-002 rendered
+  fix retest are **EXTERNAL_BLOCKED**, not passed. No paid-plan change attempted.
+- Approved synthetic knowledge revision 1 and US-English locale tenant version 1,
+  adopted from platform v3, through owner UI. Evidence hash:
+  `703c176ec64034dc49e540c728648bcf51d503de44e4fe6a0ddd138086f61134`.
+  Emergency wording preview explicitly says hang up and call 911; no hold.
+- Added bookable 30-minute **Pilot New Patient Visit**, category
+  synthetic-primary-care, without payment amounts or coverage promises.
+  Added an explicitly synthetic clinician profile for the existing owner identity
+  in Arlington; owner UI saved Mon–Fri 09:00–17:00 working hours with 30-minute
+  slots. This is not proof of independent staff-role or provider accounts.
+
+#### BH-VOICE-003 — P1 — outbound publishing unnecessarily changes inbound setup
+
+- Category/module: missing wiring / Receptionist Go live.
+- Reproduction: configure a clinic's public phone, leave AI voice line empty,
+  create a campaign/agent, then use the sole publish action for outbound testing.
+- Expected: publish and verify for outbound without changing any inbound number.
+  Actual source path always derives inboundNumber from the public phone, persists
+  that claim and attempts provider binding; no outbound-only UI choice exists.
+  This side effect was diagnosed before initiating a production provider publish.
+- Impact: blocks the agreed shared-outbound pilot model and risks unintended
+  inbound configuration changes. Root cause: inbound and outbound deployment
+  purposes were conflated; verification also fell back to public-phone readback.
+- Remediation: explicit durable INBOUND / OUTBOUND_ONLY deployment purpose;
+  additive migration defaults historical rows to INBOUND and database constraints
+  prohibit inbound-binding evidence on OUTBOUND_ONLY rows. Outbound publication
+  skips number claiming, writes, binding and readback; exact agent verification,
+  tenant scope, locks, rate limits and admission remain. Clear stale current-agent
+  inbound evidence while preserving historical deployment evidence. Studio exposes
+  purpose selection and does not claim inbound connected from agent verification.
+- Retest: **39/39 backend tests PASS**, including switching a genuinely verified
+  inbound deployment to outbound-only: zero subsequent bind/read provider calls,
+  null current binding evidence, historical evidence preserved, exact inbound
+  number_bound checklist FAIL. All 130 migrations applied to disposable database.
+  **68/68 frontend tests PASS** across seven focused files (includes recovery,
+  Settings and outbound UI tests; do not sum with earlier overlapping runs).
+  Live UI/provider test remains **EXTERNAL_BLOCKED** by frontend deployment quota
+  and Bright Health's missing attended-test tenant authorization. No live calls.
+- Final `npm run check` PASS after combined backend/frontend edits. Outbound-only
+  release is committed locally but held from production while frontend deploys
+  are quota-blocked; do not expose a new purpose through a backend-only release
+  while the old UI still defaults every publish to inbound.
+- Direct booking intentionally remains blocked until its independent campaign
+  authority and readiness gates pass; request-only outbound is the first scope.
+
+1. Release outbound-only setup after frontend hosting quota clears; create and verify the Bright Health agent through Studio.
 2. Complete Bright Health branch/provider/service/hours setup through owner UI.
 3. Prove authorized live call, task handoff, booking and provider failure recovery.
 4. Configure approved transactional delivery; prove password reset and confirmation delivery.

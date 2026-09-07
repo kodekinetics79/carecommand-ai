@@ -110,6 +110,7 @@ describe('LocalePackPanel', () => {
   });
 
   it('approves with the evidence hash shown on screen', async () => {
+    const evidenceHash = PACKS.packs[1].evidenceHash;
     let approved: { path: string; body: Record<string, unknown> } | null = null;
     respond = responder('OWNER', {
       packs: (path, init) => {
@@ -123,12 +124,12 @@ describe('LocalePackPanel', () => {
     await waitFor(() => expect(approve).toBeEnabled());
     // The hash the reviewer is shown is the one that gets acknowledged; read it
     // off the screen before approving, because approving reloads the list.
-    expect(screen.getByTestId('pack-pack-gb-2').textContent).toContain('evidence 7b585a11d5603acc4faa5220d201ebb6fcf41231b0773ef97f3b1abbfa13305b');
+    expect(screen.getByTestId('pack-pack-gb-2').textContent).toContain(`evidence ${evidenceHash}`);
     fireEvent.click(approve);
 
     await waitFor(() => expect(approved).not.toBeNull());
     expect(approved!.path).toBe('/v1/receptionist/locale-packs/pack-gb-2/approve');
-    expect(approved!.body).toEqual({ acknowledgedEvidenceHash: '7b585a11d5603acc4faa5220d201ebb6fcf41231b0773ef97f3b1abbfa13305b' });
+    expect(approved!.body).toEqual({ acknowledgedEvidenceHash: evidenceHash });
   });
 
   it('disables approval for a non-owner and says why', async () => {

@@ -101,7 +101,7 @@ let respond: (path: string, init?: RequestInit) => Promise<unknown>;
 function routes(overrides: Partial<Record<'status' | 'diff' | 'latest' | 'deploy' | 'verify', () => Promise<unknown>>> = {}) {
   return (path: string, init?: RequestInit): Promise<unknown> => {
     if (path.startsWith('/v1/receptionist/voice-line-status')) return (overrides.status ?? (() => Promise.resolve(status())))();
-    if (path.endsWith('/deployment-diff')) return (overrides.diff ?? (() => Promise.resolve(diff())))();
+    if (path.split('?')[0].endsWith('/deployment-diff')) return (overrides.diff ?? (() => Promise.resolve(diff())))();
     if (path.endsWith('/deployments/latest')) return (overrides.latest ?? (() => Promise.resolve(latestBody())))();
     if (path.endsWith('/deploy') && init?.method === 'POST') return (overrides.deploy ?? (() => Promise.reject(new Error('deploy not stubbed'))))();
     if (path.endsWith('/verify-provider') && init?.method === 'POST') return (overrides.verify ?? (() => Promise.resolve({ id: 'agent-1' })))();
@@ -119,6 +119,34 @@ function renderPanel(cfg: VoiceLineConfigurationExport | null = config()) {
 }
 
 describe('DeployPanel', () => {
+  it('publishes explicit outbound-only purpose and still verifies the agent', async () => {
+    const row = deployment({ deploymentMode: 'OUTBOUND_ONLY', numberBound: false, boundPhoneNumberMasked: null });
+    respond = routes({
+      diff: () => Promise.resolve(diff({ deployment: null })),
+      deploy: () => Promise.resolve({ deployment: { ...row, status: 'PUBLISHED' }, verification: { status: 'pending' } }),
+      latest: () => Promise.resolve(latestBody(row)),
+    });
+    renderPanel();
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Publication purpose' })).toBeEnabled());
+    fireEvent.change(screen.getByRole('combobox', { name: 'Publication purpose' }), { target: { value: 'OUTBOUND_ONLY' } });
+    const publish = await screen.findByRole('button', { name: 'Publish for outbound calls only' });
+    await waitFor(() => expect(publish).toBeEnabled());
+    expect(screen.getByText(/No inbound number is claimed/)).toBeInTheDocument();
+    fireEvent.click(publish);
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith('/v1/receptionist/campaigns/camp-1/deploy', { method: 'POST', body: JSON.stringify({ deploymentMode: 'OUTBOUND_ONLY' }) }));
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith('/v1/receptionist/agents/agent-1/verify-provider', expect.objectContaining({ method: 'POST' })));
+    expect(apiRequestMock).toHaveBeenCalledWith('/v1/receptionist/campaigns/camp-1/deployment-diff?deploymentMode=OUTBOUND_ONLY', expect.anything());
+  });
+
+  it('restores persisted outbound purpose and does not claim an inbound connection', async () => {
+    const saved = diff();
+    respond = routes({ diff: () => Promise.resolve({ ...saved, deployment: { ...saved.deployment, deploymentMode: 'OUTBOUND_ONLY' } }) });
+    renderPanel();
+    await screen.findByText('Outbound only · no inbound line connected by this deployment');
+    expect(screen.getByRole('combobox', { name: 'Publication purpose' })).toHaveValue('OUTBOUND_ONLY');
+    expect(screen.getByRole('button', { name: 'Publish for outbound calls only' })).toBeEnabled();
+  });
+
   it('lists every manual setting and every tool so the BYO path stays possible', async () => {
     respond = routes();
     renderPanel();

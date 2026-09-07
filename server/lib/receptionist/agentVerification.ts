@@ -227,7 +227,9 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
   // pin, so it is checked against the agent id and the version the probe just
   // reported in this same pass — still the provider's answer, never ours.
   const expectedBinding = {
-    boundPhoneNumber: deployment?.boundPhoneNumber ?? clinicInboundNumber,
+    boundPhoneNumber: deployment?.deploymentMode === 'OUTBOUND_ONLY'
+      ? null
+      : deployment?.boundPhoneNumber ?? clinicInboundNumber,
     providerAgentId: deployment?.providerAgentId ?? before.providerAgentId,
     providerAgentVersion: deployment?.providerAgentVersion ?? (probe.ok ? probe.snapshot.version : null),
   };
@@ -307,7 +309,11 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
           providerInboundNumberVerifiedAt: numberBinding.numberBindingVerifiedAt,
           providerInboundNumberErrorCode: numberBinding.numberBindingErrorCode,
         }
-        : {}),
+        : deployment?.deploymentMode === 'OUTBOUND_ONLY' ? {
+          providerInboundNumber: null,
+          providerInboundNumberVerifiedAt: null,
+          providerInboundNumberErrorCode: null,
+        } : {}),
       ...(success && probe.ok ? providerSnapshotData(probe.snapshot) : {}),
       ...(success ? {
         providerStatus: 'VERIFIED' as const,

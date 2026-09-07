@@ -19,6 +19,7 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { readyCampaignFixture, clinicFixtureData, proveTestCall } = await import('./helpers/receptionistFixtures');
 const { hashPrompt, llmRequestBody } = await import('../lib/retell');
+const retell = await import('../lib/retell');
 const { RETELL_GENERAL_TOOL_TYPES, retellLlmRequestIssues } = await import('../lib/receptionist/retellRequestContract');
 
 // ===========================================================================
@@ -123,6 +124,66 @@ afterAll(async () => {
 });
 
 describe('deploying a campaign to Retell', () => {
+  it('publishes and verifies outbound-only without claiming, binding, or reading any inbound line', async () => {
+    env.RETELL_API_KEY = 'mock_deploy_key';
+    env.RETELL_FROM_NUMBER = '+15550100000';
+    const bindSpy = vi.spyOn(retell, 'updatePhoneNumberInboundAgent');
+    const readSpy = vi.spyOn(retell, 'getPhoneNumberBinding');
+    try {
+      const t = await tenant();
+      const { clinic, agent, campaign } = await deployableCampaign(t);
+      const inbound = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t) });
+      expect(inbound.statusCode).toBe(200);
+      const inboundVerified = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t) });
+      expect(inboundVerified.statusCode).toBe(200);
+      expect(bindSpy).toHaveBeenCalledTimes(1);
+      expect(readSpy).toHaveBeenCalledTimes(1);
+      expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: agent.id } })).toMatchObject({ providerInboundNumber: clinic.phone, providerInboundNumberVerifiedAt: expect.any(Date) });
+      bindSpy.mockClear();
+      readSpy.mockClear();
+      // Both blank AI line and existing assigned line must remain untouched.
+      for (const inboundNumber of [null, phone()]) {
+        await db.receptionistClinic.update({ where: { id: clinic.id }, data: { inboundNumber } });
+        const deployed = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t), payload: { deploymentMode: 'OUTBOUND_ONLY' } });
+        expect(deployed.statusCode, deployed.body).toBe(200);
+        expect(deployed.json().deployment).toMatchObject({ deploymentMode: 'OUTBOUND_ONLY', numberBound: false, boundPhoneNumberMasked: null });
+        expect(deployed.json().message).toContain('No inbound number was connected or changed');
+        const row = await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: deployed.json().deployment.id } });
+        expect(row.steps).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'bind_number', status: 'skipped', detail: expect.stringContaining('Outbound-only') })]));
+        expect(await db.receptionistClinic.findUniqueOrThrow({ where: { id: clinic.id } })).toMatchObject({ inboundNumber, phone: clinic.phone });
+        const verified = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t) });
+        expect(verified.statusCode, verified.body).toBe(200);
+        expect(verified.json().agent).toMatchObject({ providerStatus: 'VERIFIED', providerVersion: row.providerAgentVersion });
+        const attested = await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: row.id } });
+        expect(attested).toMatchObject({ deploymentMode: 'OUTBOUND_ONLY', status: 'VERIFIED', numberBound: false, boundPhoneNumber: null, numberBindingReadAt: null, numberBindingVerifiedAt: null, numberBindingAgentId: null, numberBindingAgentVersion: null, numberBindingErrorCode: null });
+        expect(bindSpy).not.toHaveBeenCalled();
+        expect(readSpy).not.toHaveBeenCalled();
+        expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: agent.id } })).toMatchObject({ providerInboundNumber: null, providerInboundNumberVerifiedAt: null, providerInboundNumberErrorCode: null });
+        // Historical evidence is preserved, but cannot prove the new version answers inbound.
+        expect(await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: inbound.json().deployment.id } })).toMatchObject({ status: 'SUPERSEDED', numberBound: true, boundPhoneNumber: clinic.phone, numberBindingVerifiedAt: expect.any(Date) });
+        // Database constraint independently forbids fabricated inbound evidence.
+        await expect(db.receptionistAgentDeployment.update({ where: { id: row.id }, data: { numberBound: true, boundPhoneNumber: clinic.phone } })).rejects.toThrow();
+        const currentDiff = await app.inject({ method: 'GET', url: `/v1/receptionist/campaigns/${campaign.id}/deployment-diff`, headers: auth(t) });
+        expect(currentDiff.json()).toMatchObject({ deployment: { deploymentMode: 'OUTBOUND_ONLY' }, draft: { deploymentMode: 'OUTBOUND_ONLY' }, changed: [] });
+        const inboundDiff = await app.inject({ method: 'GET', url: `/v1/receptionist/campaigns/${campaign.id}/deployment-diff?deploymentMode=INBOUND`, headers: auth(t) });
+        expect(inboundDiff.json().changed).toContain('config');
+        expect(inboundDiff.json().changed).toContain('deploymentMode');
+        const activate = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/activate`, headers: auth(t) });
+        expect(activate.statusCode).toBe(409);
+        const readiness = await app.inject({ method: 'GET', url: `/v1/receptionist/campaigns/${campaign.id}/readiness`, headers: auth(t) });
+        expect(readiness.statusCode).toBe(200);
+        expect(readiness.json().checks).toEqual(expect.arrayContaining([expect.objectContaining({ key: 'number_bound', status: 'fail' })]));
+      }
+      const invalid = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t), payload: { deploymentMode: 'AUTO' } });
+      expect(invalid.statusCode).toBe(400);
+    } finally {
+      bindSpy.mockRestore();
+      readSpy.mockRestore();
+      env.RETELL_API_KEY = originalRetell.apiKey;
+      env.RETELL_FROM_NUMBER = originalRetell.fromNumber;
+    }
+  });
+
   it('publishes, binds the number, and verifies against what the provider actually reports', async () => {
     env.RETELL_API_KEY = 'mock_deploy_key';
     env.RETELL_FROM_NUMBER = '+15550100000';
@@ -135,7 +196,7 @@ describe('deploying a campaign to Retell', () => {
       // Deploy publishes; it does NOT claim verification, because four provider
       // round trips plus a probe do not fit in one serverless invocation.
       expect(deployed.json().verification).toEqual({ status: 'pending' });
-      expect(deployed.json().deployment).toMatchObject({ status: 'PUBLISHED', mock: true, numberBound: true });
+      expect(deployed.json().deployment).toMatchObject({ status: 'PUBLISHED', deploymentMode: 'INBOUND', mock: true, numberBound: true });
       // Masking the provider id was not enough, so the tenant projection no
       // longer carries it at all — nor the published version, the LLM version,
       // the deployment tag or the four fingerprints. One opaque reference

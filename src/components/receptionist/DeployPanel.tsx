@@ -5,7 +5,7 @@ import { receptionistApi, type Campaign } from '../../lib/receptionist';
 import {
   DEPLOYMENT_POLL_INTERVAL_MS, DEPLOYMENT_POLL_MAX_ATTEMPTS, blockedByOf, deployChecklistOf, deploymentApi, deriveDeployState,
   formatExpiresIn, pollLatestDeployment, retryAfterSecondsOf, verificationLine,
-  type BlockedByCampaign, type Deployment, type DeploymentDiff, type DeployPanelState, type VoiceLineConfigurationExport, type VoiceLineStatusResponse,
+  type BlockedByCampaign, type Deployment, type DeploymentDiff, type DeploymentMode, type DeployPanelState, type VoiceLineConfigurationExport, type VoiceLineStatusResponse,
 } from '../../lib/receptionistDeployment';
 import { useResource } from '../../hooks/useResource';
 import { describeMutationFailure, isBusy, useMutationState, type MutationError } from '../../hooks/useMutationState';
@@ -25,6 +25,7 @@ const PHASES: Array<{ key: Exclude<Phase, 'idle'>; label: string }> = [
 
 const CHANGE_LABEL: Record<string, string> = {
   prompt: 'Prompt', tools: 'Tools', intake: 'Intake schema', voice: 'Voice', language: 'Language', webhook: 'Webhook URL', beginMessage: 'Begin message',
+  deploymentMode: 'Publication purpose',
 };
 
 const TONE_TEXT = { ok: 'text-emerald-v', warn: 'text-amber-v', error: 'text-red-v', muted: 'text-t3' } as const;
@@ -74,12 +75,21 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
   pollIntervalMs?: number;
   pollMaxAttempts?: number;
 }) {
+  const [modeChoice, setModeChoice] = useState<{ campaignId: string; mode: DeploymentMode } | null>(null);
+  const requestedMode = modeChoice?.campaignId === campaignId ? modeChoice.mode : undefined;
   const loadStatus = useCallback((signal: AbortSignal) => deploymentApi.voiceLineStatus({ campaignId }, signal), [campaignId]);
-  const loadDiff = useCallback((signal: AbortSignal) => deploymentApi.deploymentDiff(campaignId, signal), [campaignId]);
+  const loadDiff = useCallback((signal: AbortSignal) => deploymentApi.deploymentDiff(campaignId, signal, requestedMode), [campaignId, requestedMode]);
   const statusResource = useResource<VoiceLineStatusResponse>(loadStatus);
   const diffResource = useResource<DeploymentDiff>(loadDiff);
   const status = receivedData(statusResource.state);
   const diff = receivedData(diffResource.state);
+  const deploymentMode = requestedMode ?? diff?.deployment?.deploymentMode ?? 'INBOUND';
+  const outboundOnly = deploymentMode === 'OUTBOUND_ONLY';
+  const phases = outboundOnly ? [
+    { key: 'publish', label: 'Publish the receptionist for outbound calls without connecting an inbound line' },
+    { key: 'verify', label: 'Read back and verify the published agent configuration' },
+    PHASES[2],
+  ] : PHASES;
 
   const deployState = useMutationState();
   const [phase, setPhase] = useState<Phase>('idle');
@@ -135,7 +145,7 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
       setPhase('publish');
       let response;
       try {
-        response = await deploymentApi.deploy(campaignId);
+        response = await deploymentApi.deploy(campaignId, deploymentMode);
       } catch (error) {
         setPhase('idle');
         setBlockedBy(blockedByOf(error));
@@ -181,7 +191,7 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
   const mock = status?.providerMode === 'mock' || diff?.deployment?.mock || latest?.mock || false;
   const deployment = diff?.deployment ?? null;
   const busy = isBusy(deployState.state) || deploying;
-  const canDeploy = !busy && cooldownSeconds === 0 && view !== 'no-agent' && Boolean(status);
+  const canDeploy = !busy && cooldownSeconds === 0 && view !== 'no-agent' && Boolean(status) && Boolean(diff);
   const verificationExpired = status?.verification.status === 'VERIFIED'
     && status.verification.expiresInMs !== null
     && status.verification.expiresInMs <= 0;
@@ -204,6 +214,19 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
         {diffFailed && <LoadFailureNotice what="The deployment record" message={diffResource.state.status === 'error' ? diffResource.state.failure.message : ''} onRetry={diffResource.reload} />}
         {!status && !statusFailed && <p role="status" className="text-xs text-t3"><Loader2 className="mr-1 inline h-3.5 w-3.5 animate-spin" aria-hidden="true" /> Checking the voice line…</p>}
 
+        <label className="block space-y-1 text-xs font-semibold text-t1">
+          <span>Publication purpose</span>
+          <select value={deploymentMode} disabled={busy || !diff} aria-describedby="publication-purpose-help" onChange={event => setModeChoice({ campaignId, mode: event.target.value as DeploymentMode })} className="block w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm">
+            <option value="INBOUND">Connect inbound line and publish agent</option>
+            <option value="OUTBOUND_ONLY">Outbound calls only — no inbound changes</option>
+          </select>
+        </label>
+        <p id="publication-purpose-help" className="text-xs text-t2">
+          {outboundOnly
+            ? 'Publishes and verifies the agent for outbound use. No inbound number is claimed, connected or changed. Start with appointment-request-only calls; direct booking and campaign activation require their own readiness checks.'
+            : 'Publishes the agent and connects this clinic’s configured inbound number. Only use a number assigned and verified for this customer.'}
+        </p>
+
         {view === 'no-agent' && (
           <div role="status" className="rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t2">
             <p className="font-semibold text-t1">No receptionist is assigned to this campaign.</p>
@@ -212,7 +235,7 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
         )}
 
         {view === 'never-deployed' && (
-          <p className="text-xs text-t2">This campaign has never gone live. Publishing sends the generated prompt, the booking steps and the receptionist version to the {VOICE.line}, then runs a {VOICE.checkLower} to confirm the live line is running exactly that.</p>
+          <p className="text-xs text-t2">{outboundOnly ? 'This campaign has no published configuration yet. Publish for outbound calls, then verify the exact agent configuration before calling.' : `This campaign has never gone live. Publishing sends the generated prompt, the booking steps and the receptionist version to the ${VOICE.line}, then runs a ${VOICE.checkLower} to confirm the live line is running exactly that.`}</p>
         )}
 
         {campaignStatus === 'ACTIVE' && !deploying && (
@@ -226,8 +249,8 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
 
         {view === 'deploying' && (
           <ol className="space-y-1.5" aria-label="Deployment steps">
-            {PHASES.map((step, index) => {
-              const current = PHASES.findIndex(p => p.key === phase);
+            {phases.map((step, index) => {
+              const current = phases.findIndex(p => p.key === phase);
               const state = index < current ? 'done' : index === current ? 'running' : 'waiting';
               return (
                 <li key={step.key} className="flex items-center gap-2 text-xs text-t2" data-step={step.key} data-step-state={state}>
@@ -245,6 +268,7 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
             <div className="flex flex-wrap items-center gap-2">
               <span className={`badge ${deployment.status === 'VERIFIED' ? 'badge-emerald' : deployment.status === 'PUBLISHED' ? 'badge-amber' : 'badge-blue'}`}>{deployment.status}</span>
               <p className="font-mono text-[10px] text-t3" title="Quote this to CareCommand support">{deployment.configurationReference ?? '—'}</p>
+              <span className="badge badge-blue">{deployment.deploymentMode === 'OUTBOUND_ONLY' ? 'Outbound only · no inbound line connected by this deployment' : 'Inbound-line deployment'}</span>
             </div>
             <p className="mt-0.5 text-[11px] text-t3">
               {deployment.verifiedAt ? `Verified ${new Date(deployment.verifiedAt).toLocaleString()}` : deployment.publishedAt ? `Published ${new Date(deployment.publishedAt).toLocaleString()} — not verified yet` : 'Pending'}
@@ -323,7 +347,7 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
             className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-40"
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Rocket className="h-4 w-4" aria-hidden="true" />}
-            {view === 'deployed-stale' ? 'Publish changes' : view === 'deploy-failed' || view === 'drift-blocked' ? (cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : 'Retry') : view === 'deployed-current' ? VOICE.publishAgain : VOICE.publish}
+            {outboundOnly ? (cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : 'Publish for outbound calls only') : view === 'deployed-stale' ? 'Publish changes' : view === 'deploy-failed' || view === 'drift-blocked' ? (cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : 'Retry') : view === 'deployed-current' ? VOICE.publishAgain : VOICE.publish}
           </button>
           {(view === 'verification-failed' || (deployment && deployment.status === 'PUBLISHED') || verificationExpired) && agentId && (
             <button type="button" disabled={busy} onClick={verifyAgain} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">

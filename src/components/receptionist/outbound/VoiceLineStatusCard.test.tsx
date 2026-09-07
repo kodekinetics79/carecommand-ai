@@ -32,6 +32,12 @@ function renderCard(value: VoiceLineStatusResponse | VoiceLineStatus | null) {
 }
 
 describe('VoiceLineStatusCard — the server says what is wrong and where to fix it', () => {
+  it('does not claim an inbound connection from agent verification alone', () => {
+    renderCard(status({ agentReady: true }));
+    expect(screen.getByText(/This does not prove an inbound line is connected/)).toBeInTheDocument();
+    expect(screen.queryByText(/The line is connected and/)).not.toBeInTheDocument();
+  });
+
   it('renders each server blocker with its own words and a fix link', () => {
     renderCard(status({
       agentReady: false,
