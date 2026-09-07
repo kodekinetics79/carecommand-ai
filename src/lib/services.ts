@@ -24,6 +24,10 @@ export interface ServiceCatalogItem {
   defaultAppointmentValue: number | null;
   depositRuleId: string | null;
   active: boolean;
+  spokenDescription: string | null;
+  bookableByVoice: boolean;
+  voiceDurationMinutes: number | null;
+  priceFrom: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -34,6 +38,10 @@ export interface ServiceCatalogInput {
   defaultDurationMinutes?: number;
   defaultAppointmentValue?: number | null;
   active?: boolean;
+  spokenDescription?: string | null;
+  bookableByVoice?: boolean;
+  voiceDurationMinutes?: number | null;
+  priceFrom?: number | null;
 }
 
 const base = '/v1/services';
