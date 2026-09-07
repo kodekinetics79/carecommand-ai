@@ -128,6 +128,18 @@ describe('CampaignPanel', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /Save changes/ })).toBeEnabled());
   });
 
+  it('allows an unconfigured legacy/default confirmation to be turned off', async () => {
+    respond = routes();
+    renderPanel(campaign({ smsConfirmation: true }));
+
+    await waitFor(() => expect(screen.getByText('No SMS provider is configured for this workspace.')).toBeInTheDocument());
+    const smsButton = screen.getByRole('button', { name: /SMS confirmation/ });
+    expect(smsButton.parentElement).not.toHaveAttribute('aria-disabled');
+
+    fireEvent.click(smsButton);
+    expect(screen.getByRole('button', { name: /Save changes/ })).toBeEnabled();
+  });
+
   it('has no raw status select — transitions go through the readiness gate', async () => {
     respond = routes();
     renderPanel();
