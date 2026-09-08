@@ -62,7 +62,7 @@ describe('a campaign is created with a receptionist attached', () => {
         initialPurpose="APPOINTMENT_REMINDER" onSaved={() => {}} onCancel={() => {}}
       />,
     );
-    expect(screen.getByRole('heading', { name: 'New appointment follow-up list' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'New appointment reminder list' })).toBeInTheDocument();
     expect((screen.getByLabelText('Call purpose') as HTMLSelectElement).value).toBe('APPOINTMENT_REMINDER');
     expect(screen.getByLabelText('Reason and goal for the call')).toHaveValue(recommendedCallBrief('APPOINTMENT_REMINDER'));
   });

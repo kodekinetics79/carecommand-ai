@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -113,6 +113,10 @@ function respond(path: string): Promise<unknown> {
   if (path.startsWith('/v1/receptionist/campaigns?clinicId=clinic-2')) return Promise.resolve([campaign({ id: 'camp-9', clinicId: 'clinic-2', name: 'Northside recall' })]);
   if (path.includes('/readiness')) return Promise.resolve(READINESS);
   if (path.startsWith('/v1/receptionist/voice-line-status')) return Promise.resolve(VOICE_LINE_STATUS);
+  if (path.startsWith('/v1/receptionist/outbound-campaigns')) return Promise.resolve([]);
+  if (path.startsWith('/v1/receptionist/booking-requests')) return Promise.resolve([]);
+  if (path.startsWith('/v1/receptionist/confirmation-deliveries')) return Promise.resolve([]);
+  if (path.startsWith('/v1/receptionist/outbound-control')) return Promise.resolve({ stopped: false, reason: null, changedAt: null });
   if (path === '/v1/receptionist/catalog') return Promise.resolve(CATALOG);
   if (path.startsWith('/v1/receptionist/agents')) return Promise.resolve([]);
   if (path.startsWith('/v1/receptionist/scheduling-branches')) return Promise.resolve([]);
@@ -226,6 +230,23 @@ describe('ReceptionistStudio', () => {
     await waitFor(() => expect(strip).toHaveAttribute('data-service-state', 'not_answering'));
     expect(strip).toHaveTextContent('The number is not bound to this deployment');
     expect(within(strip).getByRole('link')).toHaveAttribute('href', '/receptionist-studio?clinic=clinic-1&campaign=camp-1&tab=deploy');
+  });
+
+  it('does not mix inbound campaign status with outbound calling readiness', async () => {
+    renderStudio('?clinic=clinic-1&tab=outbound');
+
+    expect(await screen.findByRole('heading', { name: 'Patient outreach' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Calling setup complete' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Existing patients' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Appointment reminders' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Marketing campaigns' })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: 'Setup' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Receptionist service status')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Appointment reminders' }));
+    expect(screen.getByRole('heading', { name: 'Automatic appointment reminders' })).toBeInTheDocument();
+    expect(screen.getByText(/Choose None, Text, Call, or Both/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open Scheduling' })).toHaveAttribute('href', '/scheduling');
   });
 
   it('shows the go-live rail with the clinic prerequisite on the go-live tab (SF-4)', async () => {
