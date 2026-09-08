@@ -25,7 +25,7 @@ ALTER TABLE "AppointmentCommunicationAction"
       'DELIVERY_UNKNOWN', 'SUPPRESSED', 'FAILED'
     ))
   ),
-  ADD CONSTRAINT "AppointmentCommunicationAction_tenant_appointment_id_key"
+  ADD CONSTRAINT "AppointmentCommunicationAction_tenantId_appointmentId_id_key"
     UNIQUE ("tenantId", "appointmentId", "id");
 
 ALTER TABLE "NotificationEvent"
@@ -39,7 +39,7 @@ CREATE UNIQUE INDEX "NotificationEvent_confirmation_appointment_channel_key"
   ON "NotificationEvent"("tenantId", "appointmentId", "channel")
   WHERE source = 'receptionist.appointment_confirmation';
 
-CREATE UNIQUE INDEX "NotificationEvent_tenantId_appointmentId_appointmentCommunicationActionId_key"
+CREATE UNIQUE INDEX "NotificationEvent_tenantId_appointmentId_appointmentCommuni_key"
   ON "NotificationEvent"("tenantId", "appointmentId", "appointmentCommunicationActionId");
 
 -- The existing confirmation indexes are source-specific. The minute worker
