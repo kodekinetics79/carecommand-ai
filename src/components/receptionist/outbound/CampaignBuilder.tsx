@@ -29,7 +29,7 @@ function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField
 function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, effectiveAgentId }: { form: OutboundCampaignInput; set: (patch: Partial<OutboundCampaignInput>) => void; bookingAuthorities: Campaign[]; locations: Location[]; agents: Agent[]; effectiveAgentId: string | null }) {
   return (
     <>
-      <Field label="Campaign name" required>
+      <Field label="List name" required>
         <TextInput value={form.name} onChange={e => set({ name: e.target.value })} placeholder="June reactivation outreach" />
       </Field>
       {form.bookingMode !== 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' && (
@@ -194,14 +194,14 @@ export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timez
 
   return (
     <div className="cc-card p-5 space-y-4">
-      <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> {initialPurpose === 'APPOINTMENT_REMINDER' ? 'New appointment follow-up list' : 'New calling list'}</h3>
+      <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> {initialPurpose === 'APPOINTMENT_REMINDER' ? 'New appointment reminder list' : 'New patient call list'}</h3>
       <CampaignFormFields form={form} set={set} bookingAuthorities={bookingAuthorities} locations={locations} agents={usableAgents} effectiveAgentId={effectiveAgentId} />
       <p className="text-[11px] text-t3">Quiet hours are enforced in clinic timezone {timezone}. Overnight windows such as 21:00–08:00 are supported.</p>
       {err && <p role="alert" className="text-xs text-red-v">{err}</p>}
       <MutationNotice state={saveState.state} showSaved={false} />
       <div className="flex gap-2">
         <button type="button" disabled={saving || !form.name || !form.script || !form.purpose || !form.legalBasis || !form.policyVersion?.trim()} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
-          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Create campaign
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Create list
         </button>
         <button type="button" onClick={onCancel} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)]">Cancel</button>
       </div>

@@ -236,7 +236,11 @@ describe('ReceptionistStudio', () => {
     renderStudio('?clinic=clinic-1&tab=outbound');
 
     expect(await screen.findByRole('heading', { name: 'Patient outreach' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Calling ready' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Calling setup complete' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Existing patients' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Appointment reminders' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Marketing campaigns' })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: 'Setup' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Receptionist service status')).not.toBeInTheDocument();
   });
 
