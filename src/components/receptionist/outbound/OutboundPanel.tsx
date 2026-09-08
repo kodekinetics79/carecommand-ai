@@ -147,12 +147,24 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
       )}
 
       {(workspace === 'lists' || workspace === 'appointments') && <div id={`outreach-panel-${workspace}`} role="tabpanel" aria-labelledby={`outreach-tab-${workspace}`} className="space-y-5">
-      {workspace === 'appointments' && <div className="rounded-xl border border-amber-v/30 bg-[var(--amber-soft)] p-3 text-xs text-t2"><p className="font-bold text-t1">Manual calling today</p><p className="mt-1">Choose patients and use Call one at a time. Automatic call/SMS reminders and provider-unavailable rebooking are not connected yet, so approving a list does not schedule or dispatch anything.</p></div>}
+      {workspace === 'appointments' && <>
+        <div className="cc-card flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="max-w-2xl">
+            <div className="flex flex-wrap items-center gap-2"><h3 className="text-base font-bold text-t1">Automatic appointment reminders</h3><span className="badge badge-amber">Setup required</span></div>
+            <p className="mt-1 text-sm leading-6 text-t3">Choose None, Text, Call, or Both on each appointment in Scheduling. The choice stays attached to that exact visit; it will not send until the selected delivery service is connected.</p>
+          </div>
+          <Link to="/scheduling" className="inline-flex min-h-11 shrink-0 items-center justify-center rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white">Open Scheduling</Link>
+        </div>
+        <div>
+          <h3 className="text-sm font-bold text-t1">Manual follow-up calls</h3>
+          <p className="mt-1 text-xs text-t3">Use a saved reminder list when staff need to call a patient now. Creating or approving a list never schedules or starts calls automatically.</p>
+        </div>
+      </>}
       <div className="grid gap-5 lg:grid-cols-[260px_minmax(0,1fr)]">
         {/* Campaign list */}
         <div className="cc-card p-3 space-y-1.5 h-max">
           <div className="flex items-center justify-between px-1 pb-1">
-            <span className="text-[11px] font-bold uppercase tracking-wide text-t3">{workspace === 'appointments' ? 'Reminder lists' : 'Calling lists'}</span>
+            <span className="text-[11px] font-bold uppercase tracking-wide text-t3">{workspace === 'appointments' ? 'Manual reminder lists' : 'Patient call lists'}</span>
             <button type="button" onClick={() => { setDraftPurpose(workspace === 'appointments' ? 'APPOINTMENT_REMINDER' : 'CARE_COORDINATION'); setCreating(true); setSelectedId(''); }} className="inline-flex min-h-11 items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80"><Plus className="w-4 h-4" /> New list</button>
           </div>
           {operationalCampaigns.length === 0 && loadErrors.length === 0 && <div className="px-1 py-4"><p className="text-xs font-semibold text-t2">No {workspace === 'appointments' ? 'appointment reminder lists' : 'calling lists'} yet.</p><button type="button" onClick={() => { setDraftPurpose(workspace === 'appointments' ? 'APPOINTMENT_REMINDER' : 'CARE_COORDINATION'); setCreating(true); setSelectedId(''); }} className="mt-2 min-h-11 text-xs font-semibold text-indigo">Create a list</button></div>}
@@ -184,7 +196,6 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
       {workspace === 'appointments' && <>
         <BookingRequestQueue requests={requests} onChanged={reload} />
         <ConfirmationDeliveryQueue deliveries={deliveries} loadFailed={loadErrors.some(error => error.startsWith('confirmation delivery evidence'))} onRetry={reload} />
-        <div className="cc-card flex flex-wrap items-center justify-between gap-3 p-4"><div><p className="text-sm font-bold text-t1">Manage appointments</p><p className="mt-1 text-xs text-t3">Book, move, or cancel the canonical visit from Scheduling.</p></div><Link to="/scheduling" className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-indigo">Open Scheduling</Link></div>
       </>}
       </div>}
 

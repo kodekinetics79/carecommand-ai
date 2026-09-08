@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -242,6 +242,11 @@ describe('ReceptionistStudio', () => {
     expect(screen.getByRole('tab', { name: 'Marketing campaigns' })).toBeInTheDocument();
     expect(screen.queryByRole('tab', { name: 'Setup' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Receptionist service status')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Appointment reminders' }));
+    expect(screen.getByRole('heading', { name: 'Automatic appointment reminders' })).toBeInTheDocument();
+    expect(screen.getByText(/Choose None, Text, Call, or Both/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open Scheduling' })).toHaveAttribute('href', '/scheduling');
   });
 
   it('shows the go-live rail with the clinic prerequisite on the go-live tab (SF-4)', async () => {
