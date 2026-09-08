@@ -95,4 +95,54 @@ describe('Scheduling booking reminders', () => {
     expect(screen.queryByRole('dialog', { name: 'Book appointment' })).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
   });
+
+  it('revalidates the insurance queue after a same-day reschedule', async () => {
+    const day = todayInZone('UTC');
+    let moved = false;
+    let queueReads = 0;
+    apiRequestMock.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/auth/me') return Promise.resolve({
+        user: { id: 'user-1', role: 'MANAGER', displayName: 'Practice manager' },
+        access: { permissions: ['appointment:read', 'appointment:write'] },
+      });
+      if (path.startsWith('/v1/branches')) return Promise.resolve([{ id: 'branch-1', name: 'Bright Health', timezone: 'UTC' }]);
+      if (path.endsWith('/appointment-1/reschedule') && init?.method === 'PATCH') {
+        moved = true;
+        return Promise.resolve({ id: 'appointment-1' });
+      }
+      if (path.startsWith('/v1/appointments')) return Promise.resolve([{
+        id: 'appointment-1', patientId: 'patient-1', patientName: 'Avery Jordan', providerRef: 'Dr Rivera',
+        branchId: 'branch-1', service: 'Annual wellness visit', startsAt: `${day}T${moved ? '15:00' : '14:30'}:00.000Z`,
+        status: 'CONFIRMED', noShowRisk: 0, channel: 'EMAIL', value: '0', notes: null, version: moved ? 2 : 1,
+      }]);
+      if (path.startsWith('/v1/providers/overview')) return Promise.resolve([]);
+      if (path.startsWith('/v1/patients')) return Promise.resolve([]);
+      if (path === '/v1/services') return Promise.resolve([]);
+      if (path.startsWith('/v1/revenue-protection/appointment-queue')) {
+        queueReads += 1;
+        return Promise.resolve({ appointments: [{
+          id: 'appointment-1', branchId: 'branch-1', branchName: 'Bright Health', patientId: 'patient-1', patientName: 'Avery Jordan',
+          appointmentTime: `${day}T${moved ? '15:00' : '14:30'}:00.000Z`, serviceType: 'Annual wellness visit', payerName: null, memberId: null,
+          eligibilityStatus: 'Not Verified', copay: 0, deductibleRemaining: 0, priorAuthStatus: 'Not Required', coverageActive: false,
+          coverageStatus: 'not_verified', providerMode: 'mock', recommendedAction: 'Verify', riskLevel: 'LOW',
+        }] });
+      }
+      if (path === GROWTH_POLICY_PATH) return Promise.resolve({ source: 'default', noShowRiskHigh: 50 });
+      return Promise.reject(new Error(`Unexpected request in test: ${path}`));
+    });
+
+    render(<MemoryRouter><Scheduling /></MemoryRouter>);
+    const patientName = await screen.findAllByText('Avery Jordan');
+    const appointmentRow = patientName.map(node => node.closest('[data-appointment-id]')).find(Boolean) as HTMLElement;
+    fireEvent.click(within(appointmentRow).getByRole('button', { name: 'Reschedule' }));
+    fireEvent.change(within(appointmentRow).getByLabelText('New time'), { target: { value: '15:00' } });
+    fireEvent.click(within(appointmentRow).getByRole('button', { name: 'Confirm' }));
+
+    await waitFor(() => expect(queueReads).toBeGreaterThan(1));
+    const queueRow = screen.getAllByText('Avery Jordan')
+      .map(node => node.closest('tr'))
+      .find(Boolean) as HTMLTableRowElement;
+    expect(queueRow).toHaveTextContent('3:00 PM UTC');
+    expect(queueRow).not.toHaveTextContent('2:30 PM UTC');
+  });
 });

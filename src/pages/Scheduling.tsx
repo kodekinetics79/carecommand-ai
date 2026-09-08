@@ -255,6 +255,10 @@ export default function Scheduling() {
   // Per-row lifecycle action state.
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [rowNotice, setRowNotice] = useState<{ id: string; kind: 'error' | 'ok'; text: string } | null>(null);
+  // The verification queue is a separate read model from the appointment
+  // timeline. Successful appointment mutations must explicitly revalidate it;
+  // otherwise a same-day reschedule can show two different times on one page.
+  const [insuranceQueueRevision, setInsuranceQueueRevision] = useState(0);
   const [rescheduleFor, setRescheduleFor] = useState<string | null>(null);
   const [rescheduleForm, setRescheduleForm] = useState<{ date: string | null; time: string }>({ date: null, time: '10:00' });
   const [intakeBusy, setIntakeBusy] = useState<string | null>(null);
@@ -343,7 +347,7 @@ export default function Scheduling() {
     return () => {
       active = false;
     };
-  }, [selectedBranch, activeDate, scheduleScopeReady, scopeDayRange, timezoneForBranch]);
+  }, [selectedBranch, activeDate, scheduleScopeReady, scopeDayRange, timezoneForBranch, insuranceQueueRevision]);
 
   const closeBooking = useCallback(() => {
     setBooking(emptyBooking(todayDate));
@@ -478,6 +482,7 @@ export default function Scheduling() {
       await fn();
       setRowNotice({ id, kind: 'ok', text: okText });
       reload();
+      setInsuranceQueueRevision(current => current + 1);
     } catch (err) {
       const text = err instanceof ApiError && err.status === 409
         ? (err.message.startsWith('API request failed') ? "You can't do that from the appointment's current state." : err.message)
