@@ -8,6 +8,7 @@ vi.mock('../../../lib/api', async () => {
 });
 
 import { CampaignBuilder } from './CampaignBuilder';
+import { recommendedCallBrief } from './campaignPayload';
 
 /**
  * This form never asked which receptionist places the calls, so every campaign
@@ -42,6 +43,7 @@ async function fillRequired() {
   if (script) fireEvent.change(script, { target: { value: 'Salam. Calling from Brightsmile Dental Group.' } });
   fireEvent.change(screen.getByPlaceholderText('21:00'), { target: { value: '23:50' } });
   fireEvent.change(screen.getByPlaceholderText('08:00'), { target: { value: '23:55' } });
+  fireEvent.change(screen.getByPlaceholderText('OUTBOUND-2026-01'), { target: { value: 'OUTBOUND-2026-01' } });
 }
 
 beforeEach(() => {
@@ -53,6 +55,28 @@ beforeEach(() => {
 });
 
 describe('a campaign is created with a receptionist attached', () => {
+  it('preserves appointment follow-up intent when opened from that workspace', async () => {
+    render(
+      <CampaignBuilder
+        clinicId="clinic-1" bookingAuthorities={[]} locations={[]} timezone="America/New_York"
+        initialPurpose="APPOINTMENT_REMINDER" onSaved={() => {}} onCancel={() => {}}
+      />,
+    );
+    expect(screen.getByRole('heading', { name: 'New appointment follow-up list' })).toBeInTheDocument();
+    expect((screen.getByLabelText('Call purpose') as HTMLSelectElement).value).toBe('APPOINTMENT_REMINDER');
+    expect(screen.getByLabelText('Reason and goal for the call')).toHaveValue(recommendedCallBrief('APPOINTMENT_REMINDER'));
+  });
+
+  it('starts with a safe outbound brief and updates an untouched brief with the purpose', async () => {
+    renderBuilder();
+    const brief = screen.getByLabelText('Reason and goal for the call');
+    expect(brief).toHaveValue(recommendedCallBrief('CARE_COORDINATION'));
+    expect(brief).not.toHaveValue(expect.stringMatching(/how can I help|thanks for calling/i));
+
+    fireEvent.change(screen.getByLabelText('Call purpose'), { target: { value: 'PATIENT_REACTIVATION' } });
+    expect(brief).toHaveValue(recommendedCallBrief('PATIENT_REACTIVATION'));
+  });
+
   it('sends the clinic’s only published receptionist without asking', async () => {
     renderBuilder();
     await waitFor(() => expect(screen.getByLabelText('Receptionist placing these calls')).toBeTruthy());

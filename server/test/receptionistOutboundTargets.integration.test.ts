@@ -1758,6 +1758,15 @@ describe('AI receptionist outbound authority and target integrity', () => {
     expect(invalid.statusCode).toBe(400);
     expect(invalid.json().message).toMatch(/^name: /);
     expect(Object.keys(invalid.json().details.fieldErrors).sort()).toEqual(['name', 'policyVersion']);
+
+    const inboundStyle = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/outbound-campaigns',
+      headers: auth(tenant),
+      payload: { clinicId: tenant.clinicId, name: 'Wrong-direction wording', script: 'Thanks for calling. How can I help you today?' },
+    });
+    expect(inboundStyle.statusCode).toBe(400);
+    expect(inboundStyle.json().details.fieldErrors.script[0]).toMatch(/outbound reason and goal/i);
   });
 
   it('freezes attested direct-booking authority after approval', async () => {
@@ -1919,6 +1928,36 @@ describe('AI receptionist outbound authority and target integrity', () => {
       INSERT INTO "ReceptionistCallTarget" ("id", "tenantId", "campaignId", "patientId", "phone", "updatedAt")
       VALUES (${randomUUID()}::uuid, ${tenant.id}::uuid, ${campaignId}::uuid, ${foreignPatient.id}::uuid, ${foreignPatient.phone!}, NOW())
     `).rejects.toThrow();
+  });
+
+  it('persists the canonical patient name when the picker submits only an identity', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant);
+    const patient = await createPatient(tenant, 14);
+
+    const added = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+      payload: { targets: [{ patientId: patient.id }] },
+    });
+    expect(added.statusCode).toBe(201);
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toEqual([
+      expect.objectContaining({
+        patientId: patient.id,
+        firstName: patient.firstName,
+        lastName: patient.lastName,
+        voiceAuthorizationReady: true,
+        voiceAuthorizationReason: 'treatment_operations',
+      }),
+    ]);
   });
 
   it('rejects duplicate destinations both within a batch and against an existing campaign target', async () => {
@@ -2549,10 +2588,14 @@ describe('an outbound reminder states the appointment it is actually about', () 
     expect(response.statusCode).toBe(201);
 
     const variables = dialVariablesFrom(providerFetch);
+    expect(variables.call_direction).toBe('outbound');
+    expect(variables.call_direction_opening).toBe('Hello — this is Main clinic calling.');
     expect(variables.outbound_script).toBe('Call the patient about care coordination.');
     expect(variables.outbound_campaign_name).toBeTruthy();
     expect(variables.outbound_booking_mode).toBe('APPOINTMENT_REQUEST_ONLY');
     expect(variables.outbound_first_name).toBe(patient.firstName);
+    expect(variables.outbound_last_name).toBe(patient.lastName);
+    expect(variables.outbound_verification_mode).toBe('patient_dob');
     expect(variables).not.toHaveProperty('script');
     expect(variables.appointment_id).toBe(appointment.id);
     expect(variables.appointment_clinician).toBe('Dr Amara Osei');

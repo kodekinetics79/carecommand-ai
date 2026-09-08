@@ -4,7 +4,7 @@ import { Field, TextInput, TextArea, Select } from '../../ui/Field';
 import { receptionistApi as api, OUTBOUND_REQUIRED_FIELDS, validateOutboundQuietHours, type Agent, type Campaign, type OutboundRequiredField, type OutboundBookingMode, type OutboundCampaignInput, type Location } from '../../../lib/receptionist';
 import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { MutationNotice } from '../MutationNotice';
-import { EMPTY_CAMPAIGN, toOutboundCampaignPayload } from './campaignPayload';
+import { bookingAuthorityCallBrief, EMPTY_CAMPAIGN, recommendedCallBrief, toOutboundCampaignPayload } from './campaignPayload';
 
 function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField[]; onChange: (next: OutboundRequiredField[]) => void }) {
   return (
@@ -50,8 +50,8 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
           </Select>
         </Field>
       )}
-      <Field label="Call script" required hint="What the agent should say. Keep it scheduling-focused — the AI must not give medical advice.">
-        <TextArea rows={4} disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Hi, this is {{agent_name}} calling from {{clinic_name}}..." />
+      <Field label="Reason and goal for the call" required hint="CareCommand handles the outbound opening, AI disclosure, and identity check. Describe why the clinic is calling and the outcome you want; do not write an inbound greeting.">
+        <TextArea aria-label="Reason and goal for the call" rows={5} disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Explain why the clinic is calling, then describe the approved next step." />
       </Field>
       <Field label="Required fields to collect" hint="The agent will route to staff review if any of these are missing.">
         {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
@@ -80,7 +80,7 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
               agentId: authority?.agentId ?? null,
               defaultService: authority?.appointmentType ?? null,
               defaultBranchId: eligibleLocation?.branchId ?? null,
-              script: authority?.offerScript ?? form.script,
+              script: authority ? bookingAuthorityCallBrief(authority) : form.script,
             });
           }}>
             <option value="">Select active attested campaign</option>
@@ -88,9 +88,16 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
           </Select>
         </Field>
       )}
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid gap-3 sm:grid-cols-3">
         <Field label="Call purpose" required>
-          <Select aria-label="Call purpose" value={form.purpose ?? ''} onChange={e => set({ purpose: e.target.value as OutboundCampaignInput['purpose'] })}>
+          <Select aria-label="Call purpose" value={form.purpose ?? ''} onChange={e => {
+            const nextPurpose = e.target.value as NonNullable<OutboundCampaignInput['purpose']>;
+            const currentDefault = recommendedCallBrief(form.purpose);
+            set({
+              purpose: nextPurpose,
+              ...(form.script.trim() === '' || form.script === currentDefault ? { script: recommendedCallBrief(nextPurpose) } : {}),
+            });
+          }}>
             <option value="CARE_COORDINATION">Care coordination</option>
             <option value="APPOINTMENT_REMINDER">Appointment reminder</option>
             <option value="PATIENT_REACTIVATION">Patient reactivation</option>
@@ -106,7 +113,7 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
           <TextInput value={form.policyVersion ?? ''} onChange={e => set({ policyVersion: e.target.value })} placeholder="OUTBOUND-2026-01" />
         </Field>
       </div>
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid gap-3 sm:grid-cols-2">
         <Field label="Default branch ID" hint="Required for direct booking.">
           {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? (
             <Select aria-label="Eligible booking branch" value={form.defaultBranchId ?? ''} onChange={e => set({ defaultBranchId: e.target.value || null })}>
@@ -122,7 +129,7 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
           <TextInput disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.defaultService ?? ''} onChange={e => set({ defaultService: e.target.value })} placeholder="Consultation" />
         </Field>
       </div>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid gap-3 sm:grid-cols-3">
         <Field label="Quiet hours start"><TextInput value={form.quietHoursStart ?? ''} onChange={e => set({ quietHoursStart: e.target.value })} placeholder="21:00" /></Field>
         <Field label="Quiet hours end"><TextInput value={form.quietHoursEnd ?? ''} onChange={e => set({ quietHoursEnd: e.target.value })} placeholder="08:00" /></Field>
         <Field label="Max retries"><TextInput type="number" min={0} max={10} value={form.maxRetryAttempts ?? 1} onChange={e => set({ maxRetryAttempts: Number(e.target.value) })} /></Field>
@@ -131,8 +138,8 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
   );
 }
 
-export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timezone, onSaved, onCancel }: { clinicId: string; bookingAuthorities: Campaign[]; locations: Location[]; timezone: string; onSaved: (id: string) => void; onCancel: () => void }) {
-  const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId });
+export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timezone, initialPurpose = 'CARE_COORDINATION', onSaved, onCancel }: { clinicId: string; bookingAuthorities: Campaign[]; locations: Location[]; timezone: string; initialPurpose?: NonNullable<OutboundCampaignInput['purpose']>; onSaved: (id: string) => void; onCancel: () => void }) {
+  const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId, purpose: initialPurpose, script: recommendedCallBrief(initialPurpose) });
   // The voice agent that will place these calls.
   //
   // This form never collected one, so every campaign it created was born with
@@ -167,6 +174,10 @@ export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timez
   async function save() {
     const quietHoursError = validateOutboundQuietHours(form.quietHoursStart, form.quietHoursEnd, timezone);
     if (quietHoursError) { setErr(quietHoursError); return; }
+    if (!form.purpose || !form.legalBasis || !form.policyVersion?.trim()) {
+      setErr('Choose the call purpose and legal basis, and enter the approved policy version before creating this list.');
+      return;
+    }
     // Saving a campaign that can never be approved is worse than refusing it:
     // there is no edit form, so an unlinked campaign is unusable forever and
     // the only remedy is a database write. Say so here instead.
@@ -183,13 +194,13 @@ export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timez
 
   return (
     <div className="cc-card p-5 space-y-4">
-      <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> New outbound campaign</h3>
+      <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> {initialPurpose === 'APPOINTMENT_REMINDER' ? 'New appointment follow-up list' : 'New calling list'}</h3>
       <CampaignFormFields form={form} set={set} bookingAuthorities={bookingAuthorities} locations={locations} agents={usableAgents} effectiveAgentId={effectiveAgentId} />
       <p className="text-[11px] text-t3">Quiet hours are enforced in clinic timezone {timezone}. Overnight windows such as 21:00–08:00 are supported.</p>
       {err && <p role="alert" className="text-xs text-red-v">{err}</p>}
       <MutationNotice state={saveState.state} showSaved={false} />
       <div className="flex gap-2">
-        <button type="button" disabled={saving || !form.name || !form.script} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
+        <button type="button" disabled={saving || !form.name || !form.script || !form.purpose || !form.legalBasis || !form.policyVersion?.trim()} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
           {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Create campaign
         </button>
         <button type="button" onClick={onCancel} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)]">Cancel</button>

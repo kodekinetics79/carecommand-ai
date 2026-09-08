@@ -11,7 +11,7 @@ import { ConfirmedButton } from '../shared';
 import { MutationNotice } from '../MutationNotice';
 import { TargetList } from './TargetList';
 
-export function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: VoiceLineStatusLike | null; outboundStopped: boolean; onChanged: () => void }) {
+export function CampaignDetail({ campaign, status, outboundStopped, onChanged, mode = 'operations' }: { campaign: OutboundCampaign; status: VoiceLineStatusLike | null; outboundStopped: boolean; onChanged: () => void; mode?: 'operations' | 'setup' }) {
   const transportAmbiguityKey = transportAmbiguityStorageKey(campaign.id);
   const [targets, setTargets] = useState<CallTarget[]>([]);
   const [logs, setLogs] = useState<CallLog[]>([]);
@@ -182,13 +182,13 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
   const uat = view?.attendedUat ?? null;
   const reconciliationBlocksLaunch = launchControlsBlocked({ transportAmbiguous, reconciliationVerified, reconciliations });
 
-  async function approveAndRun() {
+  async function approveForManualCalling() {
     setLaunchMsg(null);
     // rethrow: the confirmation dialog stays open and shows the cause itself.
     await campaignAction.run(async () => {
       await api.approveOutboundCampaign(campaign.id, 'RUNNING');
       await onChanged();
-    }, { successMessage: 'Authority approved and campaign started.', rethrow: true });
+    }, { successMessage: 'Authority approved. This list is ready for staff-initiated calls.', rethrow: true });
   }
 
   async function pauseCampaign() {
@@ -213,17 +213,18 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         </div>
       )}
       {transportAmbiguous && (
-        <div role="alert" aria-live="assertive" className="cc-card border-l-4 border-l-red-v p-4">
+        <div role="alert" aria-live="assertive" className="cc-card border border-red-v/40 bg-[var(--red-soft)] p-4">
           <p className="text-sm font-bold text-red-v">{OUTBOUND_RECONCILIATION_WARNING}</p>
           <p className="mt-1 text-xs text-t2">The launch transport failed after submission. Launch controls remain blocked until provider and durable call evidence are independently reconciled.</p>
           <button type="button" disabled={launching} onClick={() => void verifyAndClearTransportAmbiguity()} className="mt-2 rounded-lg border border-red-v/40 px-3 py-1.5 text-xs font-semibold text-red-v disabled:opacity-50">Refresh all durable evidence and clear only if no reconciliation remains</button>
         </div>
       )}
       {reconciliations.length > 0 && (
-        <div role="alert" aria-live="assertive" className="cc-card border-l-4 border-l-red-v p-4">
+        <div role="alert" aria-live="assertive" className="cc-card border border-red-v/40 bg-[var(--red-soft)] p-4">
           <p className="text-sm font-bold text-red-v">Critical reconciliation required: {OUTBOUND_RECONCILIATION_WARNING}</p>
           <p className="mt-1 text-xs text-t2">This warning was reconstructed from durable call and target evidence and remains after refresh or navigation until backend reconciliation evidence is resolved.</p>
-          <div className="mt-3 space-y-2">
+          {mode === 'operations' && <p className="mt-2 text-xs font-semibold text-t2">Calling is paused while CareCommand checks an uncertain earlier attempt. Open Setup for technical evidence and resolution.</p>}
+          {mode === 'setup' && <div className="mt-3 space-y-2">
             {reconciliations.map(row => (
               <div key={row.localCallLogId} className="rounded-lg border border-red-v/30 bg-[var(--red-soft)] p-2 text-[11px] text-t2">
                 <p><span className="font-semibold">Local call log ID:</span> <span className="font-mono">{row.localCallLogId}</span></p>
@@ -231,26 +232,26 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
                 <p className="text-t3">Evidence: {row.triggerSources.join(', ')}{row.signalIds.length ? ` · signals ${row.signalIds.join(', ')}` : ''}{row.reviewTaskIds.length ? ` · review tasks ${row.reviewTaskIds.join(', ')}` : ''}</p>
               </div>
             ))}
-          </div>
+          </div>}
         </div>
       )}
       <div ref={summaryRef} tabIndex={-1} id={`outbound-campaign-${campaign.id}-settings`} className="cc-card p-5 space-y-3 outline-none">
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-bold text-t1">{campaign.name}</h3>
           <div className="flex items-center gap-2">
-            <span className="badge badge-blue">{formatEnumLabel(campaign.status)}</span>
+            <span className="badge badge-blue">{campaign.status === 'RUNNING' ? 'Ready for manual calls' : formatEnumLabel(campaign.status)}</span>
             {campaign.status === 'RUNNING'
               ? <button type="button" disabled={campaignActionPending} onClick={pauseCampaign} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Pause</button>
               : <ConfirmedButton
-                  dialogTitle="Approve and start outbound campaign?"
-                  message={`Authorize policy ${campaign.policyVersion ?? 'not configured'} and allow this campaign to place calls to its approved targets. Provider configuration and all launch gates still apply.`}
-                  confirmLabel="Approve and start"
+                  dialogTitle="Approve this calling list?"
+                  message={`Authorize policy ${campaign.policyVersion ?? 'not configured'} so staff can place calls one patient at a time. This does not schedule, queue, or automatically dispatch calls.`}
+                  confirmLabel="Approve list"
                   tone="amber"
                   disabled={campaignActionPending || !campaign.policyVersion}
-                  buttonTitle={!campaign.policyVersion ? 'Configure a policy version before approval.' : 'Approve the recorded authority and start this campaign.'}
-                  onConfirm={approveAndRun}
+                  buttonTitle={!campaign.policyVersion ? 'Configure a policy version before approval.' : 'Approve the recorded authority for manual calling.'}
+                  onConfirm={approveForManualCalling}
                   className="rounded-lg bg-indigo px-2.5 py-1 text-xs font-semibold text-white disabled:opacity-50"
-                >Approve and start</ConfirmedButton>}
+                >Approve list</ConfirmedButton>}
           </div>
         </div>
         {/*
@@ -268,7 +269,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
             ? ` · approved ${new Date(campaign.authorityApprovedAt).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
             : ' · not approved yet'}
         </p>
-        <details className="group">
+        {mode === 'setup' && <details className="group">
           <summary className="cursor-pointer list-none text-[11px] font-semibold text-t3 hover:text-t2 marker:content-none">
             <span className="group-open:hidden">Show compliance record</span>
             <span className="hidden group-open:inline">Hide compliance record</span>
@@ -283,9 +284,9 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
             {campaign.authorityApprovedById && (<><dt className="text-t3">Approved by</dt><dd className="font-mono break-all">{campaign.authorityApprovedById}</dd></>)}
             {campaign.authorityFingerprint && (<><dt className="text-t3">Evidence</dt><dd className="font-mono break-all">{campaign.authorityFingerprint}</dd></>)}
           </dl>
-        </details>
+        </details>}
         <MutationNotice state={campaignAction.state} />
-        <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>
+        {mode === 'setup' && <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>}
         <div className="flex flex-wrap gap-1.5">
           {campaign.requiredFields.map(f => <span key={f} className="badge badge-violet">{f}</span>)}
           <span className="badge badge-blue">{campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? 'Direct booking' : 'Request only'}</span>
@@ -297,7 +298,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         booked this" into "the patient says they are coming", and until now the
         panel showed only the calls it placed — never the answers they produced.
       */}
-      <div className="cc-card p-5 space-y-2">
+      {campaign.purpose === 'APPOINTMENT_REMINDER' && <div className="cc-card p-5 space-y-2">
         <h4 className="text-sm font-bold text-t1 flex items-center gap-2">
           <UserCheck className="w-4 h-4 text-indigo" aria-hidden="true" /> Who has said they’re coming
         </h4>
@@ -330,10 +331,10 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
             )}
           </>
         )}
-      </div>
+      </div>}
 
-      {uat?.enabled && (
-        <div className={`cc-card border-l-4 p-4 ${uat.active ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
+      {mode === 'setup' && uat?.enabled && (
+        <div className={`cc-card border p-4 ${uat.active ? 'border-emerald-v/40 bg-[var(--emerald-soft)]' : 'border-amber-v/40 bg-[var(--amber-soft)]'}`}>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               {/* "Attended synthetic live voice UAT" is what we call this to
@@ -364,7 +365,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
       )}
 
       {/* Launch test call */}
-      <div className="cc-card p-5 space-y-3">
+      {mode === 'setup' && <div className="cc-card p-5 space-y-3">
         <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><PhoneCall className="w-4 h-4 text-indigo" /> Launch a call</h4>
         {outboundStopped && (
           <div role="alert" className="flex items-center gap-2 rounded-lg border border-red-v/40 bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
@@ -377,7 +378,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
           </div>
         )}
         {status?.adhocTestCallsAllowed ? (
-          <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[1fr_1fr_auto] lg:items-end">
             <Field label="Test-call phone number" hint="When a provider is configured, this action may place a real call."><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
             <Field label="First name (optional)"><TextInput value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jordan" /></Field>
             <ConfirmedButton
@@ -396,10 +397,10 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         {launchMsg && (
           <p role={launchMsg.kind === 'err' ? 'alert' : 'status'} aria-live={launchMsg.kind === 'err' ? 'assertive' : 'polite'} className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
         )}
-      </div>
+      </div>}
 
       {/* Targets */}
-      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} onConfigure={goToCampaignSettings} />
+      <TargetList campaign={campaign} targets={targets} onAdded={() => void Promise.all([reloadDetail(), onChanged()])} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} onConfigure={goToCampaignSettings} />
 
       {/* Call logs */}
       <div className="cc-card p-5">
@@ -414,9 +415,9 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
                     <span className="text-t2">{l.callerName || maskedPhone(l.callerPhone)}</span>
                     <span className="text-t3">{maskedPhone(l.callerPhone)}</span>
                   </div>
-                  <p className="mt-1 text-[10px] text-t3 font-mono">{maskedProviderId(l.providerCallRef)}{providerStatusByCall[l.id] ? ` · ${providerStatusByCall[l.id]}` : ''}</p>
+                  {mode === 'setup' && <p className="mt-1 text-[10px] text-t3 font-mono">{maskedProviderId(l.providerCallRef)}{providerStatusByCall[l.id] ? ` · ${providerStatusByCall[l.id]}` : ''}</p>}
                 </div>
-                <button
+                {mode === 'setup' && <button
                   type="button"
                   disabled={!l.providerCallRef || syncingCallId === l.id}
                   title={!l.providerCallRef ? 'Call status is unavailable until the voice line has reported this call.' : 'Refresh the latest call state from the voice line.'}
@@ -424,7 +425,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
                   className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo disabled:opacity-50"
                 >
                   {syncingCallId === l.id ? 'Refreshing…' : 'Refresh provider status'}
-                </button>
+                </button>}
               </div>
             ))}
           </div>

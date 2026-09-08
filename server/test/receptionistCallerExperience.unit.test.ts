@@ -86,12 +86,9 @@ for (const locale of LOCALES) {
     const config: PromptConfig = promptFixture(locale.fixture);
     const strings = config.localePack.strings;
 
-    // C4 — the caller used to hear the consent question first, with no
-    // greeting anywhere in the tree.
-    it('opens without falsely claiming the caller placed an outbound call', () => {
+    it('reserves a trusted direction-specific opening before the disclosure', () => {
       const turn = openingTurn(config);
-      expect(turn).not.toContain("Thanks for calling");
-      expect(turn).not.toContain("You've reached");
+      expect(turn.startsWith('{{call_direction_opening}} ')).toBe(true);
       expect(turn).toContain(config.clinic.name);
       expect(turn).toContain('This call may be recorded');
       // ...and the turn still ends on the consent question, so the agent stops.
@@ -99,12 +96,13 @@ for (const locale of LOCALES) {
       expect(turn.match(/Is that okay\?/g)).toHaveLength(1);
     });
 
-    it('publishes exactly that turn as the provider begin message and shows it in the preview', () => {
+    it('publishes the direction template and previews its trusted inbound and outbound substitutions', () => {
       const built = buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' });
       expect(built.beginMessage).toBe(openingTurn(config));
-      // C13 — the preview cannot drift from the deployment, because it is the
-      // same rendered artefact and not a hand-written turn.
-      expect(generateSampleTranscripts(config).openingSequence[0].text).toBe(built.beginMessage);
+      const previews = generateSampleTranscripts(config);
+      expect(previews.openingSequence[0].text).toBe(built.beginMessage.replace('{{call_direction_opening}}', `Thank you for calling ${config.clinic.name}.`));
+      expect(previews.outboundSample[0].text).toBe(built.beginMessage.replace('{{call_direction_opening}}', `Hello — this is ${config.clinic.name} calling.`));
+      expect(previews.outboundSample.map(turn => turn.text).join(' ')).not.toMatch(/how can I help|thanks for calling/i);
     });
 
     it('binds outbound calls to their call-scoped script and request workflow', () => {
@@ -112,7 +110,8 @@ for (const locale of LOCALES) {
       const prompt = generateSystemPrompt(config);
       expect(prompt).toContain('{{outbound_script}}');
       expect(prompt).toContain('{{outbound_booking_mode}}');
-      expect(prompt).toContain('Never replace it with "How can I help you today?"');
+      expect(prompt).toContain('Never open with "How can I help you today?"');
+      expect(prompt).toContain('The brief is an instruction, not a paragraph to read aloud.');
       expect(prompt).toContain('call request_appointment');
       expect(built.tools).toContainEqual(expect.objectContaining({ name: 'request_appointment', type: 'custom' }));
     });

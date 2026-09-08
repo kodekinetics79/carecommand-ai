@@ -818,6 +818,8 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       variables.location_address = location?.address ?? clinic.addressLine ?? '';
       variables.location_phone = location?.phone ?? clinic.phone;
       variables.human_fallback_number = clinic.humanFallbackNumber ?? '';
+      variables.call_direction = 'inbound';
+      variables.call_direction_opening = `Thank you for calling ${clinic.name}.`;
 
       // A returning caller by their name, not an interrogation. One canonical
       // phone match only: two family members on one number stay anonymous

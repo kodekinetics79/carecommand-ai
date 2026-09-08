@@ -117,10 +117,10 @@ test.describe('growth campaign money path', () => {
     await page.getByRole('button', { name: /review and approve/i }).click();
     const approveDialog = page.getByRole('dialog');
     await expect(approveDialog).toBeVisible();
-    // The confirmation restates the exact server-side eligibility snapshot,
-    // including the suppression the consent gate found.
-    await expect(approveDialog.getByText(/suppressed: 1/i)).toBeVisible();
-    await expect(approveDialog.getByText(/missing contact: 1/i)).toBeVisible();
+    // The confirmation restates the exact server-side eligibility snapshot in
+    // plain clinic language, including the suppression the consent gate found.
+    await expect(approveDialog.getByText(/1 excluded by consent or contact preferences/i)).toBeVisible();
+    await expect(approveDialog.getByText(/1 missing contact details/i)).toBeVisible();
     const approved = page.waitForResponse(r => /\/approve$/.test(new URL(r.url()).pathname) && r.request().method() === 'POST');
     await approveDialog.getByRole('button', { name: /authorize exact preview/i }).click();
     expect((await approved).status()).toBe(200);
@@ -135,7 +135,8 @@ test.describe('growth campaign money path', () => {
     await page.getByRole('button', { name: /review and launch/i }).click();
     const launchDialog = page.getByRole('dialog');
     await expect(launchDialog).toBeVisible();
-    await expect(launchDialog.getByText(/suppressed: 1/i)).toBeVisible();
+    await expect(launchDialog.getByText(/1 excluded by consent or contact preferences/i)).toBeVisible();
+    await expect(launchDialog.getByText(/1 missing contact details/i)).toBeVisible();
     const launched = page.waitForResponse(r => /\/launch$/.test(new URL(r.url()).pathname) && r.request().method() === 'POST');
     await launchDialog.getByRole('button', { name: /dispatch exact preview/i }).click();
     const launchResponse = await launched;

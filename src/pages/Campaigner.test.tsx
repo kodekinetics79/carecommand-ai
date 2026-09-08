@@ -542,6 +542,15 @@ describe('Campaigner handoff', () => {
     fireEvent.change(screen.getByPlaceholderText('Q3 reactivation'), { target: { value: 'Failed card recovery' } });
     expect(screen.getByRole('button', { name: /^Create$/ })).toBeDisabled();
   });
+
+  it('does not offer unwired voice delivery in Marketing', async () => {
+    stubLoadedPage();
+    renderPage({ goal: 'winback', channel: 'voice' });
+
+    const channel = await screen.findByLabelText('Channel') as HTMLSelectElement;
+    expect(channel.value).toBe('sms');
+    expect(within(channel).queryByRole('option', { name: /voice/i })).not.toBeInTheDocument();
+  });
 });
 
 describe('Campaigner governed workflow', () => {
@@ -578,11 +587,12 @@ describe('Campaigner governed workflow', () => {
     fireEvent.click(screen.getByRole('button', { name: /Review and approve/ }));
 
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText(/You are authorizing this exact audience, template, channel and provider/)).toBeInTheDocument();
-    expect(within(dialog).getByText(/Eligible: 180/)).toBeInTheDocument();
-    expect(within(dialog).getByText(/suppressed: 44/)).toBeInTheDocument();
-    expect(within(dialog).getByText(/missing contact: 16/)).toBeInTheDocument();
-    expect(within(dialog).getByText(/consent record required: 12/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Review this exact audience and message/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/180 eligible/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/44 excluded by consent or contact preferences/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/16 missing contact details/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/12 need a current consent record/)).toBeInTheDocument();
+    expect(within(dialog).queryByText(/provider mode/i)).not.toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Authorize exact preview' }));
 

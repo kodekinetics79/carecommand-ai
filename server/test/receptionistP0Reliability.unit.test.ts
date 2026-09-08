@@ -264,16 +264,11 @@ describe('receptionist P0 reliability', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  // C4 — the fully rendered, direction-neutral disclosure is one turn that
-  // still ends on the consent question. Direction-specific language follows
-  // only after the signed call direction and explicit consent are available.
-  it('uses a direction-neutral disclosure and still waits for the answer', () => {
+  it('uses a trusted direction prefix and still waits for the answer', () => {
     const built = buildRetellConfig(promptConfig, { webhookBaseUrl: 'https://api.example.test/' });
     const disclosure = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
 
-    expect(built.beginMessage).toBe(`${disclosure} Clinic-specific compliance language. Is that okay?`);
-    expect(built.beginMessage).not.toContain('Thanks for calling');
-    expect(built.beginMessage).not.toContain("You've reached");
+    expect(built.beginMessage).toBe(`{{call_direction_opening}} ${disclosure} Clinic-specific compliance language. Is that okay?`);
     expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
     expect(built.beginMessage).not.toContain('I can help you schedule today.');
     expect(generateSamples(promptConfig).greeting).toBe(built.beginMessage);
@@ -290,7 +285,7 @@ describe('receptionist P0 reliability', () => {
     const expected = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
 
     expect(buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' }).beginMessage)
-      .toBe(`${expected} Is that okay?`);
+      .toBe(`{{call_direction_opening}} ${expected} Is that okay?`);
     const prompt = generateSystemPrompt(config);
     expect(prompt).toContain(expected);
     expect(prompt).toContain('must not be shortened, paraphrased, reordered, skipped or replaced');

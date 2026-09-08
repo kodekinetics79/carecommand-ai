@@ -154,9 +154,17 @@ describe('sample transcripts', () => {
   it('opens with the mandatory disclosure and records consent before anything else', () => {
     const transcripts = generateSampleTranscripts(baseConfig);
     expect(transcripts.openingSequence[0].speaker).toBe('agent');
-    // C13 — the preview turn IS the deployed begin message, not a paraphrase.
-    expect(transcripts.openingSequence[0].text)
-      .toBe(buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' }).beginMessage);
+    // C13 — the preview turn IS the deployed begin message after the trusted
+    // inbound webhook supplies the direction-specific opening. It must never
+    // show a raw provider template token or an outbound greeting here.
+    const deployed = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' });
+    const renderedInboundOpening = deployed.beginMessage.replace(
+      '{{call_direction_opening}}',
+      `Thank you for calling ${baseConfig.clinic.name}.`,
+    );
+    expect(transcripts.openingSequence[0].text).toBe(renderedInboundOpening);
+    expect(transcripts.openingSequence[0].text).not.toContain('{{call_direction_opening}}');
+    expect(transcripts.openingSequence[0].text).not.toMatch(/this is .* calling/i);
     expect(transcripts.openingSequence[0].text).toMatch(/recorded or monitored/i);
     expect(transcripts.openingSequence.some(turn => turn.text.includes('record_recording_preference'))).toBe(true);
     // ...and the turn after consent is the pack's own line, so the preview

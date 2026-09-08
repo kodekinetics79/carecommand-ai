@@ -42,6 +42,7 @@ import {
   maskPhone,
   maskProviderId,
 } from '../../lib/receptionist/liveCallUat';
+import { promptText } from '../../lib/receptionist/promptSafety';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
@@ -56,6 +57,7 @@ const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as con
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
+const INBOUND_STYLE_OUTBOUND_BRIEF = /\b(?:thanks?\s+for\s+calling|how\s+can\s+i\s+help|what\s+can\s+i\s+(?:do|help)|you(?:'|’)ve\s+reached|welcome\s+to\s+(?:our|the)\s+(?:clinic|office|practice|scheduling|front\s+desk))\b/i;
 // How many upcoming appointments a target candidate offers to bind to. A
 // reminder is about the next visit or two; a longer list is a picker nobody
 // reads and a bigger disclosure of a patient's diary than the job needs.
@@ -765,7 +767,9 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     agentId: optionalUuid,
     receptionistCampaignId: optionalUuid,
     name: z.string().trim().min(2).max(160),
-    script: z.string().trim().min(2).max(4000),
+    script: promptText(4000)
+      .refine(value => value.length >= 2, { message: 'Describe the reason and goal for the outbound call.' })
+      .refine(value => !INBOUND_STYLE_OUTBOUND_BRIEF.test(value), { message: 'Write an outbound reason and goal, not an inbound greeting such as “How can I help?” or “Thanks for calling.”' }),
     purpose: optionalEnum(OUTBOUND_PURPOSES),
     legalBasis: optionalEnum(OUTBOUND_LEGAL_BASES),
     policyVersion: optionalText(80, 3),
@@ -989,14 +993,16 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             { phone: { contains: query } },
           ] } : {}),
         },
-        select: { id: true, firstName: true, lastName: true, phone: true }, take: 50,
+        select: { id: true, firstName: true, lastName: true, phone: true },
+        orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }, { id: 'asc' }],
+        take: 50,
       }),
       tx.lead.findMany({
         where: {
           tenantId: request.auth.tenantId, phone: { not: null },
           ...(query ? { OR: [{ name: { contains: query, mode: 'insensitive' } }, { phone: { contains: query } }] } : {}),
         },
-        select: { id: true, name: true, phone: true }, take: 50,
+        select: { id: true, name: true, phone: true }, orderBy: [{ name: 'asc' }, { id: 'asc' }], take: 50,
       }),
     ]));
     // The appointments a target may be created FROM. A reminder campaign that
@@ -1088,8 +1094,41 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
   app.get('/outbound-campaigns/:id/targets', { preHandler: callArtifactRead }, async request => {
     const { id } = idParam.parse(request.params);
-    const rows = await db.receptionistCallTarget.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'asc' } });
-    return rows.map(row => ({ ...row, phone: maskPhone(row.phone) }));
+    const tenantId = request.auth.tenantId;
+    return runWithTenantContext(tenantId, async tx => {
+      const campaign = await tx.receptionistOutboundCampaign.findFirst({
+        where: { id, tenantId },
+        select: { purpose: true, legalBasis: true, policyVersion: true },
+      });
+      // Preserve the existing non-disclosure contract: a foreign or unknown
+      // campaign has the same empty target-list response.
+      if (!campaign) return [];
+      const rows = await tx.receptionistCallTarget.findMany({ where: { tenantId, campaignId: id }, orderBy: { createdAt: 'asc' } });
+      const requiresImmutableConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
+      return Promise.all(rows.map(async row => {
+        const targetIdentity = { patientId: row.patientId, leadId: row.leadId };
+        const suppressed = await isChannelSuppressedTx(tx, { tenantId, destination: row.phone, channel: 'voice', ...targetIdentity });
+        const consent = !suppressed && requiresImmutableConsent && campaign.purpose && campaign.policyVersion
+          ? await compatibleVoiceConsentEventTx(tx, {
+              tenantId,
+              ...targetIdentity,
+              purpose: campaign.purpose as (typeof OUTBOUND_PURPOSES)[number],
+              policyVersion: campaign.policyVersion,
+            })
+          : null;
+        const voiceAuthorizationReason = suppressed
+          ? 'suppressed' as const
+          : requiresImmutableConsent
+            ? consent ? 'compatible_immutable_consent' as const : 'consent_missing_or_incompatible' as const
+            : 'treatment_operations' as const;
+        return {
+          ...row,
+          phone: maskPhone(row.phone),
+          voiceAuthorizationReady: !suppressed && (!requiresImmutableConsent || consent !== null),
+          voiceAuthorizationReason,
+        };
+      }));
+    });
   });
 
   /**
@@ -1181,8 +1220,18 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       for (const target of body.targets) {
         if (Boolean(target.patientId) === Boolean(target.leadId)) throw new Error('target_exact_identity_required');
         const identity = target.patientId
-          ? await tx.patient.findFirst({ where: { id: target.patientId, tenantId: request.auth.tenantId, deletedAt: null }, select: { phone: true } })
-          : await tx.lead.findFirst({ where: { id: target.leadId!, tenantId: request.auth.tenantId }, select: { phone: true } });
+          ? await tx.patient.findFirst({
+              where: { id: target.patientId, tenantId: request.auth.tenantId, deletedAt: null },
+              select: { phone: true, firstName: true, lastName: true, email: true },
+            }).then(patient => patient ? { ...patient } : null)
+          : await tx.lead.findFirst({
+              where: { id: target.leadId!, tenantId: request.auth.tenantId, deletedAt: null },
+              select: { phone: true, name: true, email: true },
+            }).then(lead => {
+              if (!lead) return null;
+              const [firstName = lead.name, ...remainingName] = lead.name.trim().split(/\s+/);
+              return { phone: lead.phone, email: lead.email, firstName, lastName: remainingName.join(' ') || null };
+            });
         if (!identity) throw new Error('target_identity_foreign_or_inactive');
         const identityPhone = toE164(identity.phone ?? '');
         if (!isValidE164(identityPhone)) throw new Error('target_phone_invalid');
@@ -1218,7 +1267,17 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         if (await tx.receptionistCallTarget.count({ where: { tenantId: request.auth.tenantId, campaignId: id, phone: identityPhone } })) {
           throw new Error('target_destination_duplicate');
         }
-        rows.push({ ...target, phone: identityPhone });
+        rows.push({
+          ...target,
+          phone: identityPhone,
+          // A patient selected from the CRM should remain recognizable after
+          // saving. Persist canonical identity values from the tenant record;
+          // never trust a browser-supplied display name for an identity-bound
+          // target.
+          firstName: identity.firstName,
+          lastName: identity.lastName ?? undefined,
+          email: identity.email ?? undefined,
+        });
       }
       return rows;
     }).catch(error => {
@@ -2263,6 +2322,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?${callWebhookQuery.toString()}`,
       dynamicVariables: {
         ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
+        call_direction: 'outbound',
+        call_direction_opening: `Hello — this is ${campaign.clinic.name} calling.`,
         // This patient's own appointment, in the BRANCH's timezone and this
         // call's locale format. Every key is present on every call: an unbound
         // target sends empty strings, exactly like the optional variables
@@ -2289,11 +2350,13 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         consent_text: campaign.consentText ?? '',
         human_handoff: campaign.humanHandoffInstruction ?? '',
         outbound_script: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
-          ? authorizedCampaign.receptionistCampaign!.offerScript
+          ? `Explain that ${campaign.clinic.name} is calling to help with ${authorizedCampaign.receptionistCampaign!.appointmentType}. Use this approved scope: ${authorizedCampaign.receptionistCampaign!.offerDescription} Help with the linked booking workflow, and route clinical questions to staff.`
           : campaign.script,
         outbound_campaign_name: campaign.name,
         outbound_booking_mode: campaign.bookingMode,
         outbound_first_name: dialIdentity.firstName ?? '',
+        outbound_last_name: dialIdentity.lastName ?? '',
+        outbound_verification_mode: target?.patientId ? 'patient_dob' : 'named_recipient',
         required_fields: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
           ? ''
           : campaign.requiredFields.join(', '),
