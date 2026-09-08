@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { AlertTriangle, Loader2, X } from 'lucide-react';
 
 // Confirmation modal. When `requireReason` is set, the confirm button stays
@@ -57,7 +58,7 @@ export default function ConfirmationModal({
     catch (e) { setErr(e instanceof Error ? e.message : 'Action failed'); setBusy(false); }
   }
 
-  return (
+  const dialog = (
     <div className="fixed inset-0 z-[60] grid place-items-center p-4" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={messageId}>
       <button type="button" aria-label="Close" title="Close" onClick={onClose} className="absolute inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
       <div ref={dialogRef} className="relative w-full max-w-md glass-surface rounded-2xl p-5 animate-fade-up">
@@ -83,4 +84,5 @@ export default function ConfirmationModal({
       </div>
     </div>
   );
+  return createPortal(dialog, document.body);
 }
