@@ -6,7 +6,10 @@ const reverify = vi.hoisted(() => vi.fn(async () => ({ scanned: 0, renewed: 0, f
 const runJobContext = vi.hoisted(() => vi.fn(async (_tenantId: string, work: () => Promise<void>) => work()));
 const runContext = vi.hoisted(() => vi.fn(async (_context: unknown, work: () => Promise<void>) => work()));
 
-vi.mock('../lib/receptionist/confirmationOutbox', () => ({ dispatchDueAppointmentConfirmations: dispatchDue }));
+vi.mock('../lib/receptionist/confirmationOutbox', () => ({
+  dispatchDueAppointmentNotifications: dispatchDue,
+  dispatchDueAppointmentConfirmations: dispatchDue,
+}));
 vi.mock('../lib/receptionist/agentReverification', () => ({ reverifyExpiringAgents: reverify }));
 vi.mock('../lib/tenantContext', () => ({ runWithJobTenantContext: runJobContext, runInTenantContext: runContext }));
 

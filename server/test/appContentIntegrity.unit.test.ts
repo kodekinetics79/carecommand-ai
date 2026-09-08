@@ -152,7 +152,11 @@ describe('general app content integrity', () => {
     const revenue = source('src/pages/Revenue.tsx');
 
     expect(scheduling).toContain('Select patient…');
-    expect(scheduling).toContain('Book canonical slot');
+    // The customer-facing button says "Book appointment"; the load-bearing
+    // invariant is that it still submits the exact server-issued slot instead
+    // of constructing an unconstrained appointment in the browser.
+    expect(scheduling).toContain('schedulingApi.book(booking.providerId');
+    expect(scheduling).toContain('startsAt: booking.slotStart');
     expect(scheduling).not.toContain('unconstrained fallback');
     expect(scheduling).not.toContain("status: 'CONFIRMED'");
     expect(scheduling).not.toMatch(/customer/i);
