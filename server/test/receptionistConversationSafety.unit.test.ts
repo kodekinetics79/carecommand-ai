@@ -40,14 +40,10 @@ describe('AI receptionist conversation safety contract', () => {
     expect(RECORDING_DISCLOSURE_EVIDENCE_TEMPLATE.endsWith('{{clinic_disclosure}} Is that okay?')).toBe(true);
   });
 
-  // The first turn must work for both inbound and outbound calls because one
-  // shared clinic agent handles both directions. Direction-specific wording
-  // belongs after consent, when the signed provider direction is available.
-  it('opens with a direction-neutral disclosure and still ends on the consent question', () => {
+  it('opens with the trusted direction prefix and still ends on the consent question', () => {
     const built = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' });
 
-    expect(built.beginMessage.startsWith("Hi, I'm Avery, an AI assistant for Example Clinic.")).toBe(true);
-    expect(built.beginMessage).not.toMatch(/Thanks for calling|you've reached/i);
+    expect(built.beginMessage.startsWith("{{call_direction_opening}} Hi, I'm Avery, an AI assistant for Example Clinic.")).toBe(true);
     expect(built.beginMessage).toContain('This call may be recorded or monitored');
     expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
     // The campaign greeting override is still not spoken before consent.
@@ -111,10 +107,11 @@ describe('AI receptionist conversation safety contract', () => {
   it('branches only on trusted direction and fails closed for wrong parties and voicemail', () => {
     const prompt = generateSystemPrompt(baseConfig);
 
-    expect(prompt).toMatch(/Use only the provider-supplied call direction/i);
+    expect(prompt).toMatch(/Use only \{\{call_direction\}\}, supplied by CareCommand/i);
     expect(prompt).toMatch(/INBOUND: after explicit consent is recorded, ask how you can help/i);
     expect(prompt).toMatch(/OUTBOUND: after explicit consent is recorded, confirm you reached the intended person/i);
-    expect(prompt).toMatch(/direction is missing, conflicting, or untrusted: do not disclose a purpose or use patient-data tools/i);
+    expect(prompt).toMatch(/anything other than exactly "inbound" or "outbound": do not disclose a purpose or use patient-data tools/i);
+    expect(prompt).toMatch(/do not ask the patient to invent the purpose of a call the clinic placed/i);
     expect(prompt).toMatch(/Wrong party:.*reveal no offer, appointment, care relationship, patient status, or reason for calling/i);
     expect(prompt).toContain('This is Avery, an AI assistant calling for Example Clinic. Please call +12125550100. Goodbye.');
     expect(prompt).toMatch(/Do not collect information, book, transfer, or mark consent from a voicemail interaction/i);

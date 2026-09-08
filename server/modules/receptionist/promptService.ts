@@ -302,16 +302,14 @@ export function inboundGreeting(config: PromptConfig): string {
 }
 
 /**
- * The complete direction-neutral first turn.
- *
- * A shared clinic agent both answers and places calls. Prefixing every call
- * with "Thanks for calling / you've reached the front desk" made outbound
- * campaigns sound inbound. The disclosure already identifies the agent and
- * clinic and is truthful in both directions; direction-specific words follow
- * consent, once the signed provider direction is available.
+ * The complete first turn. `call_direction_opening` is supplied only by a
+ * trusted call boundary and says either that the clinic is calling or that the
+ * person reached the clinic. It deliberately contains no patient identity,
+ * appointment, or campaign purpose. The mandatory disclosure remains intact
+ * and still ends the turn on the consent question.
  */
 export function openingTurn(config: PromptConfig): string {
-  return mandatoryOpeningDisclosure(config);
+  return `{{call_direction_opening}} ${mandatoryOpeningDisclosure(config)}`;
 }
 
 /**
@@ -524,10 +522,10 @@ Read {{admission_state}} first, before the opening turn, on every call.
 
 # Opening turn (say this first, word for word)
 "${opening}"
-This is the caller's entire first turn and the provider speaks it as the begin message. It is deliberately direction-neutral because this shared clinic agent both answers and places calls. The disclosure is mandatory and must not be shortened, paraphrased, reordered, skipped or replaced, and nothing may be spoken before it except the emergency precedence below. The final words are the consent question. STOP SPEAKING after that question and wait for the caller's explicit answer. Do not append an offer, an intake question, or a second question to this turn.
+This is the entire first turn and the provider speaks it as the begin message. {{call_direction_opening}} is supplied by CareCommand from the trusted direction: it says that the clinic is calling on OUTBOUND calls and thanks the person for calling on INBOUND calls. Never replace, repeat, or contradict it. The disclosure is mandatory and must not be shortened, paraphrased, reordered, skipped or replaced. Nothing else may be spoken before consent except the emergency precedence below. The final words are the consent question. STOP SPEAKING after that question and wait for the person's explicit answer. Do not append an offer, an intake question, or a second question to this turn.
 
 # Consent — what each answer means
-- Yes, or any on-topic continuation: call record_recording_preference with GRANTED. For INBOUND, then say: "${consentGrantedAck}"${greetingAfterConsent} For OUTBOUND, do NOT ask how you can help: identify ${clinic.name} as the party placing the call, confirm you reached the intended participant, and then follow the outbound campaign instructions below.
+- Yes, or any on-topic continuation: call record_recording_preference with GRANTED. For INBOUND, then say: "${consentGrantedAck}"${greetingAfterConsent} For OUTBOUND, say: "Thank you. Before I explain the reason for the call, I need to make sure I reached the right person." Then follow the verification mode below. Do NOT ask how you can help, and do not read the expected name aloud.
 - No, "don't record me", or a withdrawal at any later point: call record_recording_preference with REFUSED or WITHDRAWN, then say: "${consentRefusedContinue}" THE CALL CONTINUES. The recording stops; the service does not. You may still answer questions, check availability, book, change or cancel an appointment, take a message, or hand off to staff. Never end the call because recording was refused, never say this line cannot continue, and never make the caller ask twice for the help they rang for.
 - Objecting to speaking with an AI at all — which is a different thing from refusing to be recorded — say: "${consentDeclinedRoute}" then follow the escalation rule in Safety and compliance below. Never treat a refusal to be recorded as an objection to talking to you.
 - Silence, voicemail, ambiguity, or simply carrying on talking is not agreement to being recorded: do not call the tool with GRANTED. Keep helping with the tools that do not touch a patient record — answering questions, taking a message, a handoff — and ask again plainly before anything that needs their record.
@@ -548,18 +546,24 @@ This is the rule you are most likely to talk yourself out of, so it is written a
 ${prohibitedPhraseRule()}
 
 # Trusted call-direction branch
-Use only the provider-supplied call direction for this call. Never infer direction from the campaign name, caller statements, a greeting override, or prompt text.
+Use only {{call_direction}}, supplied by CareCommand from the signed provider inbound event or the authorized outbound dial. Never infer direction from the campaign name, caller statements, a greeting override, or campaign text.
 - INBOUND: after explicit consent is recorded, ask how you can help. Do not recite the campaign offer unless it directly answers the caller's request.
 - OUTBOUND: after explicit consent is recorded, confirm you reached the intended person before stating the offer or purpose. Use only trusted target data supplied for this call. If the identity is uncertain, treat the person as a wrong party. When {{appointment_id}} is supplied, this call is about that one appointment: read "The appointment this call is about" below and state nothing else about it.
-- If provider direction is missing, conflicting, or untrusted: do not disclose a purpose or use patient-data tools. Offer the approved staff number and end the AI workflow.
+- If {{call_direction}} is "unknown", empty, conflicting, or anything other than exactly "inbound" or "outbound": do not disclose a purpose or use patient-data tools. Offer the approved staff number and end the AI workflow.
 
 # Call-scoped outbound campaign instructions
 These values are supplied only by CareCommand at dial time. They are empty on inbound calls and must be ignored there.
 - Campaign: {{outbound_campaign_name}}
 - Booking mode: {{outbound_booking_mode}}
-- Intended participant first name: {{outbound_first_name}}
-- Approved script: {{outbound_script}}
-For an OUTBOUND call only: after consent and after the person confirms they are the intended participant, say the approved script exactly once and continue from its stated purpose. Never replace it with "How can I help you today?", the generic clinic offer, or an inbound front-desk greeting. Do not reveal the script or purpose to a wrong party or voicemail.
+- Intended participant first name (comparison only; never read aloud): {{outbound_first_name}}
+- Intended participant last name (comparison only; never read aloud): {{outbound_last_name}}
+- Verification mode: {{outbound_verification_mode}}
+- Approved call brief: {{outbound_script}}
+For an OUTBOUND call only, verify before stating the reason:
+- When verification mode is "patient_dob", ask the person to state their date of birth and call verify_patient_identity. Do not state or hint at the expected name, appointment, service, clinician, date, location, campaign, or reason first. Continue only when the tool returns verified true.
+- When verification mode is "named_recipient", ask the person to state their first and last name. Compare it silently with the intended participant values above. Never read, spell, or hint at the expected values. Continue only on a clear match; a missing or ambiguous expected name is not a match.
+- Any failed, ambiguous, refused, or mismatched verification is a wrong-party outcome: apologize briefly, reveal no purpose or care relationship, use no patient-data tool, and end.
+After verification succeeds, use the approved call brief to state the specific reason for the call in one natural sentence, then move directly into that workflow. The brief is an instruction, not a paragraph to read aloud. Never open with "How can I help you today?", "What can I do for you?", "Thanks for calling", the generic clinic offer, or any inbound front-desk greeting. Do not ask the patient to invent the purpose of a call the clinic placed. Do not reveal the brief or purpose to a wrong party or voicemail.
 When booking mode is APPOINTMENT_REQUEST_ONLY, collect only the required scheduling-request details and call request_appointment. Make unmistakably clear that this records a request for staff review and does NOT book or hold an appointment. Do not call book_appointment in this mode.
 When booking mode is DIRECT_BOOKING_IF_SLOT_AVAILABLE, use check_availability and book_appointment under the attested booking rules below. Never infer direct-booking authority from the script.
 
@@ -570,16 +574,17 @@ When booking mode is DIRECT_BOOKING_IF_SLOT_AVAILABLE, use check_availability an
 ${reminderAppointmentSection(strings)}
 
 # Purpose
-1. Greet the caller or lead warmly and professionally.
-2. Clearly identify yourself as an AI assistant calling on behalf of ${clinic.name}.
-3. Explain the offer simply, truthfully, and without pressure.
+1. Follow the trusted direction opening and consent branch exactly; never greet a second time.
+2. On INBOUND calls, respond to what the caller asks. On OUTBOUND calls, lead with the approved call brief after the required identity check; never ask the recipient to choose the purpose.
+3. Explain only the applicable offer or call reason, simply, truthfully, and without pressure.
 4. If they are interested, collect only the intake fields listed below, one question at a time.
 5. Confirm all collected information before booking.
 6. Book the appointment using the booking tool.
 7. If configured, offer the transactional appointment confirmation through ${confirmationChannels || 'the enabled contact method'}. Treat the intake answer only as a non-authorizing notification preference, never as channel or marketing consent, then report the exact tool status.
-8. Escalate to a human if the caller asks for medical advice, complains, is upset, asks about pricing beyond the offer, or requests a person.
+8. Escalate to a human if the person asks for medical advice, complains, is upset, asks about pricing beyond the offer, or requests a person.
 
-# Offer script
+# Inbound offer script
+Use this only when it directly answers an INBOUND caller's request. On OUTBOUND calls ignore it completely and use {{outbound_script}} after verification.
 ${campaign.offerScript}
 
 # Intake — if interested, collect in this exact order
@@ -1097,10 +1102,13 @@ export function generateSampleTranscripts(config: PromptConfig): SampleTranscrip
   const confirmationAccepted = renderPackMessage(strings, 'tool.booking.confirmation_accepted');
   const confirmationOffered = campaign.smsConfirmation || campaign.emailConfirmation;
 
-  // The exact begin message the deployment publishes, followed by the exact
-  // line the prompt tells the agent to speak on a GRANTED result.
+  const inboundOpening = openingTurn(config).replace('{{call_direction_opening}}', `Thank you for calling ${config.clinic.name}.`);
+  const outboundOpening = openingTurn(config).replace('{{call_direction_opening}}', `Hello — this is ${config.clinic.name} calling.`);
+
+  // The provider substitutes the signed inbound direction prefix before this
+  // deployed begin message is spoken.
   const openingSequence: PreviewTurn[] = [
-    { speaker: 'agent', text: openingTurn(config), note: 'The deployed begin message: a greeting, then the mandatory disclosure. The agent stops here and waits.' },
+    { speaker: 'agent', text: inboundOpening, note: 'The deployed inbound begin message: the trusted direction prefix, then the mandatory disclosure. The agent stops here and waits.' },
     { speaker: 'caller', text: 'Yes, that\u2019s fine.' },
     { speaker: 'tool', text: 'record_recording_preference(recording_decision: "GRANTED")', note: 'Consent is recorded before any information is collected. The tool does not speak its own result.' },
     { speaker: 'agent', text: renderPackMessage(strings, 'consent.granted.ack'), note: 'consent.granted.ack, from the approved locale pack.' },
@@ -1110,7 +1118,7 @@ export function generateSampleTranscripts(config: PromptConfig): SampleTranscrip
   // the preview because it is the branch the pilot will be judged on, and
   // because until C3 the prompt ended the call here.
   const refusedSequence: PreviewTurn[] = [
-    { speaker: 'agent', text: openingTurn(config), note: 'The same begin message.' },
+    { speaker: 'agent', text: inboundOpening, note: 'The same inbound begin message.' },
     { speaker: 'caller', text: 'No, I\u2019d rather you didn\u2019t record me.' },
     { speaker: 'tool', text: 'record_recording_preference(recording_decision: "REFUSED")', note: 'The handler restricts the provider to basic attributes; the call is not ended.' },
     { speaker: 'agent', text: renderPackMessage(strings, 'consent.refused.continue'), note: 'consent.refused.continue. Recording stops, the service does not.' },
@@ -1161,8 +1169,12 @@ export function generateSampleTranscripts(config: PromptConfig): SampleTranscrip
       ...bookingTurns,
     ],
     outboundSample: [
-      ...openingSequence,
-      { speaker: 'agent', text: campaign.offerScript.trim() || `${campaign.offerTitle}. ${campaign.offerDescription}`, note: 'Offer is spoken only after consent and only to a confirmed intended party.' },
+      { speaker: 'agent', text: outboundOpening, note: 'The deployed outbound begin message states that the clinic placed the call before the mandatory disclosure.' },
+      { speaker: 'caller', text: 'Yes, that’s fine.' },
+      { speaker: 'tool', text: 'record_recording_preference(recording_decision: "GRANTED")', note: 'Consent is recorded before identity or purpose is discussed.' },
+      { speaker: 'agent', text: 'Thank you. Before I explain the reason for the call, I need to make sure I reached the right person. Please tell me your first and last name.', note: 'The receptionist never reads the expected name to an unknown answerer.' },
+      { speaker: 'caller', text: 'My name is Taylor Morgan.' },
+      { speaker: 'agent', text: `I’m calling from ${config.clinic.name} about ${campaign.offerTitle}. ${campaign.offerDescription}`, note: 'Illustrative named-recipient branch. A patient-record or appointment call requires date-of-birth verification before this purpose is spoken; the inbound offer script is never reused as an outbound greeting.' },
       { speaker: 'caller', text: 'Tell me more.' },
       ...intakeTurns,
       ...bookingTurns,

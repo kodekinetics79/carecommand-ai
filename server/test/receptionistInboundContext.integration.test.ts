@@ -154,6 +154,8 @@ describe('C2 — call_inbound resolves the values the prompt reads', () => {
     expect(variables.is_open_now).toBe('true');
     expect(variables.hours_today.length).toBeGreaterThan(0);
     expect(variables.emergency_number).toBe('911');
+    expect(variables.call_direction).toBe('inbound');
+    expect(variables.call_direction_opening).toBe('Thank you for calling Brightsmile.');
   });
 
   it('names the location the caller reached and the human they can be sent to', async () => {

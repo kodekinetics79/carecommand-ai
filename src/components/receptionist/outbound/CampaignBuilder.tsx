@@ -4,7 +4,7 @@ import { Field, TextInput, TextArea, Select } from '../../ui/Field';
 import { receptionistApi as api, OUTBOUND_REQUIRED_FIELDS, validateOutboundQuietHours, type Agent, type Campaign, type OutboundRequiredField, type OutboundBookingMode, type OutboundCampaignInput, type Location } from '../../../lib/receptionist';
 import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { MutationNotice } from '../MutationNotice';
-import { EMPTY_CAMPAIGN, toOutboundCampaignPayload } from './campaignPayload';
+import { bookingAuthorityCallBrief, EMPTY_CAMPAIGN, recommendedCallBrief, toOutboundCampaignPayload } from './campaignPayload';
 
 function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField[]; onChange: (next: OutboundRequiredField[]) => void }) {
   return (
@@ -50,8 +50,8 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
           </Select>
         </Field>
       )}
-      <Field label="Call script" required hint="What the agent should say. Keep it scheduling-focused — the AI must not give medical advice.">
-        <TextArea rows={4} disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Hi, this is {{agent_name}} calling from {{clinic_name}}..." />
+      <Field label="Reason and goal for the call" required hint="CareCommand handles the outbound opening, AI disclosure, and identity check. Describe why the clinic is calling and the outcome you want; do not write an inbound greeting.">
+        <TextArea aria-label="Reason and goal for the call" rows={5} disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Explain why the clinic is calling, then describe the approved next step." />
       </Field>
       <Field label="Required fields to collect" hint="The agent will route to staff review if any of these are missing.">
         {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
@@ -80,7 +80,7 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
               agentId: authority?.agentId ?? null,
               defaultService: authority?.appointmentType ?? null,
               defaultBranchId: eligibleLocation?.branchId ?? null,
-              script: authority?.offerScript ?? form.script,
+              script: authority ? bookingAuthorityCallBrief(authority) : form.script,
             });
           }}>
             <option value="">Select active attested campaign</option>
@@ -90,7 +90,14 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
       )}
       <div className="grid gap-3 sm:grid-cols-3">
         <Field label="Call purpose" required>
-          <Select aria-label="Call purpose" value={form.purpose ?? ''} onChange={e => set({ purpose: e.target.value as OutboundCampaignInput['purpose'] })}>
+          <Select aria-label="Call purpose" value={form.purpose ?? ''} onChange={e => {
+            const nextPurpose = e.target.value as NonNullable<OutboundCampaignInput['purpose']>;
+            const currentDefault = recommendedCallBrief(form.purpose);
+            set({
+              purpose: nextPurpose,
+              ...(form.script.trim() === '' || form.script === currentDefault ? { script: recommendedCallBrief(nextPurpose) } : {}),
+            });
+          }}>
             <option value="CARE_COORDINATION">Care coordination</option>
             <option value="APPOINTMENT_REMINDER">Appointment reminder</option>
             <option value="PATIENT_REACTIVATION">Patient reactivation</option>
@@ -132,7 +139,7 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, 
 }
 
 export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timezone, initialPurpose = 'CARE_COORDINATION', onSaved, onCancel }: { clinicId: string; bookingAuthorities: Campaign[]; locations: Location[]; timezone: string; initialPurpose?: NonNullable<OutboundCampaignInput['purpose']>; onSaved: (id: string) => void; onCancel: () => void }) {
-  const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId, purpose: initialPurpose });
+  const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId, purpose: initialPurpose, script: recommendedCallBrief(initialPurpose) });
   // The voice agent that will place these calls.
   //
   // This form never collected one, so every campaign it created was born with

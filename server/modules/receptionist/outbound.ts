@@ -42,6 +42,7 @@ import {
   maskPhone,
   maskProviderId,
 } from '../../lib/receptionist/liveCallUat';
+import { promptText } from '../../lib/receptionist/promptSafety';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
@@ -56,6 +57,7 @@ const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as con
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
+const INBOUND_STYLE_OUTBOUND_BRIEF = /\b(?:thanks?\s+for\s+calling|how\s+can\s+i\s+help|what\s+can\s+i\s+(?:do|help)|you(?:'|’)ve\s+reached|welcome\s+to\s+(?:our|the)\s+(?:clinic|office|practice|scheduling|front\s+desk))\b/i;
 // How many upcoming appointments a target candidate offers to bind to. A
 // reminder is about the next visit or two; a longer list is a picker nobody
 // reads and a bigger disclosure of a patient's diary than the job needs.
@@ -765,7 +767,9 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     agentId: optionalUuid,
     receptionistCampaignId: optionalUuid,
     name: z.string().trim().min(2).max(160),
-    script: z.string().trim().min(2).max(4000),
+    script: promptText(4000)
+      .refine(value => value.length >= 2, { message: 'Describe the reason and goal for the outbound call.' })
+      .refine(value => !INBOUND_STYLE_OUTBOUND_BRIEF.test(value), { message: 'Write an outbound reason and goal, not an inbound greeting such as “How can I help?” or “Thanks for calling.”' }),
     purpose: optionalEnum(OUTBOUND_PURPOSES),
     legalBasis: optionalEnum(OUTBOUND_LEGAL_BASES),
     policyVersion: optionalText(80, 3),
@@ -2318,6 +2322,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?${callWebhookQuery.toString()}`,
       dynamicVariables: {
         ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
+        call_direction: 'outbound',
+        call_direction_opening: `Hello — this is ${campaign.clinic.name} calling.`,
         // This patient's own appointment, in the BRANCH's timezone and this
         // call's locale format. Every key is present on every call: an unbound
         // target sends empty strings, exactly like the optional variables
@@ -2344,11 +2350,13 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         consent_text: campaign.consentText ?? '',
         human_handoff: campaign.humanHandoffInstruction ?? '',
         outbound_script: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
-          ? authorizedCampaign.receptionistCampaign!.offerScript
+          ? `Explain that ${campaign.clinic.name} is calling to help with ${authorizedCampaign.receptionistCampaign!.appointmentType}. Use this approved scope: ${authorizedCampaign.receptionistCampaign!.offerDescription} Help with the linked booking workflow, and route clinical questions to staff.`
           : campaign.script,
         outbound_campaign_name: campaign.name,
         outbound_booking_mode: campaign.bookingMode,
         outbound_first_name: dialIdentity.firstName ?? '',
+        outbound_last_name: dialIdentity.lastName ?? '',
+        outbound_verification_mode: target?.patientId ? 'patient_dob' : 'named_recipient',
         required_fields: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
           ? ''
           : campaign.requiredFields.join(', '),

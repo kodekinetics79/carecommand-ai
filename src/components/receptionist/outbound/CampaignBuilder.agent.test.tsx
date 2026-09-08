@@ -8,6 +8,7 @@ vi.mock('../../../lib/api', async () => {
 });
 
 import { CampaignBuilder } from './CampaignBuilder';
+import { recommendedCallBrief } from './campaignPayload';
 
 /**
  * This form never asked which receptionist places the calls, so every campaign
@@ -63,6 +64,17 @@ describe('a campaign is created with a receptionist attached', () => {
     );
     expect(screen.getByRole('heading', { name: 'New appointment follow-up list' })).toBeInTheDocument();
     expect((screen.getByLabelText('Call purpose') as HTMLSelectElement).value).toBe('APPOINTMENT_REMINDER');
+    expect(screen.getByLabelText('Reason and goal for the call')).toHaveValue(recommendedCallBrief('APPOINTMENT_REMINDER'));
+  });
+
+  it('starts with a safe outbound brief and updates an untouched brief with the purpose', async () => {
+    renderBuilder();
+    const brief = screen.getByLabelText('Reason and goal for the call');
+    expect(brief).toHaveValue(recommendedCallBrief('CARE_COORDINATION'));
+    expect(brief).not.toHaveValue(expect.stringMatching(/how can I help|thanks for calling/i));
+
+    fireEvent.change(screen.getByLabelText('Call purpose'), { target: { value: 'PATIENT_REACTIVATION' } });
+    expect(brief).toHaveValue(recommendedCallBrief('PATIENT_REACTIVATION'));
   });
 
   it('sends the clinic’s only published receptionist without asking', async () => {

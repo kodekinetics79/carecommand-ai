@@ -21,6 +21,12 @@
 
 /** Name + the value Retell falls back to when it has nothing to substitute. */
 export const RUNTIME_DYNAMIC_VARIABLES = [
+  // Direction is established only by a trusted boundary: the signed Retell
+  // inbound webhook or CareCommand's own outbound dial. The spoken prefix
+  // makes the very first sentence unambiguous without exposing the campaign
+  // purpose or patient identity before consent and intended-party checks.
+  { name: 'call_direction', default: 'unknown' },
+  { name: 'call_direction_opening', default: '' },
   { name: 'is_open_now', default: 'unknown' },
   { name: 'hours_today', default: '' },
   { name: 'next_opening', default: '' },
@@ -49,6 +55,8 @@ export const RUNTIME_DYNAMIC_VARIABLES = [
   { name: 'outbound_campaign_name', default: '' },
   { name: 'outbound_booking_mode', default: '' },
   { name: 'outbound_first_name', default: '' },
+  { name: 'outbound_last_name', default: '' },
+  { name: 'outbound_verification_mode', default: '' },
 ] as const;
 
 export type RuntimeDynamicVariable = (typeof RUNTIME_DYNAMIC_VARIABLES)[number]['name'];
