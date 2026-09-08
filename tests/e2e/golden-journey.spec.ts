@@ -49,7 +49,12 @@ async function seedGoldenData(projectName: string): Promise<GoldenData> {
   await db.tenantSubscription.create({ data: { tenantId, planId: plan.id, status: 'ACTIVE', startedAt: new Date() } });
   await recomputeEntitlements(tenantId, db);
 
-  const branch = await db.branch.create({ data: { tenantId, name: 'Main Clinic', location: 'Validation Suite' } });
+  // Keep the fixture's explicit clinic calendar aligned with tomorrowISO().
+  // Relying on Branch's Europe/London default made this journey cross a date
+  // boundary during BST: it booked the clinic's today, then opened Tomorrow.
+  const branch = await db.branch.create({
+    data: { tenantId, name: 'Main Clinic', location: 'Validation Suite', timezone: 'UTC' },
+  });
   const staff = await db.user.create({
     data: {
       tenantId,

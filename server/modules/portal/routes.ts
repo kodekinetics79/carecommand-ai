@@ -330,7 +330,17 @@ export const portalRoutes: FastifyPluginAsync = async app => {
         }
         const changed = await tx.appointment.updateMany({
           where: { id, tenantId, patientId, status: appt.status, deletedAt: null },
-          data: { startsAt: body.startsAt, endsAt, service: service.name, serviceCatalogItemId: service.id },
+          data: {
+            startsAt: body.startsAt,
+            endsAt,
+            service: service.name,
+            serviceCatalogItemId: service.id,
+            // Confirmation evidence is scoped to the old time. The patient
+            // must confirm the newly selected appointment independently.
+            patientConfirmedAt: null,
+            patientConfirmationSource: null,
+            patientConfirmedCallLogId: null,
+          },
         });
         if (changed.count !== 1) return { conflict: 'already_booked' as const };
         const appointment = await tx.appointment.findUniqueOrThrow({ where: { id }, select: { id: true, service: true, startsAt: true, endsAt: true, status: true, providerProfileId: true, branch: { select: { name: true, timezone: true } }, providerProfile: { select: { user: { select: { displayName: true } } } } } });

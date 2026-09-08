@@ -4,6 +4,7 @@ import { getTenantContext, runWithJobTenantContext, runWithTenantContext } from 
 import { isChannelSuppressedTx, lockSuppressionFences } from './dncFence';
 import { channelStatus } from '../campaigns';
 import { env } from '../../config/env';
+import { communicationQuietHoursDecision, getSchedulingPolicy } from '../scheduling';
 
 export const CONFIRMATION_OUTBOX_SOURCE = 'receptionist.appointment_confirmation';
 
@@ -172,9 +173,9 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       return { sent: false, status: 'dead_lettered', acceptedNow: false };
     }
     const attemptNumber = event.attempts + 1;
-    await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
     const appointment = event.appointment;
     if (!appointment || appointment.deletedAt || appointment.status !== 'CONFIRMED' || appointment.patient.deletedAt) {
+      await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
       await appendAttempt(tx, {
         tenantId, eventId, attemptNumber, status: 'suppressed', failureCode: 'appointment_not_confirmed', completed: true,
       });
@@ -186,6 +187,7 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
     }
     const destination = event.channel === 'sms' ? appointment.patient.phone : appointment.patient.email;
     if (!destination) {
+      await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
       await appendAttempt(tx, {
         tenantId, eventId, attemptNumber, status: 'dead_lettered', failureCode: 'destination_unavailable', completed: true,
       });
@@ -195,6 +197,40 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       });
       return { sent: false, status: 'destination_unavailable', acceptedNow: false };
     }
+    const policy = await getSchedulingPolicy(tenantId, tx);
+    const quietHours = communicationQuietHoursDecision(
+      new Date(),
+      policy.communicationQuietHoursStart,
+      policy.communicationQuietHoursEnd,
+      appointment.branch.timezone,
+    );
+    if (quietHours.quiet) {
+      if (quietHours.nextAllowedAt && quietHours.nextAllowedAt < appointment.startsAt) {
+        // Pending rows may change only their schedule. No attempt is consumed
+        // until a provider-boundary claim actually begins.
+        await tx.notificationEvent.updateMany({
+          where: { id: eventId, tenantId, status: event.status, attempts: event.attempts },
+          data: { nextAttemptAt: quietHours.nextAllowedAt },
+        });
+        return { sent: false, status: 'quiet_hours', acceptedNow: false };
+      }
+      const status = quietHours.reason === 'quiet_hours_invalid' ? 'dead_lettered' : 'suppressed';
+      const failureCode = quietHours.reason === 'quiet_hours_invalid' ? 'quiet_hours_invalid' : 'confirmation_window_closed';
+      await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
+      await appendAttempt(tx, { tenantId, eventId, attemptNumber, status, failureCode, completed: true });
+      await tx.notificationEvent.updateMany({
+        where: { id: eventId, tenantId, status: event.status, attempts: event.attempts },
+        data: {
+          status,
+          attempts: attemptNumber,
+          failureReason: failureCode,
+          nextAttemptAt: null,
+          deadLetteredAt: status === 'dead_lettered' ? new Date() : null,
+        },
+      });
+      return { sent: false, status, acceptedNow: false };
+    }
+    await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
     const claimed = await tx.notificationEvent.updateMany({
       where: { id: eventId, tenantId, status: { in: ['queued', 'failed'] }, attempts: event.attempts },
       data: { status: 'retrying', attempts: attemptNumber, failureReason: null, nextAttemptAt: null },
@@ -226,10 +262,46 @@ async function commitConfirmationProviderIntent(
     await confirmationBoundaryTestHook?.('suppression_fence_acquired');
     const current = await tx.notificationEvent.findFirst({
       where: { id: claim.eventId, tenantId: claim.tenantId },
-      select: { status: true, attempts: true },
+      select: {
+        status: true,
+        attempts: true,
+        appointment: { select: { startsAt: true, branch: { select: { timezone: true } } } },
+      },
     });
     if (!current || current.status !== 'retrying' || current.attempts !== claim.attemptNumber) {
       return { sent: false, status: current?.status ?? 'outbox_unavailable', acceptedNow: false };
+    }
+    const policy = await getSchedulingPolicy(claim.tenantId, tx);
+    const quietHours = communicationQuietHoursDecision(
+      new Date(),
+      policy.communicationQuietHoursStart,
+      policy.communicationQuietHoursEnd,
+      current.appointment?.branch.timezone ?? '',
+    );
+    if (quietHours.quiet) {
+      const canRetry = quietHours.nextAllowedAt && current.appointment && quietHours.nextAllowedAt < current.appointment.startsAt;
+      const status = canRetry ? 'failed' : quietHours.reason === 'quiet_hours_invalid' ? 'dead_lettered' : 'suppressed';
+      const failureCode = canRetry ? 'quiet_hours' : quietHours.reason === 'quiet_hours_invalid' ? 'quiet_hours_invalid' : 'confirmation_window_closed';
+      await appendAttempt(tx, {
+        tenantId: claim.tenantId,
+        eventId: claim.eventId,
+        attemptNumber: claim.attemptNumber,
+        status,
+        provider: 'quiet_hours_gate',
+        failureCode,
+        completed: true,
+      });
+      await tx.notificationEvent.updateMany({
+        where: { id: claim.eventId, tenantId: claim.tenantId, status: 'retrying', attempts: claim.attemptNumber },
+        data: {
+          status,
+          provider: 'quiet_hours_gate',
+          failureReason: failureCode,
+          nextAttemptAt: canRetry ? quietHours.nextAllowedAt : null,
+          deadLetteredAt: status === 'dead_lettered' ? new Date() : null,
+        },
+      });
+      return { sent: false, status, acceptedNow: false };
     }
     if (await isChannelSuppressedTx(tx, {
       tenantId: claim.tenantId,

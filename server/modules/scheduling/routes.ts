@@ -63,6 +63,14 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
       minNoticeHours: z.number().int().min(0).max(720).optional(),
       confirmBookingsBySms: z.boolean().optional(),
       confirmBookingsByEmail: z.boolean().optional(),
+      communicationQuietHoursStart: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).optional(),
+      communicationQuietHoursEnd: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).optional(),
+    }).refine(input => (input.communicationQuietHoursStart === undefined) === (input.communicationQuietHoursEnd === undefined), {
+      message: 'Communication quiet-hours start and end must be updated together',
+      path: ['communicationQuietHoursEnd'],
+    }).refine(input => !input.communicationQuietHoursStart || input.communicationQuietHoursStart !== input.communicationQuietHoursEnd, {
+      message: 'Communication quiet-hours start and end must differ',
+      path: ['communicationQuietHoursEnd'],
     }).parse(request.body);
     await db.schedulingPolicy.upsert({
       where: { tenantId: request.auth.tenantId },

@@ -886,7 +886,20 @@ export async function rescheduleAppointment(ctx: ToolContext, args: Record<strin
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-reschedule:${ctx.tenantId}:${appointmentId}`})::bigint)`;
       const conflict = await findSlotConflict({ tenantId: ctx.tenantId, providerProfileId: appt.providerProfileId!, startsAt, durationMin: service.durationMin, excludeAppointmentId: appointmentId }, tx);
       if (conflict) return { conflict } as const;
-      const changed = await tx.appointment.updateMany({ where: { id: appointmentId, tenantId: ctx.tenantId, patientId, status: appt.status, deletedAt: null }, data: { startsAt, endsAt, service: service.name, serviceCatalogItemId: service.id } });
+      const changed = await tx.appointment.updateMany({
+        where: { id: appointmentId, tenantId: ctx.tenantId, patientId, status: appt.status, deletedAt: null },
+        data: {
+          startsAt,
+          endsAt,
+          service: service.name,
+          serviceCatalogItemId: service.id,
+          // The call confirmed the change, not attendance at the new time.
+          // Discard confirmation evidence tied to the previous appointment.
+          patientConfirmedAt: null,
+          patientConfirmationSource: null,
+          patientConfirmedCallLogId: null,
+        },
+      });
       if (changed.count !== 1) return { conflict: 'already_booked' as const };
       await tx.auditEvent.create({ data: { tenantId: ctx.tenantId, actorUserId: null, action: 'receptionist.appointment.rescheduled', resource: 'appointment', resourceId: appointmentId, userAgent: 'retell-webhook', metadata: { startsAt: startsAt.toISOString(), via: 'verified_live_call' } } });
       await tx.businessEvent.create({ data: { tenantId: ctx.tenantId, eventType: 'appointment.rescheduled', entityType: 'appointment', entityId: appointmentId, sourceModule: 'receptionist', payload: { startsAt: startsAt.toISOString() } } });

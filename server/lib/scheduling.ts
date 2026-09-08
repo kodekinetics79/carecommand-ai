@@ -16,6 +16,8 @@ export interface SchedulingPolicy {
   /** Confirm appointments a human books. Opt-in; see the migration for why. */
   confirmBookingsBySms: boolean;
   confirmBookingsByEmail: boolean;
+  communicationQuietHoursStart: string;
+  communicationQuietHoursEnd: string;
 }
 
 export const DEFAULT_SCHEDULING_POLICY: SchedulingPolicy = {
@@ -26,6 +28,8 @@ export const DEFAULT_SCHEDULING_POLICY: SchedulingPolicy = {
   minNoticeHours: 0,
   confirmBookingsBySms: false,
   confirmBookingsByEmail: false,
+  communicationQuietHoursStart: '20:00',
+  communicationQuietHoursEnd: '08:00',
 };
 
 type Client = typeof db | Prisma.TransactionClient;
@@ -41,7 +45,88 @@ export async function getSchedulingPolicy(tenantId: string, client: Client = db)
     minNoticeHours: row.minNoticeHours,
     confirmBookingsBySms: row.confirmBookingsBySms,
     confirmBookingsByEmail: row.confirmBookingsByEmail,
+    communicationQuietHoursStart: row.communicationQuietHoursStart,
+    communicationQuietHoursEnd: row.communicationQuietHoursEnd,
   };
+}
+
+const HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+function quietMinute(value: string): number | null {
+  if (!HH_MM.test(value)) return null;
+  const [hour, minute] = value.split(':').map(Number);
+  return hour * 60 + minute;
+}
+
+function addLocalDays(dateISO: string, days: number): string {
+  const parsed = parseDateISO(dateISO);
+  const next = new Date(Date.UTC(parsed.year, parsed.month - 1, parsed.day + days));
+  return next.toISOString().slice(0, 10);
+}
+
+export type CommunicationQuietHoursDecision =
+  | { quiet: false; nextAllowedAt: null; reason: null }
+  | { quiet: true; nextAllowedAt: Date | null; reason: 'quiet_hours' | 'quiet_hours_invalid' };
+
+/**
+ * Evaluate clinic-local quiet hours and find the first legal UTC instant.
+ * DST gaps advance to the first representable local minute; DST folds are
+ * resolved by scanning forward from `now` when the earlier occurrence has
+ * already passed. Invalid configuration fails closed.
+ */
+export function communicationQuietHoursDecision(
+  now: Date,
+  start: string,
+  end: string,
+  timezone: string,
+): CommunicationQuietHoursDecision {
+  const startMinute = quietMinute(start);
+  const endMinute = quietMinute(end);
+  if (startMinute === null || endMinute === null || startMinute === endMinute) {
+    return { quiet: true, nextAllowedAt: null, reason: 'quiet_hours_invalid' };
+  }
+  let local: LocalParts;
+  try {
+    validateIanaTimezone(timezone);
+    local = partsAt(now, timezone);
+  } catch {
+    return { quiet: true, nextAllowedAt: null, reason: 'quiet_hours_invalid' };
+  }
+  const quiet = startMinute < endMinute
+    ? local.minuteOfDay >= startMinute && local.minuteOfDay < endMinute
+    : local.minuteOfDay >= startMinute || local.minuteOfDay < endMinute;
+  if (!quiet) return { quiet: false, nextAllowedAt: null, reason: null };
+
+  const endDate = startMinute > endMinute && local.minuteOfDay >= startMinute
+    ? addLocalDays(local.dateISO, 1)
+    : local.dateISO;
+  const exactEnd = clinicLocalMinuteToUtc(endDate, endMinute, timezone);
+  if (exactEnd && exactEnd > now) return { quiet: true, nextAllowedAt: exactEnd, reason: 'quiet_hours' };
+
+  // If the canonical end is already in the past, `now` is in the second
+  // occurrence of a DST fold. Scan UTC forward until the repeated local window
+  // really ends instead of jumping to the next ordinary wall-clock hour.
+  if (exactEnd) {
+    for (let offset = 1; offset <= 180; offset += 1) {
+      const candidate = new Date(now.getTime() + offset * 60_000);
+      const candidateLocal = partsAt(candidate, timezone);
+      const stillQuiet = startMinute < endMinute
+        ? candidateLocal.minuteOfDay >= startMinute && candidateLocal.minuteOfDay < endMinute
+        : candidateLocal.minuteOfDay >= startMinute || candidateLocal.minuteOfDay < endMinute;
+      if (!stillQuiet) return { quiet: true, nextAllowedAt: candidate, reason: 'quiet_hours' };
+    }
+    return { quiet: true, nextAllowedAt: null, reason: 'quiet_hours_invalid' };
+  }
+
+  // The configured end falls in a DST gap. Walk the local clock forward to the
+  // first representable minute; this is bounded well beyond real DST gaps.
+  for (let offset = 1; offset <= 180; offset += 1) {
+    const absoluteMinute = endMinute + offset;
+    const candidateDate = addLocalDays(endDate, Math.floor(absoluteMinute / 1440));
+    const candidate = clinicLocalMinuteToUtc(candidateDate, absoluteMinute % 1440, timezone);
+    if (candidate && candidate > now) return { quiet: true, nextAllowedAt: candidate, reason: 'quiet_hours' };
+  }
+  return { quiet: true, nextAllowedAt: null, reason: 'quiet_hours_invalid' };
 }
 
 export type PreVisitRequirement = 'eligibility' | 'intake';
