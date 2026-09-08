@@ -1,12 +1,19 @@
 import type { Prisma } from '../../generated/prisma/client';
 import { sendAuthorizedAppointmentConfirmation, type SendResult } from '../commsProvider';
 import { getTenantContext, runWithJobTenantContext, runWithTenantContext } from '../tenantContext';
-import { isChannelSuppressedTx, lockSuppressionFences } from './dncFence';
+import { canonicalDncDestination, isChannelSuppressedTx, lockSuppressionFences } from './dncFence';
 import { channelStatus } from '../campaigns';
 import { env } from '../../config/env';
 import { communicationQuietHoursDecision, getSchedulingPolicy } from '../scheduling';
+import {
+  APPOINTMENT_REMINDER_OUTBOX_SOURCE,
+  appointmentSmsAutomationReadiness,
+  lockAppointmentCommunication,
+} from '../appointmentCommunicationPlans';
 
 export const CONFIRMATION_OUTBOX_SOURCE = 'receptionist.appointment_confirmation';
+const APPOINTMENT_NOTIFICATION_SOURCES = [CONFIRMATION_OUTBOX_SOURCE, APPOINTMENT_REMINDER_OUTBOX_SOURCE] as const;
+type AppointmentNotificationSource = typeof APPOINTMENT_NOTIFICATION_SOURCES[number];
 
 // The same provider status `sendAuthorizedAppointmentConfirmation` consults,
 // read ahead of time so a campaign cannot enable a confirmation the platform
@@ -108,18 +115,24 @@ type ClaimedConfirmation = {
   service: string;
   startsAt: Date;
   timezone: string;
+  source: AppointmentNotificationSource;
+  actionId: string | null;
 };
 
 async function claimConfirmation(tenantId: string, eventId: string): Promise<ClaimedConfirmation | ConfirmationDispatch> {
   return runWithTenantContext(tenantId, async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-confirmation:${tenantId}:${eventId}`})::bigint)`;
     const event = await tx.notificationEvent.findFirst({
-      where: { id: eventId, tenantId, source: CONFIRMATION_OUTBOX_SOURCE },
+      where: { id: eventId, tenantId, source: { in: [...APPOINTMENT_NOTIFICATION_SOURCES] } },
       include: {
         appointment: { select: {
           id: true, status: true, deletedAt: true, service: true, startsAt: true,
           branch: { select: { timezone: true } },
           patient: { select: { id: true, firstName: true, phone: true, email: true, deletedAt: true } },
+        } },
+        appointmentCommunicationAction: { select: {
+          id: true, status: true, appointmentVersion: true, planRevision: true, planId: true,
+          plan: { select: { revision: true, appointmentVersion: true, mode: true, status: true } },
         } },
       },
     });
@@ -174,7 +187,10 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
     }
     const attemptNumber = event.attempts + 1;
     const appointment = event.appointment;
-    if (!appointment || appointment.deletedAt || appointment.status !== 'CONFIRMED' || appointment.patient.deletedAt) {
+    const statusEligible = event.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE
+      ? Boolean(appointment && ['CONFIRMED', 'RISKY'].includes(appointment.status))
+      : appointment?.status === 'CONFIRMED';
+    if (!appointment || appointment.deletedAt || !statusEligible || appointment.patient.deletedAt) {
       await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
       await appendAttempt(tx, {
         tenantId, eventId, attemptNumber, status: 'suppressed', failureCode: 'appointment_not_confirmed', completed: true,
@@ -183,6 +199,11 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
         where: { id: eventId, tenantId },
         data: { status: 'suppressed', attempts: attemptNumber, failureReason: 'appointment_not_confirmed', nextAttemptAt: null },
       });
+      if (event.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE && event.appointmentCommunicationAction) {
+        await tx.appointmentCommunicationAction.update({
+          where: { id: event.appointmentCommunicationAction.id }, data: { status: 'CANCELLED' },
+        });
+      }
       return { sent: false, status: 'suppressed', acceptedNow: false };
     }
     const destination = event.channel === 'sms' ? appointment.patient.phone : appointment.patient.email;
@@ -195,6 +216,14 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
         where: { id: eventId, tenantId },
         data: { status: 'dead_lettered', attempts: attemptNumber, failureReason: 'destination_unavailable', nextAttemptAt: null, deadLetteredAt: new Date() },
       });
+      if (event.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE && event.appointmentCommunicationAction) {
+        await tx.appointmentCommunicationAction.update({
+          where: { id: event.appointmentCommunicationAction.id }, data: { status: 'BLOCKED_SETUP' },
+        });
+        await tx.appointmentCommunicationPlan.update({
+          where: { id: event.appointmentCommunicationAction.planId }, data: { status: 'BLOCKED_SETUP' },
+        });
+      }
       return { sent: false, status: 'destination_unavailable', acceptedNow: false };
     }
     const policy = await getSchedulingPolicy(tenantId, tx);
@@ -228,6 +257,12 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
           deadLetteredAt: status === 'dead_lettered' ? new Date() : null,
         },
       });
+      if (event.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE && event.appointmentCommunicationAction) {
+        await tx.appointmentCommunicationAction.update({
+          where: { id: event.appointmentCommunicationAction.id },
+          data: { status: status === 'suppressed' ? 'SUPPRESSED' : 'FAILED' },
+        });
+      }
       return { sent: false, status, acceptedNow: false };
     }
     await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
@@ -236,6 +271,12 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       data: { status: 'retrying', attempts: attemptNumber, failureReason: null, nextAttemptAt: null },
     });
     if (claimed.count !== 1) throw new Error('confirmation_claim_lost');
+    if (event.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE && event.appointmentCommunicationAction) {
+      await tx.appointmentCommunicationAction.updateMany({
+        where: { id: event.appointmentCommunicationAction.id, tenantId, status: { in: ['FAILED', 'BLOCKED_SETUP'] } },
+        data: { status: 'QUEUED' },
+      });
+    }
     return {
       eventId, tenantId, appointmentId: appointment.id, patientId: appointment.patient.id,
       channel: event.channel, idempotencyKey: event.idempotencyKey!, attemptNumber,
@@ -245,6 +286,8 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       // appointment purpose plus the final shared suppression/DNC fence.
       consentEvidence: 'not_suppressed_transactional',
       service: appointment.service, startsAt: appointment.startsAt, timezone: appointment.branch.timezone,
+      source: event.source as AppointmentNotificationSource,
+      actionId: event.appointmentCommunicationAction?.id ?? null,
     };
   });
 }
@@ -253,6 +296,11 @@ async function commitConfirmationProviderIntent(
   claim: ClaimedConfirmation,
 ): Promise<ConfirmationDispatch | null> {
   return runWithTenantContext(claim.tenantId, async tx => {
+    if (claim.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE) {
+      // Reschedule/cancel/plan updates take this exact lock. Whichever commits
+      // first defines whether this version may cross the provider boundary.
+      await lockAppointmentCommunication(tx, claim.tenantId, claim.appointmentId);
+    }
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-confirmation:${claim.tenantId}:${claim.eventId}`})::bigint)`;
     await lockSuppressionFences(tx, {
       tenantId: claim.tenantId,
@@ -263,13 +311,78 @@ async function commitConfirmationProviderIntent(
     const current = await tx.notificationEvent.findFirst({
       where: { id: claim.eventId, tenantId: claim.tenantId },
       select: {
+        source: true,
         status: true,
         attempts: true,
-        appointment: { select: { startsAt: true, branch: { select: { timezone: true } } } },
+        appointment: { select: {
+          id: true, version: true, status: true, deletedAt: true, startsAt: true,
+          patient: { select: { id: true, phone: true, deletedAt: true } },
+          branch: { select: { timezone: true } },
+        } },
+        appointmentCommunicationAction: { select: {
+          id: true, status: true, appointmentVersion: true, planRevision: true, planId: true,
+          plan: { select: { revision: true, appointmentVersion: true, mode: true, status: true } },
+        } },
       },
     });
     if (!current || current.status !== 'retrying' || current.attempts !== claim.attemptNumber) {
       return { sent: false, status: current?.status ?? 'outbox_unavailable', acceptedNow: false };
+    }
+    if (claim.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE) {
+      const appointment = current.appointment;
+      const action = current.appointmentCommunicationAction;
+      const currentPhone = canonicalDncDestination(appointment?.patient.phone ?? '');
+      const claimedPhone = canonicalDncDestination(claim.destination);
+      const currentVersion = Boolean(
+        appointment && !appointment.deletedAt && !appointment.patient.deletedAt
+        && ['CONFIRMED', 'RISKY'].includes(appointment.status)
+        && appointment.startsAt > new Date()
+        && action && action.status === 'QUEUED'
+        && action.appointmentVersion === appointment.version
+        && action.planRevision === action.plan.revision
+        && action.plan.appointmentVersion === appointment.version
+        && ['SMS', 'BOTH'].includes(action.plan.mode)
+        && claim.actionId === action.id,
+      );
+      if (!currentVersion) {
+        await appendAttempt(tx, {
+          tenantId: claim.tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber,
+          status: 'suppressed', provider: 'appointment_version_gate', failureCode: 'appointment_reminder_stale', completed: true,
+        });
+        await tx.notificationEvent.update({ where: { id: claim.eventId }, data: {
+          status: 'suppressed', provider: 'appointment_version_gate', failureReason: 'appointment_reminder_stale',
+          consentChecked: true, consentResult: 'not_required', nextAttemptAt: null,
+        } });
+        if (action) await tx.appointmentCommunicationAction.update({ where: { id: action.id }, data: { status: 'CANCELLED' } });
+        return { sent: false, status: 'appointment_reminder_stale', acceptedNow: false };
+      }
+      if (!currentPhone || currentPhone !== claimedPhone) {
+        await appendAttempt(tx, {
+          tenantId: claim.tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber,
+          status: 'dead_lettered', provider: 'destination_gate', failureCode: 'destination_changed_or_unavailable', completed: true,
+        });
+        await tx.notificationEvent.update({ where: { id: claim.eventId }, data: {
+          status: 'dead_lettered', provider: 'destination_gate', failureReason: 'destination_changed_or_unavailable',
+          consentChecked: true, consentResult: 'not_required', nextAttemptAt: null, deadLetteredAt: new Date(),
+        } });
+        await tx.appointmentCommunicationAction.update({ where: { id: action!.id }, data: { status: 'BLOCKED_SETUP' } });
+        await tx.appointmentCommunicationPlan.update({ where: { id: action!.planId }, data: { status: 'BLOCKED_SETUP' } });
+        return { sent: false, status: 'destination_unavailable', acceptedNow: false };
+      }
+      const readiness = appointmentSmsAutomationReadiness();
+      if (!readiness.ready) {
+        await appendAttempt(tx, {
+          tenantId: claim.tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber,
+          status: 'failed', provider: 'provider_readiness_gate', failureCode: readiness.reason, completed: true,
+        });
+        await tx.notificationEvent.update({ where: { id: claim.eventId }, data: {
+          status: 'failed', provider: 'provider_readiness_gate', failureReason: readiness.reason,
+          nextAttemptAt: retryAt(claim.attemptNumber),
+        } });
+        await tx.appointmentCommunicationAction.update({ where: { id: action!.id }, data: { status: 'BLOCKED_SETUP' } });
+        await tx.appointmentCommunicationPlan.update({ where: { id: action!.planId }, data: { status: 'BLOCKED_SETUP' } });
+        return { sent: false, status: readiness.reason ?? 'setup_required', acceptedNow: false };
+      }
     }
     const policy = await getSchedulingPolicy(claim.tenantId, tx);
     const quietHours = communicationQuietHoursDecision(
@@ -301,6 +414,12 @@ async function commitConfirmationProviderIntent(
           deadLetteredAt: status === 'dead_lettered' ? new Date() : null,
         },
       });
+      if (claim.actionId && !canRetry) {
+        await tx.appointmentCommunicationAction.updateMany({
+          where: { id: claim.actionId, tenantId: claim.tenantId },
+          data: { status: status === 'suppressed' ? 'SUPPRESSED' : 'FAILED' },
+        });
+      }
       return { sent: false, status, acceptedNow: false };
     }
     if (await isChannelSuppressedTx(tx, {
@@ -318,6 +437,9 @@ async function commitConfirmationProviderIntent(
         status: 'suppressed', provider: 'suppression_gate', failureReason: 'suppressed_by_shared_gate',
         consentResult: 'denied', consentChecked: true, nextAttemptAt: null,
       } });
+      if (claim.actionId) await tx.appointmentCommunicationAction.updateMany({
+        where: { id: claim.actionId, tenantId: claim.tenantId }, data: { status: 'SUPPRESSED' },
+      });
       return { sent: false, status: 'suppressed', acceptedNow: false };
     }
     await appendAttempt(tx, {
@@ -338,6 +460,9 @@ async function finalizeClaim(
   preProviderFailureCode?: 'suppression_gate_unavailable',
 ): Promise<ConfirmationDispatch> {
   return runWithTenantContext(claim.tenantId, async tx => {
+    if (claim.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE) {
+      await lockAppointmentCommunication(tx, claim.tenantId, claim.appointmentId);
+    }
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-confirmation:${claim.tenantId}:${claim.eventId}`})::bigint)`;
     const current = await tx.notificationEvent.findFirst({ where: { id: claim.eventId, tenantId: claim.tenantId }, select: { status: true, attempts: true } });
     if (!current || current.status !== 'retrying' || current.attempts !== claim.attemptNumber) {
@@ -357,6 +482,9 @@ async function finalizeClaim(
         nextAttemptAt: exhausted ? null : retryAt(claim.attemptNumber),
         deadLetteredAt: exhausted ? new Date() : null,
       } });
+      if (claim.actionId) await tx.appointmentCommunicationAction.updateMany({
+        where: { id: claim.actionId, tenantId: claim.tenantId }, data: { status: 'FAILED' },
+      });
       return { sent: false, status: exhausted ? 'dead_lettered' : preProviderFailureCode, acceptedNow: false };
     }
     if (result?.status === 'sent' && result.providerMessageId) {
@@ -369,6 +497,9 @@ async function finalizeClaim(
         acceptedAt: new Date(), failureReason: null, nextAttemptAt: null,
         consentChecked: true, consentResult: claim.consentEvidence,
       } });
+      if (claim.actionId) await tx.appointmentCommunicationAction.updateMany({
+        where: { id: claim.actionId, tenantId: claim.tenantId }, data: { status: 'PROVIDER_ACCEPTED' },
+      });
       return { sent: false, status: 'accepted', acceptedNow: true };
     }
     if (result?.status === 'suppressed') {
@@ -380,6 +511,9 @@ async function finalizeClaim(
         status: 'suppressed', provider, failureReason: 'suppressed_by_shared_gate', consentResult: 'denied', nextAttemptAt: null,
         consentChecked: true,
       } });
+      if (claim.actionId) await tx.appointmentCommunicationAction.updateMany({
+        where: { id: claim.actionId, tenantId: claim.tenantId }, data: { status: 'SUPPRESSED' },
+      });
       return { sent: false, status: 'suppressed', acceptedNow: false };
     }
     // A thrown call or a live-provider failure can be acceptance-ambiguous.
@@ -393,6 +527,9 @@ async function finalizeClaim(
         status: 'delivery_unknown', provider, failureReason: 'provider_acceptance_unknown', nextAttemptAt: null, deadLetteredAt: new Date(),
         consentChecked: true, consentResult: claim.consentEvidence,
       } });
+      if (claim.actionId) await tx.appointmentCommunicationAction.updateMany({
+        where: { id: claim.actionId, tenantId: claim.tenantId }, data: { status: 'DELIVERY_UNKNOWN' },
+      });
       return { sent: false, status: 'delivery_unknown', acceptedNow: false };
     }
     const exhausted = claim.attemptNumber >= claim.maxAttempts;
@@ -406,6 +543,9 @@ async function finalizeClaim(
       nextAttemptAt: exhausted ? null : retryAt(claim.attemptNumber), deadLetteredAt: exhausted ? new Date() : null,
       consentChecked: true, consentResult: claim.consentEvidence,
     } });
+    if (claim.actionId) await tx.appointmentCommunicationAction.updateMany({
+      where: { id: claim.actionId, tenantId: claim.tenantId }, data: { status: 'FAILED' },
+    });
     return { sent: false, status: exhausted ? 'dead_lettered' : result.status, acceptedNow: false };
   });
 }
@@ -414,7 +554,10 @@ async function dispatchEvent(tenantId: string, eventId: string): Promise<Confirm
   const claim = await claimConfirmation(tenantId, eventId);
   if (!isClaim(claim)) return claim;
   const label = appointmentLabel(claim.startsAt, claim.timezone);
-  const body = `Hi ${claim.firstName}, your ${claim.service} is confirmed for ${label}.`;
+  const reminder = claim.source === APPOINTMENT_REMINDER_OUTBOX_SOURCE;
+  const body = reminder
+    ? `Hi ${claim.firstName}, reminder: your ${claim.service} is scheduled for ${label}. Contact the clinic if you need to make a change.`
+    : `Hi ${claim.firstName}, your ${claim.service} is confirmed for ${label}.`;
   let intentOutcome: ConfirmationDispatch | null;
   try {
     await confirmationBoundaryTestHook?.('before_suppression_fence');
@@ -429,10 +572,10 @@ async function dispatchEvent(tenantId: string, eventId: string): Promise<Confirm
     result = await sendAuthorizedAppointmentConfirmation(
       claim.channel,
       claim.destination,
-      'Appointment confirmed',
+      reminder ? 'Appointment reminder' : 'Appointment confirmed',
       claim.channel === 'sms' ? `${body} Reply STOP to opt out.` : body,
       claim.idempotencyKey,
-      { tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber },
+      { tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber, source: claim.source },
     );
   } catch {
     // Normalized as provider_acceptance_unknown by finalizeClaim. Raw provider
@@ -536,12 +679,12 @@ export async function processAppointmentConfirmations(
   return outcomes;
 }
 
-export async function dispatchDueAppointmentConfirmations(tenantId: string, limit = 100): Promise<{ scanned: number }> {
+export async function dispatchDueAppointmentNotifications(tenantId: string, limit = 100): Promise<{ scanned: number }> {
   const work = async () => {
     const due = await runWithTenantContext(tenantId, tx => tx.notificationEvent.findMany({
       where: {
         tenantId,
-        source: CONFIRMATION_OUTBOX_SOURCE,
+        source: { in: [...APPOINTMENT_NOTIFICATION_SOURCES] },
         OR: [
           { status: { in: ['queued', 'failed'] }, nextAttemptAt: { lte: new Date() } },
           { status: 'retrying' },
@@ -557,3 +700,7 @@ export async function dispatchDueAppointmentConfirmations(tenantId: string, limi
   if (getTenantContext()) return work();
   return runWithJobTenantContext(tenantId, async () => work(), 'worker:receptionist-confirmation');
 }
+
+// Compatibility for direct confirmation callers; the minute worker uses the
+// generalized source allowlist above.
+export const dispatchDueAppointmentConfirmations = dispatchDueAppointmentNotifications;

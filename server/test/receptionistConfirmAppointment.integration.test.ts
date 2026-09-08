@@ -72,6 +72,7 @@ describe('confirm_appointment', () => {
     const row = await db.appointment.findUniqueOrThrow({ where: { id: appointment.id } });
     expect(row.patientConfirmedAt).toBeInstanceOf(Date);
     expect(row.patientConfirmationSource).toBe('receptionist_call');
+    expect(row.patientConfirmedAppointmentVersion).toBe(row.version);
     // The point of the whole design: a patient confirmation is not a status.
     expect(row.status).toBe('CONFIRMED');
     expect(row.startsAt.toISOString()).toBe(appointment.startsAt.toISOString());

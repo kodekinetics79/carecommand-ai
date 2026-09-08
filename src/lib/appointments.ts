@@ -46,10 +46,65 @@ export interface TimeOffResponse {
   timeOff: TimeOffEntry[];
 }
 
+export type AppointmentCommunicationMode = 'NONE' | 'SMS' | 'VOICE' | 'BOTH';
+
+export interface AppointmentCommunicationPlan {
+  mode: AppointmentCommunicationMode;
+  status: 'ACTIVE' | 'PAUSED' | 'BLOCKED_SETUP' | 'COMPLETED' | 'CANCELLED';
+  reminderLeadMinutes: number;
+  revision: number | null;
+  appointmentVersion: number;
+  messages: Array<{
+    channel: 'SMS' | 'VOICE';
+    state: 'scheduled' | 'provider_accepted' | 'delivery_unknown' | 'setup_needed' | 'suppressed' | 'failed' | 'cancelled';
+    dueAt: string;
+  }>;
+  summary: string;
+}
+
+export type AppointmentCommunicationOutcomeTone = 'neutral' | 'success' | 'warning' | 'error';
+
+/** Plain clinic-facing truth; transport and supplier details stay in setup. */
+export function appointmentCommunicationOutcome(plan: AppointmentCommunicationPlan): { tone: AppointmentCommunicationOutcomeTone; text: string } {
+  if (plan.status === 'BLOCKED_SETUP') {
+    const selection = plan.mode === 'SMS' ? 'Text reminder selected.'
+      : plan.mode === 'VOICE' ? 'Call reminder selected.'
+      : plan.mode === 'BOTH' ? 'Text and call reminders selected.'
+      : 'Reminder selected.';
+    return { tone: 'warning', text: `Will not send until automatic reminders are set up. ${selection}` };
+  }
+  if (plan.messages.some(message => message.state === 'delivery_unknown')) {
+    return { tone: 'warning', text: 'Needs review. The text reminder status is unknown.' };
+  }
+  if (plan.messages.some(message => message.state === 'failed')) {
+    return { tone: 'error', text: 'Reminder failed. Review it before relying on this appointment follow-up.' };
+  }
+  if (plan.messages.some(message => message.state === 'scheduled')) {
+    return { tone: 'success', text: plan.summary };
+  }
+  if (plan.messages.some(message => message.state === 'provider_accepted')) {
+    return { tone: 'neutral', text: 'Text reminder accepted for sending. Delivery is not yet confirmed.' };
+  }
+  return { tone: 'neutral', text: plan.summary };
+}
+
 const base = '/v1/appointments';
 const schedulingBase = '/v1/scheduling';
 
 export const appointmentsApi = {
+  communicationPlan: (id: string) =>
+    apiRequest<AppointmentCommunicationPlan>(`${base}/${id}/communication-plan`),
+
+  saveCommunicationPlan: (id: string, input: {
+    mode: AppointmentCommunicationMode;
+    reminderLeadMinutes?: number;
+    appointmentVersion: number;
+    revision: number | null;
+  }) => apiRequest<AppointmentCommunicationPlan>(`${base}/${id}/communication-plan`, {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  }),
+
   // Lifecycle transitions (validated server-side; a disallowed jump returns 409).
   setStatus: (id: string, status: LifecycleStatus) =>
     apiRequest<{ id: string; status: string }>(`${base}/${id}/status`, {
@@ -88,7 +143,7 @@ export const schedulingApi = {
   // Conflict-safe booking — sets providerProfileId and is guarded by the DB
   // exclusion constraint. A taken slot returns 409 { error:'slot_unavailable' }.
   book: (providerId: string, body: { patientId: string; startsAt: string; durationMin?: number; service: string; serviceCatalogItemId?: string; channel?: string }) =>
-    apiRequest<{ id: string }>(`${schedulingBase}/providers/${providerId}/book`, {
+    apiRequest<{ id: string; version: number }>(`${schedulingBase}/providers/${providerId}/book`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),

@@ -72,6 +72,8 @@ export interface Patient {
 
 export interface Appointment {
   id: string;
+  /** Optimistic concurrency version for time-bound reminders/confirmation. */
+  version: number;
   /** Exact stored instant. Clinic-local date/time must be derived from this. */
   startsAt: string;
   patientId: string;

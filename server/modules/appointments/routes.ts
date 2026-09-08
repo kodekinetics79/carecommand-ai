@@ -10,6 +10,17 @@ import { recordWorkflowEvent } from '../../lib/intelligence';
 import { findSlotConflict, isDoubleBookConflictError, resolveSchedulingService } from '../../lib/scheduling';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { APPOINTMENT_NOTE_MAX, appendAppointmentNote, appointmentNoteSelect } from '../../lib/appointmentNotes';
+import {
+  DEFAULT_REMINDER_LEAD_MINUTES,
+  MAX_REMINDER_LEAD_MINUTES,
+  MIN_REMINDER_LEAD_MINUTES,
+  advanceCommunicationPlanAfterReschedule,
+  cancelAppointmentCommunicationPlan,
+  communicationPlanStatus,
+  lockAppointmentCommunication,
+  presentAppointmentCommunicationPlan,
+  replaceAppointmentCommunicationActions,
+} from '../../lib/appointmentCommunicationPlans';
 
 const uuid = z.string().uuid();
 
@@ -29,6 +40,7 @@ const STATUS_TRANSITIONS: Record<'ARRIVED' | 'NO_SHOW' | 'COMPLETED', ReadonlyAr
 };
 const STAFF_CANCELLABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST', 'ARRIVED'] as const;
 const STAFF_RESCHEDULABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST', 'NO_SHOW'] as const;
+const REMINDER_ELIGIBLE_STATUSES = ['CONFIRMED', 'RISKY'] as const;
 
 const appointmentQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -59,6 +71,15 @@ const appointmentInput = z.object({
   message: 'endsAt must be after startsAt',
   path: ['endsAt'],
 });
+
+const communicationPlanInput = z.object({
+  mode: z.enum(['NONE', 'SMS', 'VOICE', 'BOTH']),
+  reminderLeadMinutes: z.number().int().min(MIN_REMINDER_LEAD_MINUTES).max(MAX_REMINDER_LEAD_MINUTES).default(DEFAULT_REMINDER_LEAD_MINUTES),
+  appointmentVersion: z.number().int().positive(),
+  // null means "I observed no plan". Once one exists, callers must echo the
+  // exact revision returned by GET so a stale tab cannot overwrite a newer save.
+  revision: z.number().int().positive().nullable().default(null),
+}).strict();
 
 export const appointmentRoutes: FastifyPluginAsync = async app => {
   app.get('/', { preHandler: canReadAppointments }, async request => {
@@ -121,6 +142,117 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     const patientName = appointment.patient ? `${appointment.patient.firstName} ${appointment.patient.lastName}`.trim() : null;
     const providerName = appointment.providerProfile?.user.displayName ?? null;
     return { ...appointment, patientName, providerName, payment: summaries.get(appointment.id) ?? null };
+  });
+
+  // ----- Per-appointment reminder choice -----------------------------------
+  app.get('/:id/communication-plan', { preHandler: canReadAppointments }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const appointment = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findFirst({
+      where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
+      select: {
+        id: true,
+        version: true,
+        communicationPlan: { include: { actions: { orderBy: [{ planRevision: 'desc' }, { channel: 'asc' }] } } },
+      },
+    }));
+    if (!appointment) throw app.httpErrors.notFound('Appointment not found');
+    await audit(request, { action: 'appointment.communication_plan.read', resource: 'appointment', resourceId: id });
+    return presentAppointmentCommunicationPlan(appointment.communicationPlan, appointment.version);
+  });
+
+  app.put('/:id/communication-plan', { preHandler: canWriteAppointments }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = communicationPlanInput.parse(request.body);
+    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockAppointmentCommunication(tx, request.auth.tenantId, id);
+      const appointment = await tx.appointment.findFirst({
+        where: { id, tenantId: request.auth.tenantId, deletedAt: null },
+        select: { id: true, branchId: true, startsAt: true, status: true, version: true },
+      });
+      if (!appointment) return null;
+      assertBranchAccess(request, appointment.branchId);
+      if (appointment.version !== input.appointmentVersion) {
+        throw app.httpErrors.conflict('Appointment changed; refresh before saving reminders');
+      }
+      if (input.mode !== 'NONE' && (
+        !REMINDER_ELIGIBLE_STATUSES.includes(appointment.status as (typeof REMINDER_ELIGIBLE_STATUSES)[number])
+        || appointment.startsAt.getTime() <= Date.now()
+      )) {
+        throw app.httpErrors.conflict('Reminders can only be selected for an upcoming appointment');
+      }
+
+      const current = await tx.appointmentCommunicationPlan.findUnique({
+        where: { tenantId_appointmentId: { tenantId: request.auth.tenantId, appointmentId: id } },
+      });
+      if (current ? input.revision !== current.revision : input.revision !== null) {
+        throw app.httpErrors.conflict('Reminder choices changed; refresh before saving');
+      }
+
+      const nextRevision = current ? current.revision + 1 : 1;
+      const initialStatus = communicationPlanStatus(input.mode);
+      const plan = current
+        ? await tx.appointmentCommunicationPlan.update({
+          where: { id: current.id },
+          data: {
+            mode: input.mode,
+            status: initialStatus,
+            reminderLeadMinutes: input.reminderLeadMinutes,
+            revision: nextRevision,
+            appointmentVersion: appointment.version,
+            updatedByUserId: request.auth.userId,
+          },
+        })
+        : await tx.appointmentCommunicationPlan.create({
+          data: {
+            tenantId: request.auth.tenantId,
+            appointmentId: id,
+            mode: input.mode,
+            status: initialStatus,
+            reminderLeadMinutes: input.reminderLeadMinutes,
+            revision: nextRevision,
+            appointmentVersion: appointment.version,
+            updatedByUserId: request.auth.userId,
+          },
+        });
+
+      const smsQueued = await replaceAppointmentCommunicationActions(tx, {
+        tenantId: request.auth.tenantId,
+        appointmentId: id,
+        planId: plan.id,
+        appointmentVersion: appointment.version,
+        planRevision: nextRevision,
+        mode: input.mode,
+        startsAt: appointment.startsAt,
+        reminderLeadMinutes: input.reminderLeadMinutes,
+      });
+      const status = communicationPlanStatus(input.mode, smsQueued);
+      if (status !== initialStatus) {
+        await tx.appointmentCommunicationPlan.update({ where: { id: plan.id }, data: { status } });
+      }
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'appointment.communication_plan.updated',
+        resource: 'appointment',
+        resourceId: id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+        metadata: {
+          mode: input.mode,
+          status,
+          reminderLeadMinutes: input.reminderLeadMinutes,
+          revision: nextRevision,
+          appointmentVersion: appointment.version,
+        },
+      } });
+      return tx.appointmentCommunicationPlan.findUniqueOrThrow({
+        where: { id: plan.id },
+        include: { actions: { orderBy: [{ planRevision: 'desc' }, { channel: 'asc' }] } },
+      });
+    });
+    if (!result) throw app.httpErrors.notFound('Appointment not found');
+    return presentAppointmentCommunicationPlan(result, input.appointmentVersion);
   });
 
   // ----- Append a note (immutable history; never edits the scalar `notes`) ---
@@ -222,10 +354,19 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.conflict(`An appointment in ${appointment.status} status cannot be cancelled`);
     }
 
-    const changed = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.updateMany({
-      where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
-      data: { status: 'CANCELED' },
-    }));
+    const changed = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockAppointmentCommunication(tx, request.auth.tenantId, id);
+      const result = await tx.appointment.updateMany({
+        where: { id, tenantId: request.auth.tenantId, status: appointment.status, version: appointment.version, deletedAt: null },
+        data: { status: 'CANCELED' },
+      });
+      if (result.count === 1) await cancelAppointmentCommunicationPlan(tx, {
+        tenantId: request.auth.tenantId,
+        appointmentId: id,
+        appointmentVersion: appointment.version,
+      });
+      return result;
+    });
     if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
     // Void unpaid deposit requirements; paid ones are flagged for MANUAL refund.
     const depositOutcome = await handleAppointmentCancellationDeposit(request.auth.tenantId, id, request.auth.userId);
@@ -263,20 +404,29 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     let updated: Awaited<ReturnType<typeof db.appointment.update>>;
     try {
       updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockAppointmentCommunication(tx, request.auth.tenantId, id);
         const changed = await tx.appointment.updateMany({
-          where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
+          where: { id, tenantId: request.auth.tenantId, status: appointment.status, version: appointment.version, deletedAt: null },
           data: {
             startsAt: body.startsAt,
             endsAt: body.endsAt,
             status: nextStatus,
+            version: { increment: 1 },
             // A confirmation belongs to the exact time the patient accepted.
             // Moving the appointment must never carry that evidence forward.
             patientConfirmedAt: null,
             patientConfirmationSource: null,
             patientConfirmedCallLogId: null,
+            patientConfirmedAppointmentVersion: null,
           },
         });
         if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
+        await advanceCommunicationPlanAfterReschedule(tx, {
+          tenantId: request.auth.tenantId,
+          appointmentId: id,
+          appointmentVersion: appointment.version + 1,
+          startsAt: body.startsAt,
+        });
         return tx.appointment.findUniqueOrThrow({ where: { id } });
       });
     } catch (error) {
@@ -313,11 +463,17 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     }
 
     const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockAppointmentCommunication(tx, request.auth.tenantId, id);
       const changed = await tx.appointment.updateMany({
-        where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
+        where: { id, tenantId: request.auth.tenantId, status: appointment.status, version: appointment.version, deletedAt: null },
         data: { status },
       });
       if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
+      await cancelAppointmentCommunicationPlan(tx, {
+        tenantId: request.auth.tenantId,
+        appointmentId: id,
+        appointmentVersion: appointment.version,
+      });
 
       // Completing a visit is the only moment the product learns a patient was
       // actually seen, and nothing wrote it down. Patient.lastVisitAt stayed NULL

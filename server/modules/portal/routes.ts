@@ -7,6 +7,7 @@ import { publicView, submitSectionMutation, emitSectionSubmissionEffects, submit
 import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, unmetPreVisitRequirements } from '../../lib/scheduling';
 import { evaluateDepositForAppointment } from '../../lib/deposits';
 import { canonicalDncDestination, lockSuppressionFences } from '../../lib/receptionist/dncFence';
+import { advanceCommunicationPlanAfterReschedule, cancelAppointmentCommunicationPlan, lockAppointmentCommunication } from '../../lib/appointmentCommunicationPlans';
 
 // Appointment states a patient can still act on from the portal. COMPLETED /
 // ARRIVED / NO_SHOW are terminal-for-the-patient (staff-only from here on).
@@ -268,11 +269,13 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     }
 
     const deposit = await db.$transaction(async tx => {
+      await lockAppointmentCommunication(tx, tenantId, id);
       const changed = await tx.appointment.updateMany({
-        where: { id, tenantId, patientId, status: { in: [...PATIENT_MUTABLE_STATUSES] }, deletedAt: null },
+        where: { id, tenantId, patientId, status: { in: [...PATIENT_MUTABLE_STATUSES] }, version: appt.version, deletedAt: null },
         data: { status: 'CANCELED' },
       });
       if (changed.count !== 1) return null;
+      await cancelAppointmentCommunicationPlan(tx, { tenantId, appointmentId: id, appointmentVersion: appt.version });
       const requirements = await tx.depositRequirement.findMany({ where: { tenantId, appointmentId: id, status: { notIn: ['cancelled', 'waived'] } }, select: { id: true, status: true } });
       const needsManualRefund = requirements.some(requirement => requirement.status === 'collected');
       for (const requirement of requirements.filter(row => row.status !== 'collected')) {
@@ -324,25 +327,34 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: PortalSafeAppointment };
     try {
       result = await db.$transaction(async tx => {
+        await lockAppointmentCommunication(tx, tenantId, id);
         if (appt.providerProfileId) {
           const conflict = await findSlotConflict({ tenantId, providerProfileId: appt.providerProfileId, startsAt: body.startsAt, durationMin, excludeAppointmentId: appt.id }, tx);
           if (conflict) return { conflict } as const;
         }
         const changed = await tx.appointment.updateMany({
-          where: { id, tenantId, patientId, status: appt.status, deletedAt: null },
+          where: { id, tenantId, patientId, status: appt.status, version: appt.version, deletedAt: null },
           data: {
             startsAt: body.startsAt,
             endsAt,
             service: service.name,
             serviceCatalogItemId: service.id,
+            version: { increment: 1 },
             // Confirmation evidence is scoped to the old time. The patient
             // must confirm the newly selected appointment independently.
             patientConfirmedAt: null,
             patientConfirmationSource: null,
             patientConfirmedCallLogId: null,
+            patientConfirmedAppointmentVersion: null,
           },
         });
         if (changed.count !== 1) return { conflict: 'already_booked' as const };
+        await advanceCommunicationPlanAfterReschedule(tx, {
+          tenantId,
+          appointmentId: id,
+          appointmentVersion: appt.version + 1,
+          startsAt: body.startsAt,
+        });
         const appointment = await tx.appointment.findUniqueOrThrow({ where: { id }, select: { id: true, service: true, startsAt: true, endsAt: true, status: true, providerProfileId: true, branch: { select: { name: true, timezone: true } }, providerProfile: { select: { user: { select: { displayName: true } } } } } });
         await portalAudit(tenantId, 'portal.appointment.rescheduled', id, request, { startsAt: body.startsAt.toISOString() }, { critical: true, tx });
         return { appointment } as const;

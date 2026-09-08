@@ -11,7 +11,7 @@ import {
 import { assertSchedulerTick, validateTenantJobEnvelope } from '../lib/jobEnvelope';
 import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
 import { runInTenantContext, runWithJobTenantContext } from '../lib/tenantContext';
-import { dispatchDueAppointmentConfirmations } from '../lib/receptionist/confirmationOutbox';
+import { dispatchDueAppointmentNotifications } from '../lib/receptionist/confirmationOutbox';
 import { reverifyExpiringAgents } from '../lib/receptionist/agentReverification';
 import { purgeDueReceptionistArtifacts } from '../lib/receptionist/privacyLifecycle';
 import {
@@ -55,7 +55,7 @@ export async function runTenantComplianceJob(operation: ComplianceJobName, tenan
     case 'receptionist-confirmation-dispatch':
       await runWithJobTenantContext(
         tenantId,
-        async () => { await dispatchDueAppointmentConfirmations(tenantId); },
+        async () => { await dispatchDueAppointmentNotifications(tenantId); },
         'worker:receptionist-confirmation',
       );
       break;

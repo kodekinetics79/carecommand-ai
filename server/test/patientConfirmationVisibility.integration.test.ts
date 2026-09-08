@@ -106,6 +106,7 @@ async function makeTargetForAppointment(tenant: TenantFixture, campaignId: strin
       patientConfirmedAt: options.confirmedAt ?? null,
       patientConfirmationSource: options.confirmedAt ? options.confirmationSource ?? 'receptionist_call' : null,
       patientConfirmedCallLogId: options.confirmedCallLogId ?? null,
+      patientConfirmedAppointmentVersion: options.confirmedAt ? 1 : null,
     },
   });
   const target = await db.receptionistCallTarget.create({
