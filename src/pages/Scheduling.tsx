@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { CalendarDays, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock, UserCheck, PhoneCall } from 'lucide-react';
+import { CalendarDays, Zap, AlertCircle, AlertTriangle, CheckCircle2, CircleAlert, Clock, Users, DollarSign, RefreshCw, CreditCard, Info, LogIn, UserX, CheckCheck, X, XCircle, CalendarClock, UserCheck, PhoneCall } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
 import ProviderSetupPanel from '../components/scheduling/ProviderSetupPanel';
 import ServiceCatalogPanel from '../components/scheduling/ServiceCatalogPanel';
+import AppointmentReminderControl from '../components/scheduling/AppointmentReminderControl';
 import { activeServices, durationLabel, servicesApi, type ServiceCatalogItem } from '../lib/services';
 import InsuranceIntakeCard from '../components/insurance/InsuranceIntakeCard';
 import PageHeader from '../components/ui/PageHeader';
@@ -19,7 +20,7 @@ import { ApiError, apiRequest } from '../lib/api';
 import { useResource } from '../hooks/useResource';
 import { receivedData } from '../lib/resourceState';
 import { GROWTH_POLICY_PATH } from '../lib/growthPolicy';
-import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
+import { appointmentCommunicationOutcome, appointmentsApi, schedulingApi, type AppointmentCommunicationMode, type AppointmentCommunicationOutcomeTone, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
 import { intakeApi, intakeLink } from '../lib/intake';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { clinicDateLabel, clinicDayRangeUtc, clinicTimeToUtc, resolveTimezone, shiftClinicDate, todayInZone } from '../lib/clinicTime';
@@ -31,7 +32,14 @@ import { PATIENT_CONFIRMED_BADGE, PATIENT_CONFIRMED_EXPLANATION, patientConfirma
 // Dates are clinic-local and therefore cannot be module constants: the zone is
 // not known until the branches load. Computing them here with toISOString()
 // meant the board opened on tomorrow every evening for any clinic west of UTC.
-const emptyBooking = (today: string) => ({ patientId: '', providerId: '', service: '', date: today, channel: 'EMAIL', slotStart: '', slotEnd: '' });
+const emptyBooking = (today: string) => ({ patientId: '', providerId: '', service: '', date: today, channel: 'EMAIL', slotStart: '', slotEnd: '', reminderMode: 'NONE' as AppointmentCommunicationMode });
+
+const REMINDER_OPTIONS: Array<{ value: AppointmentCommunicationMode; label: string; description: string }> = [
+  { value: 'NONE', label: 'None', description: 'No automatic reminder' },
+  { value: 'SMS', label: 'Text', description: 'Text reminder' },
+  { value: 'VOICE', label: 'Call', description: 'Call reminder' },
+  { value: 'BOTH', label: 'Both', description: 'Text and call reminders' },
+];
 
 // Client mirror of the backend lifecycle transition rules (appointments/routes.ts)
 // so we only offer actions the server will accept; a race still surfaces as a 409.
@@ -117,8 +125,13 @@ const loadNoShowRiskPolicy = async (signal: AbortSignal): Promise<NoShowRiskPoli
 
 export default function Scheduling() {
   const navigate = useNavigate();
+  const bookingDialogTitleId = useId();
+  const bookingTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const bookingDialogRef = useRef<HTMLDivElement | null>(null);
+  const bookingFirstInputRef = useRef<HTMLInputElement | null>(null);
   const { user } = useSession();
   const isFrontDesk = user?.role === 'FRONT_DESK';
+  const canWriteAppointments = hasPermission(user, 'appointment:write');
   const [selectedBranch, setSelectedBranch] = useState('all');
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [insuranceQueue, setInsuranceQueue] = useState<AppointmentVerificationQueueRow[]>([]);
@@ -234,6 +247,7 @@ export default function Scheduling() {
   );
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
+  const [bookingNotice, setBookingNotice] = useState<{ tone: AppointmentCommunicationOutcomeTone; text: string } | null>(null);
   // Real provider slots for the conflict-safe booking path.
   const [slots, setSlots] = useState<ProviderSlot[]>([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
@@ -331,7 +345,7 @@ export default function Scheduling() {
     };
   }, [selectedBranch, activeDate, scheduleScopeReady, scopeDayRange, timezoneForBranch]);
 
-  function closeBooking() {
+  const closeBooking = useCallback(() => {
     setBooking(emptyBooking(todayDate));
     // The next booking starts from a clean search, not the last caller's name.
     setPatientQuery('');
@@ -339,7 +353,38 @@ export default function Scheduling() {
     setShowBooking(false);
     setSlots([]);
     setSlotsError(null);
-  }
+  }, [todayDate]);
+
+  useEffect(() => {
+    if (!showBooking) return;
+    const previouslyFocused = bookingTriggerRef.current
+      ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    bookingFirstInputRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeBooking();
+        return;
+      }
+      if (event.key !== 'Tab' || !bookingDialogRef.current) return;
+      const focusable = [...bookingDialogRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')];
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [closeBooking, showBooking]);
 
   function openBooking() {
     // The schedule date is already the front desk's working context. Requiring
@@ -355,18 +400,19 @@ export default function Scheduling() {
   async function bookAppointment() {
     const patient = patientRecords.find(p => p.id === booking.patientId);
     if (!patient || !patient.branchId || !booking.service.trim() || !booking.providerId || !booking.slotStart) {
-      setBookingError('Pick a patient, service, provider, and an available canonical slot before booking.');
+      setBookingError('Pick a patient, service, provider, and an available time before booking.');
       return;
     }
     setSaving(true);
     setBookingError(null);
+    setBookingNotice(null);
     try {
-      // Canonical slot booking sets providerProfileId and is guarded by the
+      // Available-time booking sets providerProfileId and is guarded by the
       // shared database exclusion constraint used by every booking channel.
       const durationMin = booking.slotEnd
         ? Math.max(5, Math.round((new Date(booking.slotEnd).getTime() - new Date(booking.slotStart).getTime()) / 60000))
         : 30;
-      await schedulingApi.book(booking.providerId, {
+      const created = await schedulingApi.book(booking.providerId, {
         patientId: patient.id,
         startsAt: booking.slotStart,
         durationMin,
@@ -374,9 +420,28 @@ export default function Scheduling() {
         serviceCatalogItemId: chosenService?.id,
         channel: booking.channel,
       });
+      let nextBookingNotice: { tone: AppointmentCommunicationOutcomeTone; text: string };
+      try {
+        const plan = await appointmentsApi.saveCommunicationPlan(created.id, {
+          mode: booking.reminderMode,
+          appointmentVersion: created.version,
+          revision: null,
+        });
+        const outcome = appointmentCommunicationOutcome(plan);
+        nextBookingNotice = {
+          tone: outcome.tone,
+          text: outcome.tone === 'warning' ? `${outcome.text} Appointment booked.` : `Appointment booked. ${outcome.text}.`,
+        };
+      } catch (error) {
+        nextBookingNotice = {
+          tone: 'error',
+          text: `Reminder choice was not saved. The appointment is booked. Open it and try again${error instanceof ApiError && error.status === 409 ? ' after refreshing' : ''}.`,
+        };
+      }
       const bookedDate = booking.date;
       closeBooking();
       setSelectedDate(bookedDate);
+      setBookingNotice(nextBookingNotice);
       reload();
     } catch (err) {
       // Two different 409s arrive here. Only one of them is a taken slot; saying
@@ -524,20 +589,35 @@ export default function Scheduling() {
         badgeColor={loadError ? 'red' : source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
-            <button type="button" onClick={openBooking} disabled={!scheduleScopeReady} title={!scheduleScopeReady ? 'Clinic timezone data must load before booking' : undefined} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:cursor-not-allowed disabled:opacity-40">
+            <button ref={bookingTriggerRef} type="button" onClick={openBooking} disabled={!scheduleScopeReady} title={!scheduleScopeReady ? 'Clinic timezone data must load before booking' : undefined} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:cursor-not-allowed disabled:opacity-40">
               <CalendarDays className="w-4 h-4" /> Book appointment
             </button>
           </div>
         }
       />
 
+      {bookingNotice && (
+        <div
+          role={bookingNotice.tone === 'error' ? 'alert' : 'status'}
+          className={`flex items-start gap-2 rounded-xl border px-4 py-3 text-sm font-semibold text-t1 ${bookingNotice.tone === 'warning' ? 'border-amber-500/60 bg-[var(--amber-soft)]' : bookingNotice.tone === 'error' ? 'border-red-500/60 bg-[var(--red-soft)]' : bookingNotice.tone === 'success' ? 'border-emerald-500/60 bg-[var(--emerald-soft)]' : 'border-[var(--b2)] bg-[var(--s2)]'}`}
+        >
+          {bookingNotice.tone === 'warning' ? <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-v" aria-hidden="true" /> : bookingNotice.tone === 'error' ? <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-red-v" aria-hidden="true" /> : bookingNotice.tone === 'success' ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-v" aria-hidden="true" /> : <Info className="mt-0.5 h-4 w-4 shrink-0 text-t2" aria-hidden="true" />}
+          <span>{bookingNotice.text}</span>
+        </div>
+      )}
+
       {showBooking && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={closeBooking}>
-          <div className="w-full max-w-md rounded-2xl bg-[var(--s1)] border border-[var(--b2)] p-5 shadow-xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-            <p className="text-sm font-bold text-t1 mb-3">Book appointment</p>
-            {bookingError && <p role="alert" className="text-[11px] text-red-v mb-2">{bookingError}</p>}
+        <div className="fixed inset-0 z-50 grid place-items-center p-4" role="dialog" aria-modal="true" aria-labelledby={bookingDialogTitleId}>
+          <button type="button" aria-label="Close booking dialog" onClick={closeBooking} className="absolute inset-0 bg-black/45 backdrop-blur-sm" />
+          <div ref={bookingDialogRef} className="relative max-h-[90vh] w-full max-w-md overflow-y-auto rounded-2xl border border-[var(--b2)] bg-[var(--s1)] p-5 shadow-xl">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h2 id={bookingDialogTitleId} className="text-sm font-bold text-t1">Book appointment</h2>
+              <button type="button" aria-label="Close booking dialog" onClick={closeBooking} className="rounded-lg p-2 text-t2 hover:bg-[var(--s3)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--indigo)]"><X className="h-4 w-4" aria-hidden="true" /></button>
+            </div>
+            {bookingError && <p role="alert" className="mb-2 flex items-start gap-2 rounded-lg border border-red-500/60 bg-[var(--red-soft)] px-3 py-2 text-[11px] font-semibold text-t1"><CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-v" aria-hidden="true" /> {bookingError}</p>}
             <div className="space-y-2.5">
               <input
+                ref={bookingFirstInputRef}
                 aria-label="Search patients"
                 value={patientQuery}
                 onChange={e => setPatientQuery(e.target.value)}
@@ -575,6 +655,30 @@ export default function Scheduling() {
                 </select>
               </div>
 
+              <fieldset>
+                <legend className="text-xs font-semibold text-t1">Reminders</legend>
+                <p className="mt-0.5 text-[11px] text-t3">Choose what happens before this appointment.</p>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  {REMINDER_OPTIONS.map(option => (
+                    <label key={option.value} className={`flex min-h-12 cursor-pointer items-start gap-2 rounded-xl border px-3 py-2 transition-colors ${booking.reminderMode === option.value ? 'border-[var(--indigo)] bg-[var(--indigo-soft)]' : 'border-[var(--b1)] bg-[var(--s2)] hover:bg-[var(--s3)]'}`}>
+                      <input
+                        type="radio"
+                        name="booking-reminder-mode"
+                        aria-label={option.label}
+                        value={option.value}
+                        checked={booking.reminderMode === option.value}
+                        onChange={() => setBooking(current => ({ ...current, reminderMode: option.value }))}
+                        className="mt-0.5 accent-[var(--indigo)]"
+                      />
+                      <span>
+                        <span className="block text-xs font-semibold text-t1">{option.label}</span>
+                        <span className="block text-[10px] leading-4 text-t3">{option.description}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
               {/* Conflict-safe slot picker (real backend availability) */}
               {booking.providerId && (
                 <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
@@ -611,7 +715,7 @@ export default function Scheduling() {
               )}
             </div>
             <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart || !booking.service.trim()} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book canonical slot'}</button>
+              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart || !booking.service.trim()} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book appointment'}</button>
               <button type="button" onClick={closeBooking} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
             </div>
           </div>
@@ -842,6 +946,12 @@ export default function Scheduling() {
                           )}
                         </p>
                       )}
+                      <AppointmentReminderControl
+                        appointmentId={appt.id}
+                        appointmentVersion={appt.version}
+                        canEdit={canWriteAppointments}
+                        eligible={['confirmed', 'risky'].includes(appt.status) && new Date(appt.startsAt).getTime() > Date.now()}
+                      />
                       {(() => {
                         const act = availableActions(appt.status);
                         const busy = rowBusy === appt.id;
