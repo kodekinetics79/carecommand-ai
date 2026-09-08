@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Loader2, X } from 'lucide-react';
 import { Field, Select, TextInput } from '../ui/Field';
 import { receptionistApi as api, type SchedulingBranch } from '../../lib/receptionist';
@@ -82,8 +83,8 @@ export function CreateClinicDialog({ onClose, onCreated }: { onClose: () => void
     }
   }
 
-  return (
-    <div className="fixed inset-0 z-[60] grid place-items-center p-4" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+  return createPortal(
+    <div className="fixed inset-0 z-[100] grid place-items-center p-4 overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby={titleId}>
       <button type="button" aria-label="Close" onClick={onClose} className="absolute inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
       <div ref={dialogRef} className="relative w-full max-w-lg glass-surface rounded-2xl p-5 animate-fade-up">
         <div className="mb-4 flex items-start justify-between gap-3">
@@ -142,6 +143,7 @@ export function CreateClinicDialog({ onClose, onCreated }: { onClose: () => void
           </div>
         </form>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

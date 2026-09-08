@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { CalendarClock, CalendarOff, Plus, Trash2, UserPlus, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import { AlertCircle, CalendarClock, CalendarOff, Plus, Trash2, UserPlus, X } from 'lucide-react';
 import BentoCard from '../ui/BentoCard';
 import { ResourceErrorNotice, ResourceSkeleton } from '../ui/ResourceSection';
 import { describeFailure } from '../../lib/resourceState';
@@ -8,6 +9,7 @@ import { schedulingApi, type AvailabilityWindow, type TimeOffEntry } from '../..
 import { providersApi, type ProviderCandidate } from '../../lib/providers';
 import type { SessionUser } from '../../lib/session';
 import type { Doctor } from '../../types';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
 
 // ===========================================================================
 // Provider setup — the missing half of scheduling.
@@ -288,61 +290,106 @@ function AddProviderModal({ branches, onClose, onCreated }: {
   }
 
   return (
-    <ModalShell title="Add provider" onClose={onClose}>
-      {formError && <p role="alert" className="mb-2 text-[11px] font-semibold text-red-v">{formError}</p>}
+    <ModalShell
+      title="Add Provider"
+      subtitle="Attach a clinician to a clinic branch and set their specialty."
+      icon={<UserPlus className="h-5 w-5" aria-hidden="true" />}
+      onClose={onClose}
+    >
+      {formError && (
+        <div role="alert" className="mb-4 flex items-center gap-2.5 rounded-xl border border-red-500/40 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs font-semibold text-red-v">
+          <AlertCircle className="h-4 w-4 shrink-0 text-red-v" aria-hidden="true" />
+          <span>{formError}</span>
+        </div>
+      )}
       {loadError ? (
         <ResourceErrorNotice title="Clinician accounts could not be loaded" failure={describeFailure(new Error(loadError))} compact />
       ) : candidates === null ? (
         <ResourceSkeleton label="clinician accounts" lines={2} rowClassName="h-9 rounded-lg" />
       ) : selectable.length === 0 ? (
-        <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-3">
+        <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-4">
           <p className="text-xs font-semibold text-t1">
             {candidates.length === 0
               ? 'No clinician account is available in this workspace.'
               : 'Every clinician account here already has a provider profile.'}
           </p>
-          <p className="mt-1 text-[11px] text-t3">
+          <p className="mt-1.5 text-xs text-t3 leading-relaxed">
             A provider profile is attached to a user account with a PROVIDER, OWNER or ADMIN role. Create that account first in
             Control Plane &rarr; Users, then add the provider here.
           </p>
         </div>
       ) : (
-        <div className="space-y-2.5">
-          <select
-            aria-label="Clinician" value={userId} onChange={e => setUserId(e.target.value)}
-            className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
-          >
-            <option value="">Select clinician…</option>
-            {selectable.map(c => <option key={c.userId} value={c.userId}>{c.displayName} · {c.role}</option>)}
-          </select>
+        <div className="space-y-4">
+          <div>
+            <label htmlFor="provider-clinician" className="block text-xs font-semibold text-t2 mb-1.5">
+              Clinician <span className="text-red-v">*</span>
+            </label>
+            <select
+              id="provider-clinician"
+              aria-label="Clinician"
+              value={userId}
+              onChange={e => setUserId(e.target.value)}
+              className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 font-medium"
+            >
+              <option value="">Select clinician…</option>
+              {selectable.map(c => <option key={c.userId} value={c.userId}>{c.displayName} · {c.role}</option>)}
+            </select>
+          </div>
 
-          <select
-            aria-label="Clinic" value={effectiveBranchId} disabled={!selected} onChange={e => setBranchId(e.target.value)}
-            className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40"
-          >
-            <option value="">{selected ? 'Select clinic…' : 'Pick a clinician first'}</option>
-            {branchChoices.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
-          </select>
-          {selected && branchChoices.length === 0 && (
-            <p role="alert" className="text-[11px] text-amber-v">
-              {selected.displayName} has no clinic access that this page can see. Grant clinic access in Control Plane &rarr; Users first.
-            </p>
-          )}
+          <div>
+            <label htmlFor="provider-branch" className="block text-xs font-semibold text-t2 mb-1.5">
+              Clinic branch <span className="text-red-v">*</span>
+            </label>
+            <select
+              id="provider-branch"
+              aria-label="Clinic"
+              value={effectiveBranchId}
+              disabled={!selected}
+              onChange={e => setBranchId(e.target.value)}
+              className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 font-medium disabled:opacity-40"
+            >
+              <option value="">{selected ? 'Select clinic branch…' : 'Pick a clinician first'}</option>
+              {branchChoices.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+            </select>
+            {selected && branchChoices.length === 0 && (
+              <p role="alert" className="mt-1.5 text-xs font-medium text-amber-v">
+                {selected.displayName} has no clinic access that this page can see. Grant clinic access in Control Plane &rarr; Users first.
+              </p>
+            )}
+          </div>
 
-          <input
-            aria-label="Specialty" value={specialty} onChange={e => setSpecialty(e.target.value)} placeholder="Specialty (e.g. Primary Care)"
-            className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
-          />
-          <p className="text-[10px] text-t3">A new provider has no working hours yet, so no slots are offered until you set them.</p>
+          <div>
+            <label htmlFor="provider-specialty" className="block text-xs font-semibold text-t2 mb-1.5">
+              Specialty <span className="text-red-v">*</span>
+            </label>
+            <input
+              id="provider-specialty"
+              aria-label="Specialty"
+              value={specialty}
+              onChange={e => setSpecialty(e.target.value)}
+              placeholder="Specialty (e.g. Primary Care, Family Medicine)"
+              className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+            />
+            <p className="mt-1 text-[11px] text-t3">A new provider has no working hours yet, so no open slots are offered until configured.</p>
+          </div>
 
-          <div className="mt-1 flex gap-2">
+          <div className="flex items-center justify-end gap-2.5 border-t border-[var(--b1)] pt-4 mt-2">
             <button
-              type="button" disabled={saving || !selected || !effectiveBranchId || !specialty.trim()} onClick={() => void submit()}
-              className="flex-1 rounded-lg bg-[var(--indigo)] py-2 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-40"
+              type="button"
+              onClick={onClose}
+              disabled={saving}
+              className="rounded-xl border border-[var(--b1)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s2)] transition disabled:opacity-40"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={saving || !selected || !effectiveBranchId || !specialty.trim()}
+              onClick={() => void submit()}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-5 py-2 text-xs font-semibold text-white shadow-sm hover:opacity-90 transition disabled:opacity-40"
             >
               {saving ? 'Adding…' : 'Add provider'}
             </button>
-            <button type="button" onClick={onClose} className="rounded-lg border border-[var(--b1)] px-4 py-2 text-xs font-semibold text-t2 transition hover:bg-[var(--s3)]">Cancel</button>
           </div>
         </div>
       )}
@@ -454,15 +501,21 @@ function ProviderHoursModal({ provider, canManageSchedule, onClose, onSaved }: {
   }
 
   return (
-    <ModalShell title={`Working hours · ${provider.name}`} onClose={onClose} wide>
+    <ModalShell
+      title={`Working hours · ${provider.name}`}
+      subtitle="Weekly schedule & upcoming time off"
+      icon={<CalendarClock className="h-5 w-5" aria-hidden="true" />}
+      onClose={onClose}
+      wide
+    >
       {!provider.active && (
-        <p className="mb-2.5 rounded-lg bg-[var(--red-soft)] px-2.5 py-1.5 text-[11px] font-semibold text-red-v">
-          This provider is deactivated. Hours can be prepared now, but no slot is offered and no booking is accepted until they are reactivated.
-        </p>
+        <div role="alert" className="mb-4 flex items-center gap-2.5 rounded-xl border border-red-500/40 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs font-semibold text-red-v">
+          <AlertCircle className="h-4 w-4 shrink-0 text-red-v" aria-hidden="true" />
+          <span>This provider is deactivated. Hours can be prepared now, but no slot is offered and no booking is accepted until they are reactivated.</span>
+        </div>
       )}
-      <p className="mb-2.5 text-[11px] text-t3">
-        Hours are clinic-local and repeat weekly. Saving replaces the whole week. Open slots are computed by the server from these hours minus
-        time off and existing appointments.
+      <p className="mb-4 text-xs text-t3 leading-relaxed">
+        Hours are clinic-local and repeat weekly. Saving replaces the whole week. Open slots are computed by the server from these hours minus time off and existing appointments.
       </p>
 
       {loadError ? (
@@ -470,69 +523,104 @@ function ProviderHoursModal({ provider, canManageSchedule, onClose, onSaved }: {
       ) : rows === null ? (
         <ResourceSkeleton label="working hours" lines={3} rowClassName="h-9 rounded-lg" />
       ) : (
-        <div className="space-y-2">
-          {formError && <p role="alert" className="text-[11px] font-semibold text-red-v">{formError}</p>}
-
-          {rows.length === 0 && (
-            <p className="rounded-lg border border-dashed border-[var(--b2)] px-3 py-3 text-center text-[11px] text-t3">
-              No working hours are set, so this provider has no open slots and cannot be booked.
-            </p>
+        <div className="space-y-3">
+          {formError && (
+            <div role="alert" className="flex items-center gap-2.5 rounded-xl border border-red-500/40 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs font-semibold text-red-v">
+              <AlertCircle className="h-4 w-4 shrink-0 text-red-v" aria-hidden="true" />
+              <span>{formError}</span>
+            </div>
           )}
 
-          {rows.map(row => (
-            <div key={row.key} className="flex flex-wrap items-center gap-1.5">
-              <select
-                aria-label="Day" value={row.dayOfWeek} disabled={!canManageSchedule}
-                onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, dayOfWeek: Number(e.target.value) } : r)))}
-                className="min-w-[104px] flex-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1.5 text-[11px] text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-60"
-              >
-                {DAY_LABELS.map((label, index) => <option key={label} value={index}>{label}</option>)}
-              </select>
-              <input
-                type="time" aria-label={`${DAY_LABELS[row.dayOfWeek]} start`} value={row.start} disabled={!canManageSchedule}
-                onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, start: e.target.value } : r)))}
-                className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1.5 text-[11px] text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-60"
-              />
-              <input
-                type="time" aria-label={`${DAY_LABELS[row.dayOfWeek]} end`} value={row.end} disabled={!canManageSchedule}
-                onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, end: e.target.value } : r)))}
-                className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1.5 text-[11px] text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-60"
-              />
-              <select
-                aria-label={`${DAY_LABELS[row.dayOfWeek]} appointment length`} value={row.slotMinutes} disabled={!canManageSchedule}
-                onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, slotMinutes: Number(e.target.value) } : r)))}
-                className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1.5 text-[11px] text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-60"
-              >
-                {SLOT_CHOICES.map(choice => <option key={choice} value={choice}>{choice} min</option>)}
-              </select>
-              {canManageSchedule && (
-                <button
-                  type="button" aria-label={`Remove ${DAY_LABELS[row.dayOfWeek]} hours`}
-                  onClick={() => setRows(current => (current ?? []).filter(r => r.key !== row.key))}
-                  className="rounded-lg border border-[var(--b1)] p-1.5 text-t3 transition hover:bg-[var(--s3)] hover:text-red-v"
-                >
-                  <Trash2 className="h-3 w-3" />
-                </button>
-              )}
+          {rows.length === 0 && (
+            <div className="rounded-xl border border-dashed border-[var(--b2)] p-4 text-center">
+              <p className="text-xs font-medium text-t2">No working hours are currently set.</p>
+              <p className="mt-1 text-[11px] text-t3">This provider has no open slots and cannot be booked until hours are added.</p>
             </div>
-          ))}
+          )}
+
+          <div className="space-y-2">
+            {rows.map(row => (
+              <div key={row.key} className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-2.5 transition focus-within:border-[var(--indigo)]">
+                <div className="flex-1 min-w-[110px]">
+                  <label className="block text-[10px] font-bold uppercase tracking-wider text-t3 mb-1">Day</label>
+                  <select
+                    aria-label="Day"
+                    value={row.dayOfWeek}
+                    disabled={!canManageSchedule}
+                    onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, dayOfWeek: Number(e.target.value) } : r)))}
+                    className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1.5 text-xs font-medium text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 disabled:opacity-60"
+                  >
+                    {DAY_LABELS.map((label, index) => <option key={label} value={index}>{label}</option>)}
+                  </select>
+                </div>
+                <div className="w-24 sm:w-28">
+                  <label className="block text-[10px] font-bold uppercase tracking-wider text-t3 mb-1">From</label>
+                  <input
+                    type="time"
+                    aria-label={`${DAY_LABELS[row.dayOfWeek]} start`}
+                    value={row.start}
+                    disabled={!canManageSchedule}
+                    onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, start: e.target.value } : r)))}
+                    className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1.5 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 disabled:opacity-60"
+                  />
+                </div>
+                <div className="w-24 sm:w-28">
+                  <label className="block text-[10px] font-bold uppercase tracking-wider text-t3 mb-1">To</label>
+                  <input
+                    type="time"
+                    aria-label={`${DAY_LABELS[row.dayOfWeek]} end`}
+                    value={row.end}
+                    disabled={!canManageSchedule}
+                    onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, end: e.target.value } : r)))}
+                    className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1.5 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 disabled:opacity-60"
+                  />
+                </div>
+                <div className="w-20 sm:w-24">
+                  <label className="block text-[10px] font-bold uppercase tracking-wider text-t3 mb-1">Slot</label>
+                  <select
+                    aria-label={`${DAY_LABELS[row.dayOfWeek]} appointment length`}
+                    value={row.slotMinutes}
+                    disabled={!canManageSchedule}
+                    onChange={e => setRows(current => (current ?? []).map(r => (r.key === row.key ? { ...r, slotMinutes: Number(e.target.value) } : r)))}
+                    className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1.5 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 disabled:opacity-60"
+                  >
+                    {SLOT_CHOICES.map(choice => <option key={choice} value={choice}>{choice}m</option>)}
+                  </select>
+                </div>
+                {canManageSchedule && (
+                  <div className="pt-4">
+                    <button
+                      type="button"
+                      aria-label={`Remove ${DAY_LABELS[row.dayOfWeek]} hours`}
+                      onClick={() => setRows(current => (current ?? []).filter(r => r.key !== row.key))}
+                      className="rounded-lg p-2 text-t3 transition hover:bg-[var(--s3)] hover:text-red-v"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
 
           {canManageSchedule && (
-            <div className="flex flex-wrap gap-1.5 pt-1">
+            <div className="flex flex-wrap items-center gap-2 pt-1">
               <button
-                type="button" onClick={() => setRows(current => {
+                type="button"
+                onClick={() => setRows(current => {
                   const existing = current ?? [];
                   const nextDay = existing.length ? (existing[existing.length - 1].dayOfWeek + 1) % 7 : 1;
                   return [...existing, newRow(nextDay)];
                 })}
-                className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1 text-[11px] font-semibold text-t2 transition hover:bg-[var(--s3)]"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-1.5 text-xs font-semibold text-t2 transition hover:bg-[var(--s3)]"
               >
-                <Plus className="h-3 w-3" /> Add hours
+                <Plus className="h-3.5 w-3.5" /> Add day
               </button>
               {rows.length === 0 && (
                 <button
-                  type="button" onClick={() => setRows([1, 2, 3, 4, 5].map(day => newRow(day)))}
-                  className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1 text-[11px] font-semibold text-t2 transition hover:bg-[var(--s3)]"
+                  type="button"
+                  onClick={() => setRows([1, 2, 3, 4, 5].map(day => newRow(day)))}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-1.5 text-xs font-semibold text-t2 transition hover:bg-[var(--s3)]"
                 >
                   Fill Monday–Friday 09:00–17:00
                 </button>
@@ -541,46 +629,56 @@ function ProviderHoursModal({ provider, canManageSchedule, onClose, onSaved }: {
           )}
 
           {savedSummary && (
-            <p className="pt-1 text-[10px] text-t3">Currently saved: {savedSummary}</p>
+            <p className="text-[11px] text-t3">Currently saved: <span className="font-medium text-t2">{savedSummary}</span></p>
           )}
 
           {canManageSchedule ? (
             <button
-              type="button" disabled={saving} onClick={() => void save()}
-              className="mt-1 w-full rounded-lg bg-[var(--indigo)] py-2 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-40"
+              type="button"
+              disabled={saving}
+              onClick={() => void save()}
+              className="w-full rounded-xl bg-[var(--indigo)] py-2.5 text-xs font-semibold text-white shadow-sm transition hover:opacity-90 disabled:opacity-40"
             >
-              {saving ? 'Saving…' : 'Save working hours'}
+              {saving ? 'Saving changes…' : 'Save working hours'}
             </button>
           ) : (
-            <p className="text-[10px] text-t3">Working hours are set by a clinic owner, administrator, manager or the provider themselves.</p>
+            <p className="text-[11px] text-t3">Working hours are set by a clinic owner, administrator, manager or the provider themselves.</p>
           )}
         </div>
       )}
 
       {/* ----- Time off ----- */}
-      <div className="mt-4 border-t border-[var(--b1)] pt-3">
-        <p className="mb-2 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-t3">
-          <CalendarOff className="h-3 w-3" /> Upcoming time off
+      <div className="mt-6 border-t border-[var(--b1)] pt-4">
+        <p className="mb-2.5 flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-t2">
+          <CalendarOff className="h-4 w-4 text-indigo" /> Upcoming time off
         </p>
-        {timeOffError && <p role="alert" className="mb-2 text-[11px] font-semibold text-red-v">{timeOffError}</p>}
+        {timeOffError && (
+          <div role="alert" className="mb-3 flex items-center gap-2 rounded-xl border border-red-500/40 bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-v" aria-hidden="true" />
+            <span>{timeOffError}</span>
+          </div>
+        )}
         {timeOff === null ? (
           <ResourceSkeleton label="time off" lines={1} rowClassName="h-8 rounded-lg" />
         ) : timeOff.length === 0 ? (
-          <p className="text-[11px] text-t3">No upcoming time off is recorded.</p>
+          <p className="text-xs text-t3">No upcoming time off is recorded.</p>
         ) : (
-          <div className="space-y-1.5">
+          <div className="space-y-2">
             {timeOff.map(entry => (
-              <div key={entry.id} className="flex items-center justify-between gap-2 rounded-lg border border-[var(--b1)] px-2.5 py-1.5">
+              <div key={entry.id} className="flex items-center justify-between gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2">
                 <div className="min-w-0">
-                  <p className="truncate text-[11px] font-semibold text-t1">{formatRange(entry.startsAt, entry.endsAt)}</p>
-                  {entry.reason && <p className="truncate text-[10px] text-t3">{entry.reason}</p>}
+                  <p className="truncate text-xs font-semibold text-t1">{formatRange(entry.startsAt, entry.endsAt)}</p>
+                  {entry.reason && <p className="truncate text-[11px] text-t3">{entry.reason}</p>}
                 </div>
                 {canManageSchedule && (
                   <button
-                    type="button" aria-label="Remove time off" disabled={timeOffBusy} onClick={() => void removeTimeOff(entry.id)}
-                    className="rounded-lg border border-[var(--b1)] p-1.5 text-t3 transition hover:bg-[var(--s3)] hover:text-red-v disabled:opacity-40"
+                    type="button"
+                    aria-label="Remove time off"
+                    disabled={timeOffBusy}
+                    onClick={() => void removeTimeOff(entry.id)}
+                    className="rounded-lg p-1.5 text-t3 transition hover:bg-[var(--s3)] hover:text-red-v disabled:opacity-40"
                   >
-                    <Trash2 className="h-3 w-3" />
+                    <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 )}
               </div>
@@ -589,28 +687,47 @@ function ProviderHoursModal({ provider, canManageSchedule, onClose, onSaved }: {
         )}
 
         {canManageSchedule && (
-          <div className="mt-2 flex flex-wrap items-center gap-1.5">
-            <input
-              type="datetime-local" aria-label="Time off starts" value={timeOffForm.startsAt}
-              onChange={e => setTimeOffForm(form => ({ ...form, startsAt: e.target.value }))}
-              className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1.5 text-[11px] text-t1 outline-none focus:border-[var(--b3)]"
-            />
-            <input
-              type="datetime-local" aria-label="Time off ends" value={timeOffForm.endsAt}
-              onChange={e => setTimeOffForm(form => ({ ...form, endsAt: e.target.value }))}
-              className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1.5 text-[11px] text-t1 outline-none focus:border-[var(--b3)]"
-            />
-            <input
-              aria-label="Time off reason" value={timeOffForm.reason} placeholder="Reason (optional)"
-              onChange={e => setTimeOffForm(form => ({ ...form, reason: e.target.value }))}
-              className="min-w-[120px] flex-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1.5 text-[11px] text-t1 outline-none focus:border-[var(--b3)]"
-            />
-            <button
-              type="button" disabled={timeOffBusy} onClick={() => void addTimeOff()}
-              className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 transition hover:bg-[var(--s3)] disabled:opacity-40"
-            >
-              {timeOffBusy ? 'Saving…' : 'Add time off'}
-            </button>
+          <div className="mt-3 space-y-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+            <p className="text-[10px] font-bold uppercase tracking-wider text-t3">Schedule time off</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div>
+                <label className="block text-[10px] font-semibold text-t3 mb-1">Starts</label>
+                <input
+                  type="datetime-local"
+                  aria-label="Time off starts"
+                  value={timeOffForm.startsAt}
+                  onChange={e => setTimeOffForm(form => ({ ...form, startsAt: e.target.value }))}
+                  className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1.5 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold text-t3 mb-1">Ends</label>
+                <input
+                  type="datetime-local"
+                  aria-label="Time off ends"
+                  value={timeOffForm.endsAt}
+                  onChange={e => setTimeOffForm(form => ({ ...form, endsAt: e.target.value }))}
+                  className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1.5 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20"
+                />
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <input
+                aria-label="Time off reason"
+                value={timeOffForm.reason}
+                placeholder="Reason (e.g. Vacation, CME conference)"
+                onChange={e => setTimeOffForm(form => ({ ...form, reason: e.target.value }))}
+                className="flex-1 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1.5 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+              />
+              <button
+                type="button"
+                disabled={timeOffBusy || !timeOffForm.startsAt || !timeOffForm.endsAt}
+                onClick={() => void addTimeOff()}
+                className="rounded-lg bg-[var(--s1)] border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t1 hover:bg-[var(--s3)] transition disabled:opacity-40"
+              >
+                {timeOffBusy ? 'Adding…' : 'Add'}
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -618,23 +735,70 @@ function ProviderHoursModal({ provider, canManageSchedule, onClose, onSaved }: {
   );
 }
 
-function ModalShell({ title, onClose, wide = false, children }: {
-  title: string; onClose: () => void; wide?: boolean; children: ReactNode;
+function ModalShell({
+  title,
+  subtitle,
+  icon,
+  onClose,
+  wide = false,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  icon?: ReactNode;
+  onClose: () => void;
+  wide?: boolean;
+  children: ReactNode;
 }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef, { onClose });
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] grid place-items-center p-4 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="provider-modal-title"
+    >
+      <button
+        type="button"
+        aria-label="Close dialog"
+        onClick={onClose}
+        className="fixed inset-0 bg-black/50 backdrop-blur-sm transition-opacity animate-fade-in"
+      />
       <div
-        className={`max-h-[90vh] w-full ${wide ? 'max-w-xl' : 'max-w-md'} overflow-y-auto rounded-2xl border border-[var(--b2)] bg-[var(--s1)] p-5 shadow-xl`}
+        ref={dialogRef}
+        tabIndex={-1}
+        className={`relative w-full ${wide ? 'max-w-2xl' : 'max-w-lg'} overflow-hidden rounded-2xl border border-[var(--b2)] bg-[var(--s1)] shadow-2xl animate-fade-up my-auto flex flex-col max-h-[92vh]`}
         onClick={e => e.stopPropagation()}
       >
-        <div className="mb-3 flex items-start justify-between gap-2">
-          <p className="text-sm font-bold text-t1">{title}</p>
-          <button type="button" aria-label="Close" onClick={onClose} className="rounded-lg p-1 text-t3 transition hover:bg-[var(--s3)] hover:text-t1">
-            <X className="h-4 w-4" />
+        <div className="flex items-start justify-between gap-3 border-b border-[var(--b1)] p-5 shrink-0">
+          <div className="flex items-center gap-3">
+            {icon && (
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--indigo-soft)] text-indigo">
+                {icon}
+              </div>
+            )}
+            <div>
+              <h2 id="provider-modal-title" className="text-base font-bold text-t1">{title}</h2>
+              {subtitle && <p className="mt-0.5 text-xs text-t3">{subtitle}</p>}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-lg p-1.5 text-t3 hover:bg-[var(--s2)] hover:text-t1 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--indigo)]"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
           </button>
         </div>
-        {children}
+
+        <div className="p-5 overflow-y-auto flex-1">
+          {children}
+        </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

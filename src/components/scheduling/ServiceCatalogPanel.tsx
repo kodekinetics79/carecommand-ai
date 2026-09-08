@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
-import { ListChecks, Plus, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { AlertCircle, ListChecks, Plus, X } from 'lucide-react';
 import BentoCard from '../ui/BentoCard';
 import { ResourceErrorNotice, ResourceSkeleton } from '../ui/ResourceSection';
 import { describeFailure } from '../../lib/resourceState';
 import { activeServices, durationLabel, servicesApi, type ServiceCatalogItem } from '../../lib/services';
 import type { SessionUser } from '../../lib/session';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
 
 // ===========================================================================
 // Service catalog — the other half of a bookable schedule.
@@ -137,40 +139,42 @@ export default function ServiceCatalogPanel({ user, onCatalogChanged }: Props) {
                     Every service is switched off, so bookings fall back to free text at 30 minutes.
                   </p>
                 )}
-                <ul className="space-y-1.5">
+                <ul className="space-y-2">
                   {items.map(item => (
-                    <li key={item.id} className="flex items-center justify-between gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-2">
-                      <div className="min-w-0">
-                        <p className="truncate text-xs font-semibold text-t1">{item.name}</p>
-                        <p className="text-[11px] text-t3">
-                          {durationLabel(item.defaultDurationMinutes)} · {item.category}
-                          {item.defaultAppointmentValue != null && ` · ${item.defaultAppointmentValue}`}
-                        </p>
+                    <li key={item.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3 space-y-2 transition hover:border-[var(--b2)] overflow-hidden">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs font-bold text-t1" title={item.name}>{item.name}</p>
+                          <p className="text-[11px] text-t3 truncate">
+                            {durationLabel(item.defaultDurationMinutes)} · {item.category}
+                            {item.defaultAppointmentValue != null && ` · $${item.defaultAppointmentValue}`}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className={`badge ${item.active ? 'badge-emerald' : 'badge-red'}`}>{item.active ? 'Bookable' : 'Off'}</span>
+                          <span className={`badge ${item.bookableByVoice ? 'badge-blue' : 'badge-slate'}`}>{item.bookableByVoice ? 'AI voice' : 'Staff only'}</span>
+                        </div>
                       </div>
-                      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-                        <span className={`badge ${item.active ? 'badge-emerald' : 'badge-red'}`}>{item.active ? 'Bookable' : 'Off'}</span>
-                        <span className={`badge ${item.bookableByVoice ? 'badge-blue' : 'badge-slate'}`}>{item.bookableByVoice ? 'AI voice' : 'Staff only'}</span>
-                        {canManage && (
-                          <>
-                            <button
-                              type="button"
-                              disabled={rowBusy === item.id}
-                              onClick={() => void toggleVoiceBooking(item)}
-                              className="rounded-lg border border-[var(--b1)] px-2 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s1)] disabled:opacity-50"
-                            >
-                              {item.bookableByVoice ? 'Disable AI booking' : 'Enable AI booking'}
-                            </button>
-                            <button
-                              type="button"
-                              disabled={rowBusy === item.id}
-                              onClick={() => void toggleActive(item)}
-                              className="rounded-lg border border-[var(--b1)] px-2 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s1)] disabled:opacity-50"
-                            >
-                              {item.active ? 'Stop offering' : 'Offer again'}
-                            </button>
-                          </>
-                        )}
-                      </div>
+                      {canManage && (
+                        <div className="flex items-center gap-2 pt-2 border-t border-[var(--b1)]/60">
+                          <button
+                            type="button"
+                            disabled={rowBusy === item.id}
+                            onClick={() => void toggleVoiceBooking(item)}
+                            className="flex-1 min-w-0 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s3)] hover:text-t1 transition disabled:opacity-50 text-center truncate"
+                          >
+                            {item.bookableByVoice ? 'Disable AI booking' : 'Enable AI booking'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={rowBusy === item.id}
+                            onClick={() => void toggleActive(item)}
+                            className="flex-1 min-w-0 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s3)] hover:text-t1 transition disabled:opacity-50 text-center truncate"
+                          >
+                            {item.active ? 'Stop offering' : 'Offer again'}
+                          </button>
+                        </div>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -181,7 +185,7 @@ export default function ServiceCatalogPanel({ user, onCatalogChanged }: Props) {
               <button
                 type="button"
                 onClick={() => setAddOpen(true)}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-1.5 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition"
               >
                 <Plus className="h-3.5 w-3.5" /> Add a service
               </button>
@@ -210,6 +214,9 @@ function AddServiceModal({ firstService, onClose, onSaved }: {
   onClose: () => void;
   onSaved: () => void | Promise<void>;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef, { onClose });
+
   const [form, setForm] = useState({
     name: '', category: 'general', defaultDurationMinutes: 30, defaultAppointmentValue: '',
     spokenDescription: '', bookableByVoice: false,
@@ -238,87 +245,176 @@ function AddServiceModal({ firstService, onClose, onSaved }: {
     }
   }
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className="w-full max-w-sm rounded-2xl border border-[var(--b2)] bg-[var(--s1)] p-5 shadow-xl" onClick={e => e.stopPropagation()}>
-        <div className="mb-3 flex items-center justify-between">
-          <p className="flex items-center gap-1.5 text-sm font-bold text-t1"><ListChecks className="h-4 w-4" /> Add a service</p>
-          <button type="button" aria-label="Close" onClick={onClose} className="text-t3 hover:text-t1"><X className="h-4 w-4" /></button>
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] grid place-items-center p-4 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-service-title"
+    >
+      <button
+        type="button"
+        aria-label="Close dialog"
+        onClick={onClose}
+        className="fixed inset-0 bg-black/50 backdrop-blur-sm transition-opacity animate-fade-in"
+      />
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        className="relative w-full max-w-lg overflow-hidden rounded-2xl border border-[var(--b2)] bg-[var(--s1)] shadow-2xl animate-fade-up my-auto flex flex-col max-h-[92vh]"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3 border-b border-[var(--b1)] p-5 shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--indigo-soft)] text-indigo">
+              <ListChecks className="h-5 w-5" aria-hidden="true" />
+            </div>
+            <div>
+              <h2 id="add-service-title" className="text-base font-bold text-t1">Add Service</h2>
+              <p className="mt-0.5 text-xs text-t3">Define a clinical service and configure booking availability.</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-lg p-1.5 text-t3 hover:bg-[var(--s2)] hover:text-t1 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--indigo)]"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
         </div>
 
-        {firstService && (
-          <p className="mb-3 rounded-lg bg-[var(--amber-soft)] px-2.5 py-2 text-[11px] font-semibold text-amber-v">
-            This is the first service. Once it exists, only services on this list can be booked — anything the
-            front desk types that is not here will be refused. Add the rest before they rely on it.
-          </p>
-        )}
-        {error && <p role="alert" className="mb-2 text-[11px] text-red-v">{error}</p>}
+        <form
+          onSubmit={e => {
+            e.preventDefault();
+            void submit();
+          }}
+          className="p-5 space-y-4 overflow-y-auto flex-1"
+        >
+          {firstService && (
+            <div role="status" className="rounded-xl border border-amber-500/30 bg-[var(--amber-soft)] p-3 text-xs font-medium text-amber-v leading-relaxed">
+              This is the first service. Once it exists, only services on this list can be booked — anything typed that is not here will be refused. Add all clinic services before staff relies on it.
+            </div>
+          )}
 
-        <div className="space-y-2.5">
-          <input
-            aria-label="Service name"
-            value={form.name}
-            onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-            placeholder="Service name (e.g. Annual exam)"
-            className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
-          />
-          <div className="grid grid-cols-2 gap-2.5">
+          {error && (
+            <div role="alert" className="flex items-center gap-2.5 rounded-xl border border-red-500/40 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs font-semibold text-red-v">
+              <AlertCircle className="h-4 w-4 shrink-0 text-red-v" aria-hidden="true" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div>
+            <label htmlFor="service-name" className="block text-xs font-semibold text-t2 mb-1.5">
+              Service name <span className="text-red-v">*</span>
+            </label>
             <input
-              aria-label="Category"
-              value={form.category}
-              onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
-              placeholder="Category"
-              className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
+              id="service-name"
+              aria-label="Service name"
+              value={form.name}
+              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="e.g. Annual Health Check, Routine Consultation"
+              required
+              className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3 font-medium"
             />
-            <label className="flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1">
-              <span className="shrink-0 text-[11px] text-t3">Minutes</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="service-category" className="block text-xs font-semibold text-t2 mb-1.5">
+                Category
+              </label>
               <input
+                id="service-category"
+                aria-label="Category"
+                value={form.category}
+                onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
+                placeholder="general, follow-up, procedure"
+                className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+              />
+            </div>
+            <div>
+              <label htmlFor="service-duration" className="block text-xs font-semibold text-t2 mb-1.5">
+                Duration (minutes) <span className="text-red-v">*</span>
+              </label>
+              <input
+                id="service-duration"
                 aria-label="Default duration in minutes"
-                type="number" min={5} max={480} step={5}
+                type="number"
+                min={5}
+                max={480}
+                step={5}
                 value={form.defaultDurationMinutes}
                 onChange={e => setForm(f => ({ ...f, defaultDurationMinutes: Number(e.target.value) }))}
-                className="w-full bg-transparent outline-none"
+                className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20"
               />
-            </label>
+            </div>
           </div>
-          <input
-            aria-label="Default value"
-            value={form.defaultAppointmentValue}
-            onChange={e => setForm(f => ({ ...f, defaultAppointmentValue: e.target.value }))}
-            placeholder="Default value (optional)"
-            className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
-          />
-          <input
-            aria-label="Caller-facing service description"
-            value={form.spokenDescription}
-            onChange={e => setForm(f => ({ ...f, spokenDescription: e.target.value }))}
-            placeholder="How the AI receptionist describes this service (optional)"
-            className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none focus:border-[var(--b3)]"
-          />
-          <label className="flex items-start gap-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1">
+
+          <div>
+            <label htmlFor="service-value" className="block text-xs font-semibold text-t2 mb-1.5">
+              Default appointment value ($)
+            </label>
+            <input
+              id="service-value"
+              aria-label="Default value"
+              type="number"
+              min={0}
+              step={0.01}
+              value={form.defaultAppointmentValue}
+              onChange={e => setForm(f => ({ ...f, defaultAppointmentValue: e.target.value }))}
+              placeholder="e.g. 150 (optional)"
+              className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+            />
+          </div>
+
+          <div>
+            <label htmlFor="service-spoken" className="block text-xs font-semibold text-t2 mb-1.5">
+              Spoken description for AI Receptionist
+            </label>
+            <input
+              id="service-spoken"
+              aria-label="Caller-facing service description"
+              value={form.spokenDescription}
+              onChange={e => setForm(f => ({ ...f, spokenDescription: e.target.value }))}
+              placeholder="How the voice agent explains this to callers (optional)"
+              className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+            />
+          </div>
+
+          <label className="flex items-start gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3 cursor-pointer hover:bg-[var(--s3)] transition">
             <input
               aria-label="Allow AI receptionist booking"
               type="checkbox"
               checked={form.bookableByVoice}
               onChange={e => setForm(f => ({ ...f, bookableByVoice: e.target.checked }))}
-              className="mt-0.5"
+              className="mt-1 h-4 w-4 rounded border-[var(--b2)] text-[var(--indigo)] focus:ring-[var(--indigo)]"
             />
-            <span><strong>Allow AI receptionist booking</strong><br /><span className="text-[11px] text-t3">Only enable this after the service wording, duration, providers, and locations are ready.</span></span>
+            <div className="text-xs">
+              <span className="font-semibold text-t1">Allow AI receptionist booking</span>
+              <p className="mt-0.5 text-[11px] text-t3 leading-normal">Enables automated booking over phone calls for this service once providers and schedules are configured.</p>
+            </div>
           </label>
-        </div>
 
-        <div className="mt-4 flex justify-end gap-2">
-          <button type="button" onClick={onClose} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2 hover:bg-[var(--s2)]">Cancel</button>
-          <button
-            type="button"
-            disabled={saving || form.name.trim().length < 2}
-            onClick={() => void submit()}
-            className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
-          >
-            {saving ? 'Saving…' : 'Add service'}
-          </button>
-        </div>
+          <div className="flex items-center justify-end gap-2.5 border-t border-[var(--b1)] pt-4 mt-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-xl border border-[var(--b1)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s2)] transition"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={saving || form.name.trim().length < 2}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-5 py-2 text-xs font-semibold text-white shadow-sm hover:opacity-90 transition disabled:opacity-40"
+            >
+              {saving ? 'Saving…' : 'Add service'}
+            </button>
+          </div>
+        </form>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

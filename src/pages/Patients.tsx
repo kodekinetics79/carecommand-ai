@@ -1,6 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
-import { Search, Users, AlertCircle, TrendingUp, Heart, Sparkles, ArrowRight, ShieldCheck, UserPlus, Filter } from 'lucide-react';
+import { Search, Users, AlertCircle, TrendingUp, Heart, Sparkles, ArrowRight, ShieldCheck, UserPlus, Filter, X, Loader2 } from 'lucide-react';
+import { useFocusTrap } from '../hooks/useFocusTrap';
 import { useNavigate } from 'react-router';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -73,6 +75,10 @@ export default function Patients() {
   const [form, setForm] = useState(emptyForm);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const firstInputRef = useRef<HTMLInputElement>(null);
+  useFocusTrap(dialogRef, { onClose: () => setShowAddForm(false), initialFocus: firstInputRef, enabled: showAddForm });
+
   const patientRecords = patientsLoadedPath === patientsPath ? loadedPatientRecords : [];
   const summary = summaryLoadedPath === summaryPath ? loadedSummary : null;
   const error = patientErrorPath === patientsPath ? patientError : null;
@@ -136,7 +142,14 @@ export default function Patients() {
         badge={loadError || summaryError ? 'Data unavailable' : summary ? `${summary.highRiskCount} at risk · Stored patient records` : 'Loading patient records'}
         badgeColor={loadError || summaryError ? 'red' : summary?.highRiskCount ? 'amber' : 'emerald'}
         actions={
-          canCreatePatient ? <button type="button" disabled={activeBranchOptions.length === 0 || Boolean(branchError)} title={activeBranchOptions.length === 0 || branchError ? 'An active clinic must load before registering a patient' : undefined} onClick={() => setShowAddForm(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:cursor-not-allowed disabled:opacity-40">
+          canCreatePatient ? <button type="button" disabled={activeBranchOptions.length === 0 || Boolean(branchError)} title={activeBranchOptions.length === 0 || branchError ? 'An active clinic must load before registering a patient' : undefined} onClick={() => {
+            setFormError(null);
+            setForm({
+              ...emptyForm,
+              branchId: selectedBranch !== 'all' ? selectedBranch : (activeBranchOptions[0]?.id ?? ''),
+            });
+            setShowAddForm(true);
+          }} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:cursor-not-allowed disabled:opacity-40">
             <UserPlus className="w-4 h-4" /> Add Patient
           </button> : undefined
         }
@@ -165,34 +178,203 @@ export default function Patients() {
         </div>
       </section>
 
-      {showAddForm && canCreatePatient && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div role="dialog" aria-modal="true" aria-labelledby="add-patient-title" className="glass-surface w-full max-w-md rounded-2xl p-5">
-            <p id="add-patient-title" className="text-sm font-bold text-t1 mb-3">Add Patient</p>
-            {formError && <p role="alert" className="text-[11px] text-red-v mb-2">{formError}</p>}
-            <div className="grid grid-cols-2 gap-2.5">
-              <input aria-label="First name" autoComplete="given-name" value={form.firstName} onChange={e => setForm(f => ({ ...f, firstName: e.target.value }))} placeholder="First name" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-              <input aria-label="Last name" autoComplete="family-name" value={form.lastName} onChange={e => setForm(f => ({ ...f, lastName: e.target.value }))} placeholder="Last name" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-              <input aria-label="Email" type="email" autoComplete="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="Email" className="col-span-2 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-              <input aria-label="Phone" type="tel" autoComplete="tel" value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} placeholder="Phone" className="col-span-2 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-              <label className="col-span-2 flex items-center gap-2 text-[11px] text-t3">
-                <span className="shrink-0">Date of birth</span>
-                <input type="date" aria-label="Date of birth" value={form.dateOfBirth} onChange={e => setForm(f => ({ ...f, dateOfBirth: e.target.value }))} className="flex-1 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-              </label>
-              <select aria-label="Branch" title="Branch" value={form.branchId} onChange={e => setForm(f => ({ ...f, branchId: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
-                <option value="">Select branch…</option>
-                {activeBranchOptions.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
-              </select>
-              <select aria-label="Lifecycle stage" title="Lifecycle stage" value={form.lifecycleStage} onChange={e => setForm(f => ({ ...f, lifecycleStage: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
-                {['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'LOST', 'RETAINED'].map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
-              </select>
+      {showAddForm && canCreatePatient && createPortal(
+        <div className="fixed inset-0 z-[100] grid place-items-center p-4 overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="add-patient-title">
+          <button
+            type="button"
+            aria-label="Close add patient dialog"
+            onClick={() => setShowAddForm(false)}
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm transition-opacity animate-fade-in"
+          />
+          <div
+            ref={dialogRef}
+            className="relative w-full max-w-lg overflow-hidden rounded-2xl border border-[var(--b2)] bg-[var(--s1)] shadow-2xl animate-fade-up my-auto"
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-[var(--b1)] p-5">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--indigo-soft)] text-indigo">
+                  <UserPlus className="h-5 w-5" aria-hidden="true" />
+                </div>
+                <div>
+                  <h2 id="add-patient-title" className="text-base font-bold text-t1">Add Patient</h2>
+                  <p className="mt-0.5 text-xs text-t3">Register a new patient record and assign their clinic branch.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAddForm(false)}
+                aria-label="Close"
+                className="rounded-lg p-1.5 text-t3 hover:bg-[var(--s2)] hover:text-t1 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--indigo)]"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
             </div>
-            <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving} onClick={createPatient} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Saving…' : 'Add Patient'}</button>
-              <button type="button" onClick={() => setShowAddForm(false)} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
-            </div>
+
+            <form
+              onSubmit={e => {
+                e.preventDefault();
+                void createPatient();
+              }}
+              className="p-5 space-y-4"
+            >
+              {formError && (
+                <div role="alert" className="flex items-center gap-2.5 rounded-xl border border-red-500/40 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs font-semibold text-red-v">
+                  <AlertCircle className="h-4 w-4 shrink-0 text-red-v" aria-hidden="true" />
+                  <span>{formError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="patient-first-name" className="block text-xs font-semibold text-t2 mb-1.5">
+                    First name <span className="text-red-v">*</span>
+                  </label>
+                  <input
+                    ref={firstInputRef}
+                    id="patient-first-name"
+                    aria-label="First name"
+                    autoComplete="given-name"
+                    value={form.firstName}
+                    onChange={e => setForm(f => ({ ...f, firstName: e.target.value }))}
+                    placeholder="First name"
+                    required
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="patient-last-name" className="block text-xs font-semibold text-t2 mb-1.5">
+                    Last name <span className="text-red-v">*</span>
+                  </label>
+                  <input
+                    id="patient-last-name"
+                    aria-label="Last name"
+                    autoComplete="family-name"
+                    value={form.lastName}
+                    onChange={e => setForm(f => ({ ...f, lastName: e.target.value }))}
+                    placeholder="Last name"
+                    required
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="patient-email" className="block text-xs font-semibold text-t2 mb-1.5">
+                    Email address
+                  </label>
+                  <input
+                    id="patient-email"
+                    aria-label="Email"
+                    type="email"
+                    autoComplete="email"
+                    value={form.email}
+                    onChange={e => setForm(f => ({ ...f, email: e.target.value }))}
+                    placeholder="patient@example.com"
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="patient-phone" className="block text-xs font-semibold text-t2 mb-1.5">
+                    Phone number
+                  </label>
+                  <input
+                    id="patient-phone"
+                    aria-label="Phone"
+                    type="tel"
+                    autoComplete="tel"
+                    value={form.phone}
+                    onChange={e => setForm(f => ({ ...f, phone: e.target.value }))}
+                    placeholder="+1 (555) 000-0000"
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="patient-dob" className="block text-xs font-semibold text-t2 mb-1.5">
+                    Date of birth
+                  </label>
+                  <input
+                    id="patient-dob"
+                    type="date"
+                    aria-label="Date of birth"
+                    value={form.dateOfBirth}
+                    onChange={e => setForm(f => ({ ...f, dateOfBirth: e.target.value }))}
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="patient-branch" className="block text-xs font-semibold text-t2 mb-1.5">
+                    Clinic branch <span className="text-red-v">*</span>
+                  </label>
+                  <select
+                    id="patient-branch"
+                    aria-label="Branch"
+                    title="Branch"
+                    required
+                    value={form.branchId}
+                    onChange={e => setForm(f => ({ ...f, branchId: e.target.value }))}
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20"
+                  >
+                    <option value="">Select branch…</option>
+                    {activeBranchOptions.map(b => (
+                      <option key={b.id} value={b.id}>{b.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="patient-lifecycle" className="block text-xs font-semibold text-t2 mb-1.5">
+                  Lifecycle stage
+                </label>
+                <select
+                  id="patient-lifecycle"
+                  aria-label="Lifecycle stage"
+                  title="Lifecycle stage"
+                  value={form.lifecycleStage}
+                  onChange={e => setForm(f => ({ ...f, lifecycleStage: e.target.value }))}
+                  className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20"
+                >
+                  {['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'LOST', 'RETAINED'].map(s => (
+                    <option key={s} value={s}>{s.replace('_', ' ')}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex items-center justify-end gap-2.5 border-t border-[var(--b1)] pt-4 mt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAddForm(false)}
+                  disabled={saving}
+                  className="rounded-xl border border-[var(--b1)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s2)] transition disabled:opacity-40"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-5 py-2 text-xs font-semibold text-white shadow-sm hover:opacity-90 transition disabled:opacity-40"
+                >
+                  {saving ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                      <span>Saving…</span>
+                    </>
+                  ) : (
+                    <>
+                      <UserPlus className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>Add Patient</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">

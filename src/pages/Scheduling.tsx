@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router';
-import { CalendarDays, Zap, AlertCircle, AlertTriangle, CheckCircle2, CircleAlert, Clock, Users, DollarSign, RefreshCw, CreditCard, Info, LogIn, UserX, CheckCheck, X, XCircle, CalendarClock, UserCheck, PhoneCall } from 'lucide-react';
+import { CalendarDays, CalendarPlus, Search, Zap, AlertCircle, AlertTriangle, CheckCircle2, CircleAlert, Clock, Users, DollarSign, RefreshCw, CreditCard, Info, LogIn, UserX, CheckCheck, X, XCircle, CalendarClock, UserCheck, PhoneCall } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
 import ProviderSetupPanel from '../components/scheduling/ProviderSetupPanel';
@@ -586,7 +587,7 @@ export default function Scheduling() {
   }
 
   return (
-    <div className="space-y-6 pb-8">
+    <div className="space-y-6 pb-8 min-w-0 max-w-full">
       <PageHeader
         title="Scheduling"
         subtitle="Review appointments, provider availability, recorded risk flags, and front-office follow-up tasks."
@@ -611,61 +612,182 @@ export default function Scheduling() {
         </div>
       )}
 
-      {showBooking && (
-        <div className="fixed inset-0 z-50 grid place-items-center p-4" role="dialog" aria-modal="true" aria-labelledby={bookingDialogTitleId}>
-          <button type="button" aria-label="Close booking dialog" onClick={closeBooking} className="absolute inset-0 bg-black/45 backdrop-blur-sm" />
-          <div ref={bookingDialogRef} className="relative max-h-[90vh] w-full max-w-md overflow-y-auto rounded-2xl border border-[var(--b2)] bg-[var(--s1)] p-5 shadow-xl">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <h2 id={bookingDialogTitleId} className="text-sm font-bold text-t1">Book appointment</h2>
-              <button type="button" aria-label="Close booking dialog" onClick={closeBooking} className="rounded-lg p-2 text-t2 hover:bg-[var(--s3)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--indigo)]"><X className="h-4 w-4" aria-hidden="true" /></button>
+      {showBooking && createPortal(
+        <div className="fixed inset-0 z-[100] grid place-items-center p-4 overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby={bookingDialogTitleId}>
+          <button
+            type="button"
+            aria-label="Close booking dialog"
+            onClick={closeBooking}
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm transition-opacity animate-fade-in"
+          />
+          <div
+            ref={bookingDialogRef}
+            className="relative my-auto w-full max-w-xl overflow-hidden rounded-2xl border border-[var(--b2)] bg-[var(--s1)] shadow-2xl animate-fade-up flex flex-col max-h-[92vh]"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-[var(--b1)] p-5 shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--indigo-soft)] text-indigo">
+                  <CalendarPlus className="h-5 w-5" aria-hidden="true" />
+                </div>
+                <div>
+                  <h2 id={bookingDialogTitleId} className="text-base font-bold text-t1">Book appointment</h2>
+                  <p className="mt-0.5 text-xs text-t3">Schedule a patient visit, select clinician, date, and reminders.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                aria-label="Close booking dialog"
+                onClick={closeBooking}
+                className="rounded-lg p-1.5 text-t3 hover:bg-[var(--s2)] hover:text-t1 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--indigo)]"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
             </div>
-            {bookingError && <p role="alert" className="mb-2 flex items-start gap-2 rounded-lg border border-red-500/60 bg-[var(--red-soft)] px-3 py-2 text-[11px] font-semibold text-t1"><CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-v" aria-hidden="true" /> {bookingError}</p>}
-            <div className="space-y-2.5">
-              <input
-                ref={bookingFirstInputRef}
-                aria-label="Search patients"
-                value={patientQuery}
-                onChange={e => setPatientQuery(e.target.value)}
-                placeholder="Search patients by name, phone, email or reference"
-                className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]"
-              />
-              <select aria-label="Patient" title="Patient" value={booking.patientId} onChange={e => { const chosen = patientRecords.find(p => p.id === e.target.value) ?? null; setPinnedPatient(chosen); setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' })); }} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
-                <option value="">Select patient…</option>
-                {pinnedPatient && !patientRecords.some(p => p.id === pinnedPatient.id) && (
-                  <option value={pinnedPatient.id}>{pinnedPatient.name}</option>
+
+            <div className="p-5 overflow-y-auto space-y-4 flex-1">
+              {bookingError && (
+                <div role="alert" className="flex items-start gap-2.5 rounded-xl border border-red-500/40 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs font-semibold text-red-v">
+                  <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-red-v" aria-hidden="true" />
+                  <span>{bookingError}</span>
+                </div>
+              )}
+
+              <div>
+                <label htmlFor="booking-patient-search" className="block text-xs font-semibold text-t2 mb-1.5">
+                  Patient <span className="text-red-v">*</span>
+                </label>
+                <div className="space-y-2">
+                  <div className="relative">
+                    <Search className="absolute left-3 top-2.5 h-4 w-4 text-t3 pointer-events-none" />
+                    <input
+                      ref={bookingFirstInputRef}
+                      id="booking-patient-search"
+                      aria-label="Search patients"
+                      value={patientQuery}
+                      onChange={e => setPatientQuery(e.target.value)}
+                      placeholder="Search patients by name, phone, or email…"
+                      className="w-full pl-9 pr-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3 font-medium"
+                    />
+                  </div>
+                  <select
+                    id="booking-patient"
+                    aria-label="Patient"
+                    title="Patient"
+                    value={booking.patientId}
+                    onChange={e => {
+                      const chosen = patientRecords.find(p => p.id === e.target.value) ?? null;
+                      setPinnedPatient(chosen);
+                      setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' }));
+                    }}
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 font-medium"
+                  >
+                    <option value="">Select patient…</option>
+                    {pinnedPatient && !patientRecords.some(p => p.id === pinnedPatient.id) && (
+                      <option value={pinnedPatient.id}>{pinnedPatient.name}</option>
+                    )}
+                    {patientRecords.map(p => (
+                      <option key={p.id} value={p.id}>{p.name} {p.phone ? `(${p.phone})` : ''}</option>
+                    ))}
+                  </select>
+                  {debouncedPatientQuery.trim() && patientRecords.length === 0 && (
+                    <p className="text-[11px] text-t3">No patient matches that search. Registering a new patient is on the Patients screen.</p>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="booking-service" className="block text-xs font-semibold text-t2 mb-1.5">
+                  Service <span className="text-red-v">*</span>
+                </label>
+                {catalogGoverns ? (
+                  <select
+                    id="booking-service"
+                    aria-label="Service"
+                    title="Service"
+                    value={booking.service}
+                    onChange={e => setBooking(b => ({ ...b, service: e.target.value, slotStart: '', slotEnd: '' }))}
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 font-medium"
+                  >
+                    <option value="">Select service…</option>
+                    {bookableServices.map(item => (
+                      <option key={item.id} value={item.name}>{item.name} · {durationLabel(item.defaultDurationMinutes)}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    id="booking-service"
+                    aria-label="Service"
+                    value={booking.service}
+                    onChange={e => setBooking(b => ({ ...b, service: e.target.value }))}
+                    placeholder="Service (e.g. Dermatology Review, Routine Consultation)"
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 placeholder:text-t3 font-medium"
+                  />
                 )}
-                {patientRecords.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-              {debouncedPatientQuery.trim() && patientRecords.length === 0 && (
-                <p className="text-[11px] text-t3">No patient matches that search. Registering a new patient is on the Patients screen.</p>
-              )}
-              {catalogGoverns ? (
-                // Only what the server will accept. Typing a service that is not
-                // in the catalog is refused, so it must not be offered.
-                <select aria-label="Service" title="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value, slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
-                  <option value="">Select service…</option>
-                  {bookableServices.map(item => <option key={item.id} value={item.name}>{item.name} · {durationLabel(item.defaultDurationMinutes)}</option>)}
-                </select>
-              ) : (
-                <input aria-label="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-              )}
-              <div className="grid grid-cols-2 gap-2.5">
-                <select aria-label="Provider" title="Provider" disabled={!booking.patientId} value={booking.providerId} onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40">
-                  <option value="">{booking.patientId ? 'Select provider…' : 'Pick patient first'}</option>
-                  {bookableProviders.map(p => <option key={p.id} value={p.id}>{p.name} · {p.specialty}</option>)}
-                </select>
-                <input type="date" aria-label="Date" value={booking.date} onChange={e => setBooking(b => ({ ...b, date: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-                <select aria-label="Channel" title="Channel" value={booking.channel} onChange={e => setBooking(b => ({ ...b, channel: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="booking-provider" className="block text-xs font-semibold text-t2 mb-1.5">
+                    Provider <span className="text-red-v">*</span>
+                  </label>
+                  <select
+                    id="booking-provider"
+                    aria-label="Provider"
+                    title="Provider"
+                    disabled={!booking.patientId}
+                    value={booking.providerId}
+                    onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))}
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 disabled:opacity-40 font-medium"
+                  >
+                    <option value="">{booking.patientId ? 'Select provider…' : 'Pick patient first'}</option>
+                    {bookableProviders.map(p => <option key={p.id} value={p.id}>{p.name} · {p.specialty}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="booking-date" className="block text-xs font-semibold text-t2 mb-1.5">
+                    Date <span className="text-red-v">*</span>
+                  </label>
+                  <input
+                    id="booking-date"
+                    type="date"
+                    aria-label="Date"
+                    value={booking.date}
+                    onChange={e => setBooking(b => ({ ...b, date: e.target.value, slotStart: '', slotEnd: '' }))}
+                    className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 font-medium"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="booking-channel" className="block text-xs font-semibold text-t2 mb-1.5">
+                  Booking channel
+                </label>
+                <select
+                  id="booking-channel"
+                  aria-label="Channel"
+                  title="Channel"
+                  value={booking.channel}
+                  onChange={e => setBooking(b => ({ ...b, channel: e.target.value }))}
+                  className="w-full px-3 py-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none transition focus:border-[var(--indigo)] focus:ring-2 focus:ring-[var(--indigo)]/20 font-medium"
+                >
                   {['WHATSAPP', 'SMS', 'EMAIL', 'CALL', 'VIDEO'].map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
 
               <fieldset>
                 <legend className="text-xs font-semibold text-t1">Reminders</legend>
-                <p className="mt-0.5 text-[11px] text-t3">Choose what happens before this appointment.</p>
+                <p className="mt-0.5 text-[11px] text-t3">Choose notification channel for pre-visit reminders.</p>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   {REMINDER_OPTIONS.map(option => (
-                    <label key={option.value} className={`flex min-h-12 cursor-pointer items-start gap-2 rounded-xl border px-3 py-2 transition-colors ${booking.reminderMode === option.value ? 'border-[var(--indigo)] bg-[var(--indigo-soft)]' : 'border-[var(--b1)] bg-[var(--s2)] hover:bg-[var(--s3)]'}`}>
+                    <label
+                      key={option.value}
+                      className={`flex min-h-[52px] cursor-pointer items-start gap-2.5 rounded-xl border p-2.5 transition ${
+                        booking.reminderMode === option.value
+                          ? 'border-[var(--indigo)] bg-[var(--indigo-soft)] ring-1 ring-[var(--indigo)]/30'
+                          : 'border-[var(--b1)] bg-[var(--s2)] hover:bg-[var(--s3)]'
+                      }`}
+                    >
                       <input
                         type="radio"
                         name="booking-reminder-mode"
@@ -675,10 +797,10 @@ export default function Scheduling() {
                         onChange={() => setBooking(current => ({ ...current, reminderMode: option.value }))}
                         className="mt-0.5 accent-[var(--indigo)]"
                       />
-                      <span>
+                      <div className="min-w-0 flex-1">
                         <span className="block text-xs font-semibold text-t1">{option.label}</span>
-                        <span className="block text-[10px] leading-4 text-t3">{option.description}</span>
-                      </span>
+                        <span className="block text-[10px] leading-snug text-t3 mt-0.5">{option.description}</span>
+                      </div>
                     </label>
                   ))}
                 </div>
@@ -686,45 +808,80 @@ export default function Scheduling() {
 
               {/* Conflict-safe slot picker (real backend availability) */}
               {booking.providerId && (
-                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Open slots</p>
+                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3.5 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-t3">Available slots</p>
+                    {slots.length > 0 && (
+                      <span className="text-[10px] font-semibold text-indigo">{slots.length} available</span>
+                    )}
+                  </div>
                   {slotsLoading ? (
-                    <p className="text-[11px] text-t3">Loading open slots…</p>
+                    <p className="text-xs text-t3 py-1">Loading open slots…</p>
                   ) : slots.length > 0 ? (
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto">
                       {slots.map(s => {
                         const label = clinicTimeLabelForAppointment(s.startsAt, bookingTimezone);
                         const active = booking.slotStart === s.startsAt;
                         return (
-                          <button key={s.startsAt} type="button" onClick={() => setBooking(b => ({ ...b, slotStart: s.startsAt, slotEnd: s.endsAt }))} className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${active ? 'bg-[var(--indigo)] text-white' : 'bg-[var(--s3)] text-t2 hover:bg-[var(--b1)]'}`}>{label}</button>
+                          <button
+                            key={s.startsAt}
+                            type="button"
+                            onClick={() => setBooking(b => ({ ...b, slotStart: s.startsAt, slotEnd: s.endsAt }))}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                              active
+                                ? 'bg-[var(--indigo)] text-white shadow-sm ring-2 ring-[var(--indigo)]/30'
+                                : 'bg-[var(--s1)] border border-[var(--b1)] text-t2 hover:bg-[var(--s3)] hover:text-t1'
+                            }`}
+                          >
+                            {label}
+                          </button>
                         );
                       })}
                     </div>
                   ) : (
-                    <p className="text-[11px] text-amber-v">{slotsError ?? 'No open slots.'}</p>
+                    <p className="text-xs text-amber-v">{slotsError ?? 'No open slots for this provider and date.'}</p>
                   )}
                 </div>
               )}
 
               {booking.patientId && bookableProviders.length === 0 && (
-                <p role="alert" className="text-[11px] text-amber-v">
-                  {clinicProviders.length === 0
-                    ? "No provider is set up in this patient's clinic yet. Add one in Providers & availability, then set their working hours."
-                    : `Every provider in this patient's clinic is deactivated or has no working hours, so no appointment can be booked here yet. Set that up in Providers & availability.`}
-                </p>
+                <div role="alert" className="flex items-start gap-2.5 rounded-xl border border-amber-500/40 bg-[var(--amber-soft)] p-3 text-xs font-semibold text-amber-v">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-v mt-0.5" aria-hidden="true" />
+                  <span>
+                    {clinicProviders.length === 0
+                      ? "No provider is set up in this patient's clinic yet. Add one in Providers & availability, then set their working hours."
+                      : "Every provider in this patient's clinic is deactivated or has no working hours, so no appointment can be booked here yet. Set that up in Providers & availability."}
+                  </span>
+                </div>
               )}
               {booking.patientId && bookableProviders.length > 0 && unbookableInClinic > 0 && (
-                <p className="text-[11px] text-t3">
+                <p className="text-xs text-t3">
                   {unbookableInClinic} other {unbookableInClinic === 1 ? 'provider' : 'providers'} in this clinic {unbookableInClinic === 1 ? 'is' : 'are'} not on the schedule (deactivated, or no working hours set).
                 </p>
               )}
             </div>
-            <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart || !booking.service.trim()} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book appointment'}</button>
-              <button type="button" onClick={closeBooking} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
+
+            <div className="flex items-center justify-end gap-2.5 border-t border-[var(--b1)] p-5 shrink-0 bg-[var(--s1)]">
+              <button
+                type="button"
+                onClick={closeBooking}
+                className="rounded-xl border border-[var(--b1)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s2)] transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={saving || !booking.patientId || !booking.providerId || !booking.slotStart || !booking.service.trim()}
+                onClick={bookAppointment}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-5 py-2 text-xs font-semibold text-white shadow-sm hover:opacity-90 transition disabled:opacity-40"
+              >
+                <CalendarPlus className="h-4 w-4" aria-hidden="true" />
+                {saving ? 'Booking…' : 'Book appointment'}
+              </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
@@ -779,13 +936,258 @@ export default function Scheduling() {
         </div>
       </section>
 
-      <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
-        {/* Appointment timeline */}
-        <div className="space-y-4">
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px] min-w-0 max-w-full">
+        {/* Main scheduling column */}
+        <div className="space-y-4 min-w-0 max-w-full">
+          <BentoCard
+            title="Appointment timeline"
+            subtitle={activeDate === todayDate ? "Today's schedule" : clinicDateLabel(activeDate, clinicTimezone, { month: 'short', day: 'numeric', year: 'numeric' })}
+            headerRight={
+              <span className="text-xs font-semibold text-t3">{scheduleScopeReady ? `${todayAppts.length} appointments · ${formatCurrency(totalValue)}` : 'Schedule unavailable'}</span>
+            }
+          >
+            {/* The rule the red flags below are asserted against, stated as the
+                value actually used — or the named failure when it could not be
+                read. Never a hardcoded number presented as configured. */}
+            {receivedNoShowPolicy ? (
+              <p className="mb-2 text-[11px] text-t3">
+                Appointments are flagged high no-show risk at a stored risk ≥ {receivedNoShowPolicy.noShowRiskHigh}.
+                {' '}{receivedNoShowPolicy.source === 'tenant' ? 'Configured for this workspace.' : 'Product default — this workspace has not set its own thresholds yet.'}
+              </p>
+            ) : noShowPolicy.state.status === 'error' ? (
+              <p role="alert" className="mb-2 text-[11px] font-semibold text-amber-v">
+                The configured no-show risk threshold could not be loaded, so risk flags are hidden.
+                {' '}<button type="button" onClick={noShowPolicy.reload} className="underline">Retry</button>
+              </p>
+            ) : null}
+            {/* How many of the people on this list have told US they are
+                coming, as distinct from how many the clinic has booked. Both
+                numbers come from the SAME received response — `source` is only
+                'live' once one has landed — so a failed or in-flight load
+                renders no sentence at all rather than "0 of 0". */}
+            {source === 'live' && !appointmentError && todayAppts.length > 0 && (
+              <p className="mb-3 text-[11px] text-t3">
+                {patientConfirmedSummary(patientConfirmedCount, todayAppts.length)}
+                {patientConfirmedCount === 0 ? ' Nobody has answered a reminder yet.' : ''}
+              </p>
+            )}
+            <div className="space-y-3">
+              {!scheduleScopeReady ? (
+                <div className="py-8 text-center text-sm text-t3">Appointments are unavailable until clinic timezones load.</div>
+              ) : todayAppts.length === 0 ? (
+                <div className="py-8 text-center text-sm text-t3">No appointments match the selected date and branch.</div>
+              ) : todayAppts.map((appt) => {
+                const sc = statusConfig[appt.status] ?? statusConfig['confirmed'];
+                const appointmentTimezone = timezoneForBranch(appt.branchId);
+                const appointmentBranchName = branchDisplayNames.get(appt.branchId) ?? 'Clinic';
+                const isRisky = receivedNoShowPolicy !== null && appt.noShowRisk >= receivedNoShowPolicy.noShowRiskHigh;
+                const confirmation = appt.patientConfirmation ?? null;
+                const confirmationDetailId = `appt-${appt.id}-patient-confirmation`;
+                const confirmingCallLogId = confirmation?.callLogId ?? null;
+                return (
+                  <div
+                    key={appt.id}
+                    data-appointment-id={appt.id}
+                    className={`p-4 rounded-2xl border transition-all duration-150 hover:border-[var(--b3)] hover:shadow-sm ${
+                      isRisky ? 'border-red-500/30 bg-[var(--red-soft)]/40' : 'border-[var(--b1)] bg-[var(--s2)]/40'
+                    }`}
+                  >
+                    {/* Header: Time, Patient, Badges */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--b1)]/60">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="shrink-0 px-2.5 py-1.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)] text-center min-w-[96px]">
+                          <p className="text-xs font-bold text-t1 whitespace-nowrap">
+                            {clinicTimeLabelForAppointment(appt.startsAt, appointmentTimezone, selectedBranch === 'all')}
+                          </p>
+                          {Number(appt.value) > 0 && (
+                            <p className="text-[10px] font-semibold text-emerald-v mt-0.5">
+                              {formatCurrency(Number(appt.value))}
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="text-sm font-bold text-t1 truncate">{appt.patientName}</p>
+                            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full uppercase tracking-wider bg-[var(--s3)] text-t3 border border-[var(--b1)] shrink-0">
+                              {appt.channel}
+                            </span>
+                          </div>
+                          <p className="text-xs text-t3 mt-0.5 truncate">
+                            <span className="font-medium text-t2">{appt.service || 'General Consultation'}</span>
+                            <span className="mx-1.5 text-t3/60">·</span>
+                            <span>{appt.doctorName || 'Assigned Provider'}</span>
+                            {selectedBranch === 'all' && (
+                              <>
+                                <span className="mx-1.5 text-t3/60">·</span>
+                                <span className="text-t3">{appointmentBranchName}</span>
+                              </>
+                            )}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                        {isRisky && <RiskBadge level="high" label={`${appt.noShowRisk}% risk`} size="sm" />}
+                        {confirmation && (
+                          <span
+                            title={PATIENT_CONFIRMED_EXPLANATION}
+                            className="inline-flex items-center gap-1 text-[10px] font-bold px-2.5 py-1 rounded-full bg-[var(--emerald-soft)] text-emerald-v border border-emerald-500/20"
+                          >
+                            <UserCheck className="w-3 h-3" aria-hidden="true" /> {PATIENT_CONFIRMED_BADGE}
+                          </span>
+                        )}
+                        <span className={`inline-flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1 rounded-full ${sc.bg} ${sc.text} border border-current/20`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${sc.dot}`} />
+                          {sc.label}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Confirmation Call Link */}
+                    {confirmation && (
+                      <p className="mt-2.5 flex flex-wrap items-center gap-2 text-xs text-emerald-v">
+                        <span id={confirmationDetailId}>{patientConfirmationDetail(confirmation, appointmentTimezone)}</span>
+                        {confirmingCallLogId && canOpenConfirmingCall && (
+                          <button
+                            type="button"
+                            aria-describedby={confirmationDetailId}
+                            onClick={() => navigate(`/receptionist-studio?tab=activity&callId=${encodeURIComponent(confirmingCallLogId)}`)}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition-colors"
+                          >
+                            <PhoneCall className="w-3 h-3" aria-hidden="true" /> Open the call
+                          </button>
+                        )}
+                      </p>
+                    )}
+
+                    {/* Reminder Control */}
+                    <div className="mt-2">
+                      <AppointmentReminderControl
+                        appointmentId={appt.id}
+                        appointmentVersion={appt.version}
+                        canEdit={canWriteAppointments}
+                        eligible={['confirmed', 'risky'].includes(appt.status) && new Date(appt.startsAt).getTime() > Date.now()}
+                      />
+                    </div>
+
+                    {/* Action Buttons */}
+                    {(() => {
+                      const act = availableActions(appt.status);
+                      const busy = rowBusy === appt.id;
+                      return (
+                        <>
+                          <div className="flex items-center gap-2 mt-3 pt-2.5 border-t border-[var(--b1)]/40 flex-wrap">
+                            {act.checkIn && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void setLifecycle(appt.id, 'ARRIVED', 'Checked in.')}
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-v bg-[var(--blue-soft)] hover:bg-blue-500/20 px-3 py-1.5 rounded-xl transition-all disabled:opacity-40"
+                              >
+                                <LogIn className="w-3 h-3" /> Check-in
+                              </button>
+                            )}
+                            {act.complete && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void setLifecycle(appt.id, 'COMPLETED', 'Marked completed.')}
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-v bg-[var(--emerald-soft)] hover:bg-emerald-500/20 px-3 py-1.5 rounded-xl transition-all disabled:opacity-40"
+                              >
+                                <CheckCheck className="w-3 h-3" /> Complete
+                              </button>
+                            )}
+                            {act.noShow && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void setLifecycle(appt.id, 'NO_SHOW', 'Marked no-show.')}
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-v bg-[var(--amber-soft)] hover:bg-amber-500/20 px-3 py-1.5 rounded-xl transition-all disabled:opacity-40"
+                              >
+                                <UserX className="w-3 h-3" /> No-show
+                              </button>
+                            )}
+                            {act.reschedule && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => {
+                                  setRescheduleFor(prev => (prev === appt.id ? null : appt.id));
+                                  setRescheduleForm({
+                                    date: todayInZone(appointmentTimezone, new Date(appt.startsAt)),
+                                    time: clinicTimeInput(appt.startsAt, appointmentTimezone),
+                                  });
+                                }}
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] hover:bg-[var(--s3)] px-3 py-1.5 rounded-xl transition-all disabled:opacity-40"
+                              >
+                                <CalendarClock className="w-3 h-3" /> {rescheduleFor === appt.id ? 'Close' : 'Reschedule'}
+                              </button>
+                            )}
+                            {act.cancel && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void cancelAppointment(appt.id)}
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-v bg-[var(--red-soft)] hover:bg-red-500/20 px-3 py-1.5 rounded-xl transition-all disabled:opacity-40"
+                              >
+                                <XCircle className="w-3 h-3" /> Cancel
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              disabled={intakeBusy === appt.id}
+                              onClick={() => void createAndCopyIntake(appt)}
+                              className="inline-flex items-center gap-1.5 text-xs font-semibold text-violet-v bg-[var(--violet-soft)] hover:bg-violet-500/20 px-3 py-1.5 rounded-xl transition-all disabled:opacity-40"
+                            >
+                              <Zap className="w-3 h-3" /> {intakeBusy === appt.id ? 'Creating…' : 'Create & copy intake link'}
+                            </button>
+                            {!isFrontDesk && (
+                              <button
+                                type="button"
+                                onClick={() => setPaymentApptId(prev => (prev === appt.id ? null : appt.id))}
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] hover:bg-[var(--s3)] px-3 py-1.5 rounded-xl transition-all"
+                              >
+                                <CreditCard className="w-3 h-3" /> {paymentApptId === appt.id ? 'Hide deposit' : 'Deposit'}
+                              </button>
+                            )}
+                          </div>
+                          {rowNotice?.id === appt.id && (
+                            <p role={rowNotice.kind === 'error' ? 'alert' : 'status'} className={`mt-2 rounded-lg px-2.5 py-1 text-xs font-semibold ${rowNotice.kind === 'ok' ? 'bg-[var(--emerald-soft)] text-emerald-v' : 'bg-[var(--red-soft)] text-red-v'}`}>{rowNotice.text}</p>
+                          )}
+                          {rescheduleFor === appt.id && (
+                            <div className="mt-3 p-3 rounded-xl bg-[var(--s3)] border border-[var(--b1)] flex items-center gap-2 flex-wrap">
+                              <input type="date" aria-label="New date" value={rescheduleForm.date ?? todayDate} onChange={e => setRescheduleForm(f => ({ ...f, date: e.target.value }))} className="px-2.5 py-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                              <input type="time" aria-label="New time" value={rescheduleForm.time} onChange={e => setRescheduleForm(f => ({ ...f, time: e.target.value }))} className="px-2.5 py-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                              <button type="button" disabled={busy} onClick={() => void submitReschedule(appt.id)} className="px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 disabled:opacity-40">{busy ? 'Saving…' : 'Confirm'}</button>
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
+                    {!isFrontDesk && paymentApptId === appt.id && (
+                      <div className="mt-3 space-y-3">
+                        <InsuranceIntakeCard appointmentId={appt.id} />
+                        <AppointmentPaymentCard appointmentId={appt.id} />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </BentoCard>
+
           <BentoCard
             title="Insurance Verification Queue"
             subtitle="Point-in-time eligibility responses; provider mode is shown exactly as recorded"
-            headerRight={<span className="text-xs font-semibold text-t3">{queueMode}</span>}
+            headerRight={
+              <div className="flex items-center gap-2">
+                {visibleInsuranceQueue.length > 0 && (
+                  <span className="badge badge-blue text-[11px]">{visibleInsuranceQueue.length} {visibleInsuranceQueue.length === 1 ? 'record' : 'records'}</span>
+                )}
+                <span className="text-xs font-semibold text-t3">{queueMode}</span>
+              </div>
+            }
           >
             {queueError && <p role="alert" className="mb-3 rounded-lg bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">{queueError}</p>}
             {scheduleScopeReady && queueTruncated && <p role="alert" className="mb-3 rounded-lg bg-[var(--amber-soft)] px-3 py-2 text-xs font-semibold text-amber-v">The first 100 verification rows are shown. Select one clinic to narrow this queue before acting.</p>}
@@ -796,8 +1198,8 @@ export default function Scheduling() {
             ) : visibleInsuranceQueue.length === 0 ? (
               <div className="py-8 text-center text-sm text-t3">No appointments found for this clinic scope.</div>
             ) : (
-              <div className="overflow-x-auto rounded-2xl border border-[var(--b1)]">
-                <table className="min-w-[960px] text-sm">
+              <div className="overflow-x-auto rounded-2xl border border-[var(--b1)] max-w-full w-full">
+                <table className="w-full min-w-[780px] text-sm">
                   <thead className="bg-[var(--s2)] text-left text-xs text-t3">
                     <tr>
                       <th className="px-4 py-3">Patient</th>
@@ -854,180 +1256,10 @@ export default function Scheduling() {
               </div>
             )}
           </BentoCard>
-
-          <BentoCard title="Appointment timeline" subtitle={activeDate === todayDate ? "Today's schedule" : clinicDateLabel(activeDate, clinicTimezone, { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
-            <span className="text-xs font-semibold text-t3">{scheduleScopeReady ? `${todayAppts.length} appointments · ${formatCurrency(totalValue)}` : 'Schedule unavailable'}</span>
-          }>
-            {/* The rule the red flags below are asserted against, stated as the
-                value actually used — or the named failure when it could not be
-                read. Never a hardcoded number presented as configured. */}
-            {receivedNoShowPolicy ? (
-              <p className="mb-2 text-[11px] text-t3">
-                Appointments are flagged high no-show risk at a stored risk ≥ {receivedNoShowPolicy.noShowRiskHigh}.
-                {' '}{receivedNoShowPolicy.source === 'tenant' ? 'Configured for this workspace.' : 'Product default — this workspace has not set its own thresholds yet.'}
-              </p>
-            ) : noShowPolicy.state.status === 'error' ? (
-              <p role="alert" className="mb-2 text-[11px] font-semibold text-amber-v">
-                The configured no-show risk threshold could not be loaded, so risk flags are hidden.
-                {' '}<button type="button" onClick={noShowPolicy.reload} className="underline">Retry</button>
-              </p>
-            ) : null}
-            {/* How many of the people on this list have told US they are
-                coming, as distinct from how many the clinic has booked. Both
-                numbers come from the SAME received response — `source` is only
-                'live' once one has landed — so a failed or in-flight load
-                renders no sentence at all rather than "0 of 0". */}
-            {source === 'live' && !appointmentError && todayAppts.length > 0 && (
-              <p className="mb-2 text-[11px] text-t3">
-                {patientConfirmedSummary(patientConfirmedCount, todayAppts.length)}
-                {patientConfirmedCount === 0 ? ' Nobody has answered a reminder yet.' : ''}
-              </p>
-            )}
-            <div className="space-y-2">
-              {!scheduleScopeReady ? (
-                <div className="py-8 text-center text-sm text-t3">Appointments are unavailable until clinic timezones load.</div>
-              ) : todayAppts.length === 0 ? (
-                <div className="py-8 text-center text-sm text-t3">No appointments match the selected date and branch.</div>
-              ) : todayAppts.map((appt) => {
-                const sc = statusConfig[appt.status] ?? statusConfig['confirmed'];
-                const appointmentTimezone = timezoneForBranch(appt.branchId);
-                const appointmentBranchName = branchDisplayNames.get(appt.branchId) ?? 'Clinic';
-                const isRisky = receivedNoShowPolicy !== null && appt.noShowRisk >= receivedNoShowPolicy.noShowRiskHigh;
-                // Null unless the server sent a real confirmation timestamp.
-                // An unconfirmed row renders nothing here — absence means "not
-                // confirmed", and a "not confirmed" badge would be a claim the
-                // clinic never made about a patient nobody has called.
-                const confirmation = appt.patientConfirmation ?? null;
-                const confirmationDetailId = `appt-${appt.id}-patient-confirmation`;
-                // Bound here so the link below cannot be rendered without the
-                // id it needs; a confirmation taken at the desk carries none.
-                const confirmingCallLogId = confirmation?.callLogId ?? null;
-                return (
-                  <div key={appt.id} data-appointment-id={appt.id} className={`flex items-start gap-3 p-3.5 rounded-xl border transition-all hover:bg-[var(--s3)] ${isRisky ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
-                    <div className="text-center shrink-0 w-14">
-                      <p className="text-sm font-bold text-t1">{clinicTimeLabelForAppointment(appt.startsAt, appointmentTimezone, selectedBranch === 'all')}</p>
-                      <p className="text-[10px] text-t3">{appt.value ? formatCurrency(Number(appt.value)) : ''}</p>
-                    </div>
-                    <div className="w-px self-stretch bg-[var(--b1)] shrink-0" />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between gap-2 mb-0.5">
-                        <p className="text-sm font-bold text-t1">{appt.patientName}</p>
-                        <div className="flex items-center gap-2">
-                          {isRisky && <RiskBadge level="high" label={`${appt.noShowRisk}% risk`} size="sm" />}
-                          {confirmation && (
-                            <span
-                              title={PATIENT_CONFIRMED_EXPLANATION}
-                              className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-[var(--emerald-soft)] text-emerald-v"
-                            >
-                              <UserCheck className="w-2.5 h-2.5" aria-hidden="true" /> {PATIENT_CONFIRMED_BADGE}
-                            </span>
-                          )}
-                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg} ${sc.text}`}>{sc.label}</span>
-                        </div>
-                      </div>
-                      <p className="text-xs text-t3">{appt.service} · {appt.doctorName}{selectedBranch === 'all' ? ` · ${appointmentBranchName}` : ''}</p>
-                      {confirmation && (
-                        <p className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-emerald-v">
-                          {/* The id sits on the sentence itself, not on the
-                              paragraph that also wraps the button: a
-                              description that contained the control's own
-                              label would describe it to itself. */}
-                          <span id={confirmationDetailId}>{patientConfirmationDetail(confirmation, appointmentTimezone)}</span>
-                          {/* Straight from the appointment to the call that
-                              evidences it. The description is carried by
-                              aria-describedby from the sentence ABOVE, never
-                              folded into the button's own name — a count or a
-                              date inside a control's accessible name is how
-                              "Clinic Profile1" got announced. */}
-                          {confirmingCallLogId && canOpenConfirmingCall && (
-                            <button
-                              type="button"
-                              aria-describedby={confirmationDetailId}
-                              onClick={() => navigate(`/receptionist-studio?tab=activity&callId=${encodeURIComponent(confirmingCallLogId)}`)}
-                              className="inline-flex items-center gap-1 rounded-full border border-[var(--b1)] bg-[var(--s2)] px-2 py-0.5 font-semibold text-t2 hover:bg-[var(--s3)] transition-colors"
-                            >
-                              <PhoneCall className="w-2.5 h-2.5" aria-hidden="true" /> Open the call
-                            </button>
-                          )}
-                        </p>
-                      )}
-                      <AppointmentReminderControl
-                        appointmentId={appt.id}
-                        appointmentVersion={appt.version}
-                        canEdit={canWriteAppointments}
-                        eligible={['confirmed', 'risky'].includes(appt.status) && new Date(appt.startsAt).getTime() > Date.now()}
-                      />
-                      {(() => {
-                        const act = availableActions(appt.status);
-                        const busy = rowBusy === appt.id;
-                        return (
-                          <>
-                            <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                              <span className="text-[10px] text-t3 capitalize mr-1">{appt.channel}</span>
-                              {act.checkIn && (
-                                <button type="button" disabled={busy} onClick={() => void setLifecycle(appt.id, 'ARRIVED', 'Checked in.')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-v bg-[var(--blue-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
-                                  <LogIn className="w-2.5 h-2.5" /> Check-in
-                                </button>
-                              )}
-                              {act.complete && (
-                                <button type="button" disabled={busy} onClick={() => void setLifecycle(appt.id, 'COMPLETED', 'Marked completed.')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-v bg-[var(--emerald-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
-                                  <CheckCheck className="w-2.5 h-2.5" /> Complete
-                                </button>
-                              )}
-                              {act.noShow && (
-                                <button type="button" disabled={busy} onClick={() => void setLifecycle(appt.id, 'NO_SHOW', 'Marked no-show.')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-v bg-[var(--amber-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
-                                  <UserX className="w-2.5 h-2.5" /> No-show
-                                </button>
-                              )}
-                              {act.reschedule && (
-                                <button type="button" disabled={busy} onClick={() => { setRescheduleFor(prev => (prev === appt.id ? null : appt.id)); setRescheduleForm({ date: todayInZone(appointmentTimezone, new Date(appt.startsAt)), time: clinicTimeInput(appt.startsAt, appointmentTimezone) }); }} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
-                                  <CalendarClock className="w-2.5 h-2.5" /> {rescheduleFor === appt.id ? 'Close' : 'Reschedule'}
-                                </button>
-                              )}
-                              {act.cancel && (
-                                <button type="button" disabled={busy} onClick={() => void cancelAppointment(appt.id)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-red-v bg-[var(--red-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
-                                  <XCircle className="w-2.5 h-2.5" /> Cancel
-                                </button>
-                              )}
-                              <button type="button" disabled={intakeBusy === appt.id} onClick={() => void createAndCopyIntake(appt)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-violet-v bg-[var(--violet-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
-                                <Zap className="w-2.5 h-2.5" /> {intakeBusy === appt.id ? 'Creating…' : 'Create & copy intake link'}
-                              </button>
-                              {/* Deposit-evaluate excludes FRONT_DESK by design — hide rather than 403. */}
-                              {!isFrontDesk && (
-                                <button type="button" onClick={() => setPaymentApptId(prev => (prev === appt.id ? null : appt.id))} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors">
-                                  <CreditCard className="w-2.5 h-2.5" /> {paymentApptId === appt.id ? 'Hide deposit' : 'Deposit'}
-                                </button>
-                              )}
-                            </div>
-                            {rowNotice?.id === appt.id && (
-                              <p role={rowNotice.kind === 'error' ? 'alert' : 'status'} className={`mt-1.5 rounded px-2 py-1 text-[10px] font-semibold ${rowNotice.kind === 'ok' ? 'bg-[var(--emerald-soft)] text-emerald-v' : 'bg-[var(--red-soft)] text-red-v'}`}>{rowNotice.text}</p>
-                            )}
-                            {rescheduleFor === appt.id && (
-                              <div className="mt-2 flex items-center gap-1.5 flex-wrap">
-                                <input type="date" aria-label="New date" value={rescheduleForm.date ?? todayDate} onChange={e => setRescheduleForm(f => ({ ...f, date: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
-                                <input type="time" aria-label="New time" value={rescheduleForm.time} onChange={e => setRescheduleForm(f => ({ ...f, time: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
-                                <button type="button" disabled={busy} onClick={() => void submitReschedule(appt.id)} className="px-2.5 py-1 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 disabled:opacity-40">{busy ? 'Saving…' : 'Confirm'}</button>
-                              </div>
-                            )}
-                          </>
-                        );
-                      })()}
-                      {!isFrontDesk && paymentApptId === appt.id && (
-                        <div className="mt-2.5 space-y-2.5">
-                          <InsuranceIntakeCard appointmentId={appt.id} />
-                          <AppointmentPaymentCard appointmentId={appt.id} />
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </BentoCard>
         </div>
 
         {/* Right sidebar */}
-        <div className="space-y-4">
+        <div className="space-y-4 min-w-0">
           {/* Provider records + working hours — what every booking resolves against */}
           <ProviderSetupPanel
             user={user}

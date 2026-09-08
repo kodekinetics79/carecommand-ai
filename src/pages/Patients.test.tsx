@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -137,5 +137,54 @@ describe('Patients multi-clinic records', () => {
     expect(screen.getByText('Selected clinic')).toBeInTheDocument();
     expect(screen.getByText('Selected clinic only')).toBeInTheDocument();
     expect(screen.getByText('3 patients are in the risk review queue')).toBeInTheDocument();
+  });
+});
+
+describe('Patients add patient modal', () => {
+  it('opens accessible modal with proper labels and submits a new patient', async () => {
+    handlers['GET /v1/auth/me'] = () => ({
+      user: { id: 'u1', role: 'ADMIN' },
+      access: { permissions: ['patient:write', 'patient:read'] },
+    });
+    handlers['GET /v1/patients?limit=25'] = () => [];
+    handlers['GET /v1/branches?limit=100'] = () => [
+      { id: 'branch-1', name: 'Downtown Clinic', active: true },
+    ];
+    handlers['GET /v1/patients/summary'] = () => SUMMARY;
+    let postBody: Record<string, unknown> | null = null;
+    handlers['POST /v1/patients'] = (init) => {
+      postBody = JSON.parse(String(init?.body ?? '{}'));
+      return { id: 'patient-new' };
+    };
+
+    renderPage();
+    const addBtn = await screen.findByRole('button', { name: /Add Patient/ });
+    fireEvent.click(addBtn);
+
+    const dialog = screen.getByRole('dialog', { name: /Add Patient/ });
+    expect(dialog).toBeInTheDocument();
+
+    // Check visible field labels
+    expect(screen.getByText('First name')).toBeInTheDocument();
+    expect(screen.getByText('Last name')).toBeInTheDocument();
+    expect(screen.getByText('Email address')).toBeInTheDocument();
+    expect(screen.getByText('Phone number')).toBeInTheDocument();
+    expect(screen.getByText('Clinic branch')).toBeInTheDocument();
+    expect(screen.getByText('Lifecycle stage')).toBeInTheDocument();
+
+    // Fill required inputs
+    fireEvent.change(screen.getByRole('textbox', { name: 'First name' }), { target: { value: 'Alex' } });
+    fireEvent.change(screen.getByRole('textbox', { name: 'Last name' }), { target: { value: 'Rivera' } });
+
+    // Click submit
+    fireEvent.click(within(dialog).getByRole('button', { name: /Add Patient/ }));
+
+    await waitFor(() => {
+      expect(postBody).toMatchObject({
+        firstName: 'Alex',
+        lastName: 'Rivera',
+        branchId: 'branch-1',
+      });
+    });
   });
 });

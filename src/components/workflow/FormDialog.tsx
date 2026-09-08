@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Loader2, X } from 'lucide-react';
 
 export interface FormDialogField {
@@ -77,8 +78,8 @@ export default function FormDialog({
     }
   }
 
-  return (
-    <div className="fixed inset-0 z-[60] grid place-items-center p-4" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={message ? messageId : undefined}>
+  return createPortal(
+    <div className="fixed inset-0 z-[100] grid place-items-center p-4 overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={message ? messageId : undefined}>
       <button type="button" aria-label="Close" title="Close" onClick={onClose} className="absolute inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
       <div ref={dialogRef} className="relative w-full max-w-md glass-surface rounded-2xl p-5 animate-fade-up">
         <div className="mb-4 flex items-start justify-between gap-3">
@@ -121,6 +122,7 @@ export default function FormDialog({
           </div>
         </form>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
