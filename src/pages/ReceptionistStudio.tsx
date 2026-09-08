@@ -401,10 +401,13 @@ export default function ReceptionistStudio() {
           <div className="min-w-0 space-y-4">
             {/*
               SF-3 / SF-4. The strip and the rail sit above the tabs on every
-              screen, so "is the line answering, and what is blocking it" is
-              never more than one glance away, whichever tab is open.
+              inbound-receptionist screen, so "is the line answering, and what
+              is blocking it" is never more than one glance away. Outreach is
+              deliberately excluded: it has its own outbound readiness state,
+              and placing a draft inbound status beside "Calling ready" made
+              two different services look contradictory.
             */}
-            {activeCampaign && <ServiceStatusStrip status={status} />}
+            {activeCampaign && tab !== 'outbound' && <ServiceStatusStrip status={status} />}
             {activeCampaign && tab !== 'campaign' && readinessResource.state.status === 'error' && (
               <LoadFailureNotice what="Activation readiness" message={readinessResource.state.failure.message} onRetry={reloadRail} />
             )}
