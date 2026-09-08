@@ -10,6 +10,7 @@ vi.mock('../lib/api', async () => {
 });
 
 import { GROWTH_POLICY_PATH } from '../lib/growthPolicy';
+import { clinicTimeToUtc, todayInZone } from '../lib/clinicTime';
 import Scheduling from './Scheduling';
 
 /**
@@ -35,9 +36,14 @@ interface ConfirmationFields {
   patientConfirmedCallLogId?: string | null;
 }
 
+const CLINIC_TIMEZONE = 'America/New_York';
+
 function appointment(id: string, confirmation: ConfirmationFields = {}) {
-  const startsAt = new Date();
-  startsAt.setHours(14, 30, 0, 0);
+  // Pin the fixture to TODAY IN THE CLINIC, not today on the CI runner. During
+  // the UTC-midnight / New-York-evening window those are different dates; the
+  // prior fixture placed every row on tomorrow's clinic schedule and six tests
+  // timed out together despite the product being correct.
+  const startsAt = clinicTimeToUtc(todayInZone(CLINIC_TIMEZONE), '14:30', CLINIC_TIMEZONE);
   return {
     id,
     patientId: `patient-${id}`,
@@ -92,7 +98,7 @@ function respondWith(options: {
     if (path.startsWith('/v1/providers/overview')) return Promise.resolve([]);
     if (path.startsWith('/v1/patients')) return Promise.resolve([]);
     if (path.startsWith('/v1/branches')) {
-      return Promise.resolve([{ id: 'branch-1', name: 'Bright Health Arlington', timezone: 'America/New_York' }]);
+      return Promise.resolve([{ id: 'branch-1', name: 'Bright Health Arlington', timezone: CLINIC_TIMEZONE }]);
     }
     if (path.startsWith('/v1/revenue-protection/appointment-queue')) return Promise.resolve({ appointments: [] });
     if (path === GROWTH_POLICY_PATH) return Promise.resolve({ source: 'default', noShowRiskHigh: 50 });
