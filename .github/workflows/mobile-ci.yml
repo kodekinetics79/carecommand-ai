@@ -26,4 +26,8 @@ jobs:
         with:
           node-version: '22.13.1'
       - run: npm install
+      - name: Verify Expo SDK dependency compatibility
+        run: npx expo install --check
+      - name: Audit production dependencies (high+)
+        run: npm audit --omit=dev --audit-level=high
       - run: npm run typecheck
