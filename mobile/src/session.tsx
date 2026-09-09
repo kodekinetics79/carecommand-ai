@@ -120,7 +120,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setMfa(null);
     try {
       const result = await staffLogin(input);
-      if ('status' in result && (result.status === 'mfa_required' || result.status === 'mfa_setup_required')) {
+      if ('mfaToken' in result) {
         if (result.status === 'mfa_setup_required') {
           const setup = await staffMfaSetup(result.mfaToken);
           setMfa({ token: result.mfaToken, mode: 'setup', secret: setup.secret, otpauthUri: setup.otpauthUri });
