@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "CareCommand",
+    "slug": "carecommand-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "carecommand",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.kodekinetics.carecommand",
+      "config": { "usesNonExemptEncryption": false }
+    },
+    "android": {
+      "package": "com.kodekinetics.carecommand",
+      "predictiveBackGestureEnabled": true
+    },
+    "plugins": [
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true,
+          "faceIDPermission": "Allow CareCommand to use Face ID to protect your session."
+        }
+      ]
+    ]
+  }
+}
