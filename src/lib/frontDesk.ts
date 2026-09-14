@@ -288,6 +288,7 @@ export interface CallStaffTaskRef {
 
 /** Detail = today's CallLog plus the C4 additions. `handoffReferences` stays as a one-cycle alias of `staffTasks`. */
 export interface CallLogDetail extends CallLog {
+  callerPhoneMasked?: string | null;
   recordingConsentStatus?: RecordingConsentStatus | null;
   patient?: { id: string; firstName: string; lastName: string } | null;
   staffTasks?: CallStaffTaskRef[];

@@ -83,6 +83,9 @@ const emptyEvidence = () => ({
 export default function InsuranceEligibility() {
   const [capability, setCapability] = useState<EligibilityCapability | null>(null);
   const [patients, setPatients] = useState<CrmPatient[]>([]);
+  const [acceptedPayers, setAcceptedPayers] = useState<Array<{ id: string; name: string }>>([]);
+  const [patientPolicies, setPatientPolicies] = useState<Array<{ id: string; planName: string; memberId: string; payer?: { name: string } | null; active: boolean }>>([]);
+  const [loadingPolicies, setLoadingPolicies] = useState(false);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [form, setForm] = useState({ patientId: '', payerName: '', memberId: '', planName: '', serviceType: '', serviceDate: '' });
@@ -102,18 +105,50 @@ export default function InsuranceEligibility() {
   }, [reconciliationFilter]);
   const load = useCallback(async () => {
     try {
-      const [caps, pats] = await Promise.all([
+      const [caps, pats, payers] = await Promise.all([
         apiRequest<EligibilityCapability[]>('/v1/capabilities'),
         crmService.getPatients().catch(() => [] as CrmPatient[]),
+        apiRequest<Array<{ id: string; name: string }>>('/v1/insurance/accepted').catch(() => [] as Array<{ id: string; name: string }>),
       ]);
       setCapability(caps.find(row => row.key === 'eligibility_checks') ?? null);
       setPatients(pats);
+      setAcceptedPayers(payers);
       await Promise.all([loadHistory(), loadReconciliations()]);
     } catch (e) { setError(e instanceof Error ? e.message : 'Failed to load'); }
     finally { setLoading(false); }
   }, [loadHistory, loadReconciliations]);
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void load(); }, [load]);
+
+  const onSelectPatient = async (patientId: string) => {
+    setError(null);
+    setResult(null);
+    setForm(f => ({ ...f, patientId, payerName: '', memberId: '', planName: '' }));
+    if (!patientId) {
+      setPatientPolicies([]);
+      return;
+    }
+    setLoadingPolicies(true);
+    try {
+      const rows = await apiRequest<Array<{ id: string; planName: string; memberId: string; payer?: { name: string } | null; active: boolean }>>(`/v1/insurance/policies?patientId=${patientId}`);
+      const activeRows = rows.filter(r => r.active && r.payer?.name);
+      setPatientPolicies(activeRows);
+      if (activeRows.length > 0) {
+        const primary = activeRows[0];
+        setForm(f => ({
+          ...f,
+          patientId,
+          payerName: primary.payer?.name ?? '',
+          memberId: primary.memberId ?? '',
+          planName: primary.planName ?? '',
+        }));
+      }
+    } catch {
+      setPatientPolicies([]);
+    } finally {
+      setLoadingPolicies(false);
+    }
+  };
 
   // Unknown is not the same as unavailable: while the capability is still
   // loading the control stays disabled and says so, rather than rendering as
@@ -209,12 +244,63 @@ export default function InsuranceEligibility() {
           )}
           <div className="space-y-2.5">
             <Field label="Patient">
-              <select aria-label="Patient" value={form.patientId} onChange={e => setForm(f => ({ ...f, patientId: e.target.value }))} className={inputCls}>
+              <select aria-label="Patient" value={form.patientId} onChange={e => void onSelectPatient(e.target.value)} className={inputCls}>
                 <option value="">Select a patient…</option>
                 {patients.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
             </Field>
-            <Field label="Payer name"><input value={form.payerName} onChange={e => setForm(f => ({ ...f, payerName: e.target.value }))} placeholder="e.g. Aetna" className={inputCls} /></Field>
+
+            {form.patientId && !loadingPolicies && patientPolicies.length === 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-[var(--amber-soft)] p-3 text-[12px] text-amber-v space-y-1">
+                <p className="font-semibold">No active insurance policy on file for this patient.</p>
+                <p className="text-t2 text-[11px] leading-relaxed">
+                  CareCommand verifies point-in-time eligibility against a recorded patient policy with an active payer.
+                  Please add a policy under <strong>Patients → Insurance</strong>, or test with a patient who has active coverage (e.g. <strong>Sophie Laurent</strong>).
+                </p>
+              </div>
+            )}
+
+            {form.patientId && patientPolicies.length > 1 && (
+              <div className="space-y-1.5">
+                <p className="text-[11px] font-semibold text-t3">Patient's recorded policies:</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {patientPolicies.map(pol => (
+                    <button
+                      key={pol.id}
+                      type="button"
+                      onClick={() => setForm(f => ({
+                        ...f,
+                        payerName: pol.payer?.name ?? '',
+                        memberId: pol.memberId,
+                        planName: pol.planName,
+                      }))}
+                      className={`px-2.5 py-1 text-xs rounded-lg border transition ${
+                        form.memberId === pol.memberId
+                          ? 'border-[var(--indigo)] bg-[var(--indigo-soft)] text-indigo font-semibold'
+                          : 'border-[var(--b1)] bg-[var(--s2)] text-t2 hover:bg-[var(--s3)]'
+                      }`}
+                    >
+                      {pol.payer?.name} ({pol.memberId})
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <Field label="Payer name">
+              <input
+                list="accepted-payers-list"
+                value={form.payerName}
+                onChange={e => setForm(f => ({ ...f, payerName: e.target.value }))}
+                placeholder="e.g. UnitedHealthcare, Aetna, Blue Cross"
+                className={inputCls}
+              />
+              <datalist id="accepted-payers-list">
+                {acceptedPayers.map(payer => (
+                  <option key={payer.id} value={payer.name} />
+                ))}
+              </datalist>
+            </Field>
             <Field label="Member ID"><input value={form.memberId} onChange={e => setForm(f => ({ ...f, memberId: e.target.value }))} placeholder="e.g. AET-110293" autoComplete="off" className={inputCls} /></Field>
             <Field label="Plan name (optional)"><input value={form.planName} onChange={e => setForm(f => ({ ...f, planName: e.target.value }))} placeholder="e.g. Aetna Core Plus" className={inputCls} /></Field>
             <Field label="Requested service (optional)"><input value={form.serviceType} onChange={e => setForm(f => ({ ...f, serviceType: e.target.value }))} placeholder="e.g. Office visit" className={inputCls} /></Field>

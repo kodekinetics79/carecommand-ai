@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, X, FileJson, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { RefreshCw, X, FileJson, CheckCircle2, XCircle, AlertTriangle, Copy, Check } from 'lucide-react';
 import type { ElementType } from 'react';
 import BentoCard from '../components/ui/BentoCard';
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
@@ -76,30 +77,160 @@ export default function DeviceSyncLogs() {
           )}
       </BentoCard>
 
-      {detail && (
-        <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label="Raw sync payload">
-          <button type="button" aria-label="Close" onClick={() => setDetail(null)} className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-fade-in" />
-          <div className="relative w-full max-w-lg glass-surface h-full overflow-y-auto animate-fade-up flex flex-col">
-            <header className="sticky top-0 z-10 flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--b1)] glass-surface-head">
-              <div><p className="text-base font-bold text-t1 capitalize">{detail.providerKey} · {detail.event}</p><p className="text-[11px] text-t3">{fmt(detail.createdAt)} · {detail.message}</p></div>
-              <button type="button" onClick={() => setDetail(null)} aria-label="Close" className="text-t3 hover:text-t1"><X className="w-5 h-5" /></button>
-            </header>
-            <div className="p-5 space-y-3">
-              <div className="grid grid-cols-2 gap-2 text-[12px]">
-                <Info label="Status" value={detail.status} /><Info label="HTTP" value={String(detail.httpStatus ?? '—')} />
-                <Info label="Signature" value={detail.signatureValid === null ? 'n/a' : detail.signatureValid ? 'valid' : 'invalid'} /><Info label="Readings" value={String(detail.readingsIngested)} />
-              </div>
-              <p className="text-[11px] font-bold uppercase tracking-wide text-t3 inline-flex items-center gap-1.5"><FileJson className="w-3.5 h-3.5" /> Raw payload</p>
-              <pre className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] p-3 text-[11px] text-t1 overflow-x-auto font-mono leading-relaxed">{JSON.stringify(detail.payload ?? {}, null, 2)}</pre>
-            </div>
-          </div>
-        </div>
-      )}
+      {detail && <SyncLogDetailDrawer detail={detail} onClose={() => setDetail(null)} />}
     </div>
   );
 }
 
-const thCls = 'px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-t3';
-function Info({ label, value }: { label: string; value: string }) {
-  return <div className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1.5"><p className="text-[10px] uppercase tracking-wide text-t3">{label}</p><p className="text-[12px] font-semibold text-t1">{value}</p></div>;
+function SyncLogDetailDrawer({
+  detail,
+  onClose,
+}: {
+  detail: SyncLogDetail;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  const copyPayload = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(detail.payload ?? {}, null, 2));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // ignore
+    }
+  };
+
+  const meta = STATUS_META[detail.status] ?? STATUS_META.error;
+  const SIcon = meta.icon;
+
+  const drawerElement = (
+    <div
+      className="fixed inset-0 z-[100] flex justify-end"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="sync-log-drawer-title"
+    >
+      {/* Full-screen backdrop */}
+      <button
+        type="button"
+        aria-label="Close drawer"
+        onClick={onClose}
+        className="fixed inset-0 bg-black/50 backdrop-blur-sm transition-opacity animate-fade-in"
+      />
+
+      {/* Slide-out drawer panel */}
+      <div className="relative flex h-full w-full max-w-xl flex-col border-l border-[var(--b1)] bg-white dark:bg-slate-900 shadow-2xl animate-fade-up outline-none overflow-hidden z-10">
+        <header className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-[var(--b1)] bg-[var(--s2)]/95 px-6 py-4 backdrop-blur-md">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--indigo-soft)] text-indigo">
+              <FileJson className="h-5 w-5" aria-hidden="true" />
+            </div>
+            <div className="min-w-0">
+              <h2 id="sync-log-drawer-title" className="text-base font-bold text-t1 tracking-tight truncate capitalize">
+                {detail.providerKey} · {detail.event}
+              </h2>
+              <p className="text-[11px] text-t3 truncate">
+                {fmt(detail.createdAt)}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-lg p-1.5 text-t3 hover:bg-[var(--s3)] hover:text-t1 transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-t3">Status</p>
+              <div className="mt-1">
+                <span className={`badge ${meta.cls} inline-flex items-center gap-1 text-[11px]`}>
+                  <SIcon className="w-3 h-3" />
+                  {detail.status}
+                </span>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-t3">HTTP Status</p>
+              <p className="mt-1 text-[13px] font-bold text-t1 font-mono">{detail.httpStatus ?? '—'}</p>
+            </div>
+
+            <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-t3">Signature</p>
+              <div className="mt-1 text-[12px] font-semibold">
+                {detail.signatureValid === null ? (
+                  <span className="text-t3">n/a</span>
+                ) : detail.signatureValid ? (
+                  <span className="text-emerald-v inline-flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5" /> Valid</span>
+                ) : (
+                  <span className="text-red-v inline-flex items-center gap-1"><XCircle className="w-3.5 h-3.5" /> Invalid</span>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-t3">Readings / Alerts</p>
+              <p className="mt-1 text-[13px] font-bold text-t1 tabular-nums">
+                {detail.readingsIngested} <span className="text-t3 font-normal text-xs">/</span> {detail.alertsCreated}
+              </p>
+            </div>
+          </div>
+
+          {detail.message && (
+            <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3.5 text-xs text-t2">
+              <span className="font-semibold text-t1">Event Note:</span> {detail.message}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-t3 inline-flex items-center gap-1.5">
+                <FileJson className="w-3.5 h-3.5 text-indigo" /> Raw payload
+              </p>
+              <button
+                type="button"
+                onClick={copyPayload}
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-t2 hover:text-t1 px-2.5 py-1 rounded-md border border-[var(--b1)] hover:bg-[var(--s2)] transition"
+              >
+                {copied ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-v" />
+                    <span className="text-emerald-v">Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5 text-t3" />
+                    <span>Copy JSON</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            <pre className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-4 text-[12px] text-t1 overflow-x-auto font-mono leading-relaxed max-h-[60vh]">
+              {JSON.stringify(detail.payload ?? {}, null, 2)}
+            </pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return createPortal(drawerElement, document.body);
 }
+
+const thCls = 'px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-t3';

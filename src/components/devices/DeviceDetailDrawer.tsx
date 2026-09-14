@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type ElementType } from 'react';
+import { createPortal } from 'react-dom';
 import {
   X, Cpu, Wifi, WifiOff, AlertTriangle, Clock, Activity, FlaskConical, MonitorSmartphone,
   ScanLine, Radio, Watch, CheckCircle2, Trash2, Settings, Plus, History, Save, Loader2,
@@ -124,10 +125,10 @@ export default function DeviceDetailDrawer({ deviceId, onClose, onChanged }: { d
   const sm = d ? (STATUS_META[d.status] ?? STATUS_META.pending) : STATUS_META.pending;
   const SIcon = sm.icon;
 
-  return (
-    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label="Device details">
-      <button type="button" aria-label="Close panel" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-fade-in" />
-      <div className="relative w-full max-w-md glass-surface h-full overflow-y-auto animate-fade-up flex flex-col">
+  const drawerElement = (
+    <div className="fixed inset-0 z-[90] flex justify-end" role="dialog" aria-modal="true" aria-label="Device details">
+      <button type="button" aria-label="Close panel" onClick={onClose} className="fixed inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
+      <div className="relative w-full max-w-md glass-surface h-full overflow-y-auto animate-fade-up flex flex-col z-10 shadow-2xl">
         <header className="sticky top-0 z-10 flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--b1)] glass-surface-head">
           <div className="flex items-center gap-3 min-w-0">
             <span className="w-10 h-10 rounded-xl bg-[var(--indigo-soft)] grid place-items-center shrink-0"><TIcon className="w-5 h-5 text-indigo" /></span>
@@ -240,6 +241,8 @@ export default function DeviceDetailDrawer({ deviceId, onClose, onChanged }: { d
       </div>
     </div>
   );
+
+  return createPortal(drawerElement, document.body);
 }
 
 const inputCls = 'w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]';

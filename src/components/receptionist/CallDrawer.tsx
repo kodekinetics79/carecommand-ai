@@ -13,7 +13,6 @@ import {
   PhoneOutgoing,
   ShieldAlert,
   Sparkles,
-  User,
   X,
 } from 'lucide-react';
 import { frontDeskApi, type CallLogDetail } from '../../lib/frontDesk';

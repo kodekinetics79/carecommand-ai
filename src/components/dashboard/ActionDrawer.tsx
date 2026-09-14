@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { X, Megaphone, ArrowRight } from 'lucide-react';
 import { formatCurrency } from '../../utils/formatters';
 import { type PriorityAction, type Severity } from '../../lib/dashboardService';
@@ -17,10 +18,10 @@ export default function ActionDrawer({ action, onClose, onNavigate }: { action: 
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  return (
-    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={action.title}>
-      <button type="button" aria-label="Close panel" title="Close panel" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-fade-in" />
-      <div className="relative w-full max-w-md glass-surface h-full overflow-y-auto animate-fade-up flex flex-col">
+  const drawerElement = (
+    <div className="fixed inset-0 z-[90] flex justify-end" role="dialog" aria-modal="true" aria-label={action.title}>
+      <button type="button" aria-label="Close panel" title="Close panel" onClick={onClose} className="fixed inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
+      <div className="relative w-full max-w-md glass-surface h-full overflow-y-auto animate-fade-up flex flex-col z-10 shadow-2xl">
         <header className="sticky top-0 z-10 flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--b1)] glass-surface-head">
           <div>
             <div className="flex items-center gap-2 mb-1">
@@ -52,6 +53,8 @@ export default function ActionDrawer({ action, onClose, onNavigate }: { action: 
       </div>
     </div>
   );
+
+  return createPortal(drawerElement, document.body);
 }
 
 function Detail({ label, value }: { label: string; value: string }) {

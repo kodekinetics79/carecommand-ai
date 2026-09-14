@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { X, User, Mail, Phone, CalendarDays, ShieldCheck, CreditCard, Sparkles, Tag } from 'lucide-react';
 import { formatCurrency } from '../../utils/formatters';
 import ConsentBadgeGroup from './ConsentBadgeGroup';
@@ -33,10 +34,10 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
 
   const consent = patient?.consent ?? lead?.consent ?? { email: 'unknown', sms: 'unknown', whatsapp: 'unknown', voice: 'unknown', evidenceAvailable: false };
 
-  return (
-    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={`${subjectName} growth profile`}>
-      <button type="button" aria-label="Close panel" title="Close panel" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-fade-in" />
-      <div className="relative w-full max-w-md glass-surface h-full overflow-y-auto animate-fade-up flex flex-col">
+  const drawerElement = (
+    <div className="fixed inset-0 z-[90] flex justify-end" role="dialog" aria-modal="true" aria-label={`${subjectName} growth profile`}>
+      <button type="button" aria-label="Close panel" title="Close panel" onClick={onClose} className="fixed inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
+      <div className="relative w-full max-w-md glass-surface h-full overflow-y-auto animate-fade-up flex flex-col z-10 shadow-2xl">
         <header className="sticky top-0 z-10 flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--b1)] glass-surface-head">
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-10 h-10 rounded-full logo-user grid place-items-center text-[12px] font-bold text-white shrink-0">{subjectName.split(' ').map(s => s[0]).slice(0, 2).join('')}</div>
@@ -118,6 +119,8 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
       </div>
     </div>
   );
+
+  return createPortal(drawerElement, document.body);
 }
 
 function Block({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {

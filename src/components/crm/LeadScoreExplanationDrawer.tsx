@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { X, TrendingUp, TrendingDown, Sparkles, Clock, Radio } from 'lucide-react';
 import { formatCurrency } from '../../utils/formatters';
 import type { CrmLead, ScoreBand } from '../../lib/crmService';
@@ -21,10 +22,10 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
   const negatives = lead.scoreDrivers.filter(d => !d.positive);
   const tone = BAND_TONE[lead.scoreBand];
 
-  return (
-    <div className="fixed inset-0 z-[55] flex justify-end" role="dialog" aria-modal="true" aria-label="Lead score explanation">
-      <button type="button" aria-label="Close" title="Close" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-fade-in" />
-      <div className="relative w-full max-w-sm glass-surface h-full overflow-y-auto animate-fade-up">
+  const drawerElement = (
+    <div className="fixed inset-0 z-[90] flex justify-end" role="dialog" aria-modal="true" aria-label="Lead score explanation">
+      <button type="button" aria-label="Close" title="Close" onClick={onClose} className="fixed inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
+      <div className="relative w-full max-w-sm glass-surface h-full overflow-y-auto animate-fade-up z-10 shadow-2xl">
         <header className="sticky top-0 z-10 flex items-center justify-between px-5 py-4 border-b border-[var(--b1)] glass-surface-head">
           <div className="flex items-center gap-2"><Sparkles className="w-4 h-4 text-violet-v" /><h2 className="text-sm font-bold text-t1">Why this score?</h2></div>
           <button type="button" onClick={onClose} aria-label="Close" className="text-t3 hover:text-t1"><X className="w-5 h-5" /></button>
@@ -66,6 +67,8 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
       </div>
     </div>
   );
+
+  return createPortal(drawerElement, document.body);
 }
 
 function Section({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) {

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { X, Megaphone, MessageSquare, PhoneCall, CalendarPlus, Send, Users, Clock3, Ban, CheckCircle2 } from 'lucide-react';
 import OpportunityDetailPanel from './OpportunityDetailPanel';
 import ConfirmationModal from '../workflow/ConfirmationModal';
@@ -37,16 +38,16 @@ export default function OpportunityActionDrawer({ opportunity, onClose, onChange
 
   const ctas = ctasFor(opportunity);
 
-  return (
-    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={opportunity.title}>
-      <button type="button" aria-label="Close panel" title="Close panel" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-fade-in" />
-      <div className="relative w-full max-w-lg glass-surface h-full overflow-y-auto animate-fade-up flex flex-col">
+  const drawerElement = (
+    <div className="fixed inset-0 z-[90] flex justify-end" role="dialog" aria-modal="true" aria-label={opportunity.title}>
+      <button type="button" aria-label="Close panel" title="Close panel" onClick={onClose} className="fixed inset-0 bg-black/45 backdrop-blur-sm animate-fade-in" />
+      <div className="relative w-full max-w-lg glass-surface h-full overflow-y-auto animate-fade-up flex flex-col z-10 shadow-2xl">
         <header className="sticky top-0 z-10 flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--b1)] glass-surface-head">
           <div className="min-w-0">
             <p className="text-[10px] font-bold uppercase tracking-wider text-t3">{opportunity.department} · {opportunity.branch}</p>
             <h2 className="text-base font-bold text-t1 leading-tight mt-0.5">{opportunity.title}</h2>
           </div>
-          <button type="button" onClick={onClose} aria-label="Close" className="text-t3 hover:text-t1 shrink-0"><X className="w-5 h-5" /></button>
+          <button type="button" onClick={onClose} aria-label="Close" className="text-t3 hover:text-t1 shrink-0 p-1 -mr-1 rounded-lg hover:bg-[var(--s2)] transition"><X className="w-5 h-5" /></button>
         </header>
 
         <div className="p-5 flex-1">
@@ -103,6 +104,8 @@ export default function OpportunityActionDrawer({ opportunity, onClose, onChange
       )}
     </div>
   );
+
+  return createPortal(drawerElement, document.body);
 }
 
 function SmallBtn({ icon: Icon, label, onClick }: { icon: typeof Clock3; label: string; onClick: () => void }) {
