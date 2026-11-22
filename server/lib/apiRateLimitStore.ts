@@ -8,6 +8,8 @@ import { assertProductionRateLimitStore } from './rateLimitPolicy';
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 2_000;
 const DEFAULT_CIRCUIT_COOLDOWN_MS = 1_000;
+const DEFAULT_STARTUP_ATTEMPTS = 3;
+const DEFAULT_STARTUP_RETRY_DELAY_MS = 125;
 
 type RateLimitCommandDefinition = {
   numberOfKeys: number;
@@ -230,40 +232,58 @@ export async function acquireApiRateLimitStore(input: {
   redisUrl: string;
   connectTimeoutMs?: number;
   commandTimeoutMs?: number;
+  startupAttempts?: number;
+  startupRetryDelayMs?: number;
   createClient?: (redisUrl: string) => ApiRateLimitClient;
 }): Promise<ApiRateLimitRedis | undefined> {
-  const manager = createApiRateLimitStoreManager({
-    createClient: () => (input.createClient ?? createRedisClient)(input.redisUrl),
-    connectTimeoutMs: input.connectTimeoutMs,
-    commandTimeoutMs: input.commandTimeoutMs,
-  });
-  try {
-    await manager.connect();
-    return manager.store;
-  } catch (error) {
-    manager.close();
-    if (input.nodeEnv === 'production') {
+  const attempts = input.startupAttempts
+    ?? (input.nodeEnv === 'production' ? DEFAULT_STARTUP_ATTEMPTS : 1);
+  const retryDelayMs = input.startupRetryDelayMs ?? DEFAULT_STARTUP_RETRY_DELAY_MS;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const manager = createApiRateLimitStoreManager({
+      createClient: () => (input.createClient ?? createRedisClient)(input.redisUrl),
+      connectTimeoutMs: input.connectTimeoutMs,
+      commandTimeoutMs: input.commandTimeoutMs,
+    });
+    try {
+      await manager.connect();
+      return manager.store;
+    } catch (error) {
+      manager.close();
+      lastError = error;
       const message = error instanceof Error ? error.message : '';
-      const reason = message.includes('connection timed out')
-        ? 'connect_timeout'
-        : /ECONNREFUSED/i.test(message)
-          ? 'connection_refused'
-          : /ETIMEDOUT/i.test(message)
-            ? 'connect_timeout'
-        : message.includes('did not become ready')
-          ? 'not_ready'
-          : message.includes('Connection is closed')
-            ? 'connection_closed'
-          : /WRONGPASS|NOAUTH|authentication/i.test(message)
-            ? 'authentication_failed'
-            : /ENOTFOUND|EAI_AGAIN/i.test(message)
-              ? 'dns_failed'
-              : /certificate|TLS|SSL/i.test(message)
-                ? 'tls_failed'
-                : 'connection_failed';
-      throw new Error(`RateLimit: distributed store is required in production (${reason})`, { cause: error });
+      const retryable = /EBUSY|EAI_AGAIN|ETIMEDOUT|ECONNRESET|Connection is closed|socket hang up/i.test(message);
+      if (attempt < attempts && retryable) {
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs * attempt));
+        continue;
+      }
+      break;
     }
-    assertProductionRateLimitStore(input.nodeEnv, undefined);
-    return undefined;
   }
+
+  if (input.nodeEnv === 'production') {
+    const message = lastError instanceof Error ? lastError.message : '';
+    const reason = message.includes('connection timed out')
+      ? 'connect_timeout'
+      : /ECONNREFUSED/i.test(message)
+        ? 'connection_refused'
+        : /ETIMEDOUT/i.test(message)
+          ? 'connect_timeout'
+          : message.includes('did not become ready')
+            ? 'not_ready'
+            : message.includes('Connection is closed')
+              ? 'connection_closed'
+              : /WRONGPASS|NOAUTH|authentication/i.test(message)
+                ? 'authentication_failed'
+                : /ENOTFOUND|EAI_AGAIN|EBUSY/i.test(message)
+                  ? 'dns_failed'
+                  : /certificate|TLS|SSL/i.test(message)
+                    ? 'tls_failed'
+                    : 'connection_failed';
+    throw new Error(`RateLimit: distributed store is required in production (${reason})`, { cause: lastError });
+  }
+  assertProductionRateLimitStore(input.nodeEnv, undefined);
+  return undefined;
 }

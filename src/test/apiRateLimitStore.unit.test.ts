@@ -94,6 +94,7 @@ describe('API rate-limit store', () => {
     await expect(acquireApiRateLimitStore({
       nodeEnv: 'production',
       redisUrl: 'rediss://redis.example.test:6380',
+      startupAttempts: 1,
       createClient: () => client,
     })).rejects.toThrow('RateLimit: distributed store is required in production (not_ready)');
     expect(disconnected).toBe(1);
@@ -106,6 +107,7 @@ describe('API rate-limit store', () => {
       nodeEnv: 'production',
       redisUrl: 'rediss://redis.example.test:6380',
       connectTimeoutMs: 5,
+      startupAttempts: 1,
       createClient: () => client,
     })).rejects.toThrow('RateLimit: distributed store is required in production (connect_timeout)');
   });
@@ -117,8 +119,28 @@ describe('API rate-limit store', () => {
     await expect(acquireApiRateLimitStore({
       nodeEnv: 'production',
       redisUrl: 'redis://redis.example.test:6379',
+      startupAttempts: 1,
       createClient: () => client,
     })).rejects.toThrow('RateLimit: distributed store is required in production (connection_refused)');
+  });
+
+  it('retries a transient serverless DNS EBUSY with a fresh client', async () => {
+    let created = 0;
+    const store = await acquireApiRateLimitStore({
+      nodeEnv: 'production',
+      redisUrl: 'rediss://redis.example.test:6380',
+      startupRetryDelayMs: 0,
+      createClient: () => {
+        created += 1;
+        return created === 1
+          ? fakeClient({ connect: async () => { throw new Error('getaddrinfo EBUSY redis.example.test'); } })
+          : fakeClient();
+      },
+    });
+
+    expect(store).toBeDefined();
+    expect(created).toBe(2);
+    store!.close();
   });
 
   it('recovers with a fresh client after a runtime command failure', async () => {
