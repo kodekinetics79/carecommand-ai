@@ -1,6 +1,8 @@
 import { db } from '../../lib/db';
-import { autopilotQueue } from '../../workers/queues';
 import { dependencyUp } from '../../lib/metrics';
+import { checkQueueRedis, checkRateLimitRedis, type RedisPingable } from './redisChecks';
+
+export { checkQueueRedis, checkRateLimitRedis } from './redisChecks';
 
 // Dependency probes shared by the readiness route (modules/health/routes.ts)
 // and the /metrics scrape (plugins/metrics.ts). Both publish into the
@@ -24,20 +26,25 @@ export async function checkDatabase(): Promise<boolean> {
   }
 }
 
-export async function checkRedis(): Promise<boolean> {
-  try {
-    const client = (await withTimeout(Promise.resolve(autopilotQueue.client), 1000)) as unknown as { ping(): Promise<string> };
-    const pong = await withTimeout(client.ping(), 1000);
-    return pong === 'PONG';
-  } catch {
-    return false;
-  }
+export interface DependencyCheckOptions {
+  rateLimitRedis?: RedisPingable;
+  queuesEnabled?: boolean;
+  queueProbe?: () => Promise<unknown>;
 }
 
-/** Run both probes and publish the results to the dependency_up gauge. */
-export async function refreshDependencyGauges(): Promise<{ databaseOk: boolean; redisOk: boolean }> {
-  const [databaseOk, redisOk] = await Promise.all([checkDatabase(), checkRedis()]);
+/** Run dependency probes and publish the results to the dependency_up gauge. */
+export async function refreshDependencyGauges(options: DependencyCheckOptions = {}): Promise<{
+  databaseOk: boolean;
+  redisOk: boolean;
+  queueRedisOk: boolean;
+}> {
+  const [databaseOk, redisOk, queueRedisOk] = await Promise.all([
+    checkDatabase(),
+    checkRateLimitRedis(options.rateLimitRedis),
+    checkQueueRedis({ enabled: options.queuesEnabled ?? false, probe: options.queueProbe }),
+  ]);
   dependencyUp.set({ dependency: 'database' }, databaseOk ? 1 : 0);
   dependencyUp.set({ dependency: 'redis' }, redisOk ? 1 : 0);
-  return { databaseOk, redisOk };
+  dependencyUp.set({ dependency: 'queue-redis' }, queueRedisOk ? 1 : 0);
+  return { databaseOk, redisOk, queueRedisOk };
 }

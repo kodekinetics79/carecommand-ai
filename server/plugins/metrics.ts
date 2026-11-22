@@ -11,6 +11,7 @@ import {
 } from '../lib/metrics';
 import { refreshDependencyGauges } from '../modules/health/checks';
 import { autopilotQueue, campaignQueue, complianceQueue } from '../workers/queues';
+import type { ApiRateLimitRedis } from '../lib/apiRateLimitStore';
 
 // Per-request start time, kept off the public request type.
 const START = Symbol('metricsStart');
@@ -28,7 +29,11 @@ declare module 'fastify' {
  * the raw URL, so path params (ids/tokens/PHI) never leak into label values and
  * series cardinality stays bounded. Unmatched routes collapse to "unmatched".
  */
-export const metricsPlugin = fp(async app => {
+interface MetricsPluginOptions {
+  rateLimitRedis?: ApiRateLimitRedis;
+}
+
+export const metricsPlugin = fp<MetricsPluginOptions>(async (app, options) => {
   if (!env.METRICS_ENABLED) return;
 
   app.addHook('onRequest', async (request: FastifyRequest) => {
@@ -70,7 +75,13 @@ export const metricsPlugin = fp(async app => {
     // external monitor is polling /health/ready. Cheap; failure-tolerant.
     await Promise.all([
       sampleQueueDepths([autopilotQueue, campaignQueue, complianceQueue]),
-      refreshDependencyGauges(),
+      refreshDependencyGauges({
+        rateLimitRedis: options.rateLimitRedis,
+        queuesEnabled: env.QUEUES_ENABLED,
+        queueProbe: env.QUEUES_ENABLED
+          ? () => autopilotQueue.getJobCounts('waiting')
+          : undefined,
+      }),
     ]);
 
     reply.header('Content-Type', registry.contentType);

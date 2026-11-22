@@ -4,19 +4,20 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { buildApp } from './app';
 import { assertRlsRuntimeRole } from './lib/rlsGuard';
+import { withAppCleanupOnFailure } from './lib/appBootCleanup';
 
 type App = Awaited<ReturnType<typeof buildApp>>;
 let appPromise: Promise<App> | null = null;
 
 async function getApp(): Promise<App> {
   if (!appPromise) {
-    appPromise = buildApp().then(async app => {
-      await app.ready();
-      // Boot-time RLS runtime-role guard. Production always fails closed; dev
-      // can opt in via RLS_ENFORCE_RUNTIME_ROLE.
-      await assertRlsRuntimeRole({ logger: app.log });
-      return app;
-    }).catch((error: unknown) => {
+    appPromise = buildApp().then(app => withAppCleanupOnFailure(app, async () => {
+        await app.ready();
+        // Boot-time RLS runtime-role guard. Production always fails closed; dev
+        // can opt in via RLS_ENFORCE_RUNTIME_ROLE.
+        await assertRlsRuntimeRole({ logger: app.log });
+        return app;
+      })).catch((error: unknown) => {
       // A rejected boot must not stay memoised. Without this, one transient
       // failure (a database or Redis hiccup during cold start) is cached for
       // the life of the instance, and every subsequent request on that lambda

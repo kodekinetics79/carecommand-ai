@@ -50,9 +50,11 @@ import { platformAuthRoutes } from './modules/platform/auth';
 import { portalAuthRoutes } from './modules/portal/auth';
 import { portalRoutes } from './modules/portal/routes';
 import { portalAdminRoutes } from './modules/portal/admin';
-import { autopilotQueue } from './workers/queues';
 import { assertProductionRateLimitStore, skipRateLimitStoreErrors } from './lib/rateLimitPolicy';
 import { closeRetellRateStore } from './lib/receptionist/retellRateStore';
+import { acquireApiRateLimitStore, type ApiRateLimitRedis } from './lib/apiRateLimitStore';
+import { withAppCleanupOnFailure } from './lib/appBootCleanup';
+import { autopilotQueue } from './workers/queues';
 
 // Webhook signature verification (Stripe/Retell) needs the exact bytes that were
 // signed, so we capture the raw JSON body while still parsing it normally.
@@ -75,7 +77,15 @@ export async function buildApp() {
     // under it. Make it intentional rather than relying on the framework default.
     bodyLimit: 1_048_576,
   });
-  app.addHook('onClose', async () => { closeRetellRateStore(); });
+  return withAppCleanupOnFailure(app, async () => {
+  const rateLimitRedis: ApiRateLimitRedis | undefined = await acquireApiRateLimitStore({
+    nodeEnv: env.NODE_ENV,
+    redisUrl: env.REDIS_URL,
+  });
+  app.addHook('onClose', async () => {
+    closeRetellRateStore();
+    rateLimitRedis?.close();
+  });
 
   // Preserve the raw body so webhook handlers can verify HMAC signatures,
   // while still delivering parsed JSON to every other route.
@@ -104,18 +114,9 @@ export async function buildApp() {
   await app.register(helmet);
 
   // Redis-backed rate limiting so limits (and brute-force protection) hold
-  // across multiple API instances behind a load balancer. Reuses the BullMQ
-  // Redis connection. Local development may use the in-memory store, but a
-  // production process must never silently downgrade this shared control.
-  let rateLimitRedis: unknown;
-  try {
-    rateLimitRedis = await Promise.race([
-      autopilotQueue.client,
-      new Promise(resolve => setTimeout(() => resolve(undefined), 1500)),
-    ]);
-  } catch {
-    rateLimitRedis = undefined;
-  }
+  // across API instances. This connection is intentionally independent from
+  // BullMQ: serverless API deployments may disable queue workers while still
+  // requiring the distributed authentication control.
   const isProd = env.NODE_ENV === 'production';
   assertProductionRateLimitStore(env.NODE_ENV, rateLimitRedis);
   await app.register(rateLimit, {
@@ -133,7 +134,7 @@ export async function buildApp() {
     // Production authentication and abuse controls fail closed when the shared
     // store errors. Development remains available when a local Redis is absent.
     skipOnError: skipRateLimitStoreErrors(env.NODE_ENV),
-    nameSpace: 'cc-ratelimit:',
+    nameSpace: `cc:${env.QUEUE_NAMESPACE}:ratelimit:`,
   });
 
   // API docs must not be exposed unauthenticated in production. Serve the raw
@@ -176,10 +177,16 @@ export async function buildApp() {
   });
   // Metrics before auth so its onRequest/onResponse hooks time EVERY route
   // (including public/webhook ones) and /metrics stays outside the JWT scope.
-  await app.register(metricsPlugin);
+  await app.register(metricsPlugin, { rateLimitRedis });
   await app.register(authPlugin);
 
-  await app.register(healthRoutes);
+  await app.register(healthRoutes, {
+    rateLimitRedis,
+    queuesEnabled: env.QUEUES_ENABLED,
+    queueProbe: env.QUEUES_ENABLED
+      ? () => autopilotQueue.getJobCounts('waiting')
+      : undefined,
+  });
   await app.register(i18nRoutes, { prefix: '/v1/i18n' });
   await app.register(authRoutes, { prefix: '/v1/auth' });
   // Retell posts call events here without a JWT, so it stays outside the
@@ -249,4 +256,5 @@ export async function buildApp() {
   }, { prefix: '/v1' });
 
   return app;
+  });
 }

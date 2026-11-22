@@ -6,31 +6,20 @@ import { providerConfigured } from '../../lib/providerCredentials';
 import { passwordResetDeliveryConfigured } from '../../lib/passwordResetDelivery';
 import { SLOS, errorBudgetMinutes } from '../../lib/slo';
 import { refreshDependencyGauges } from './checks';
+import type { DependencyCheckOptions } from './checks';
+import { registerReadinessRoute } from './readinessRoute';
 
 const BOOTED_AT = Date.now();
 
-export const healthRoutes: FastifyPluginAsync = async app => {
+export const healthRoutes: FastifyPluginAsync<DependencyCheckOptions> = async (app, options) => {
   app.get('/health/live', async () => ({ status: 'ok' }));
-
-  app.get('/health/ready', async (_request, reply) => {
-    // The probe result also feeds the dependency_up gauge so an alert can fire
-    // on a dependency outage even between external probes (the /metrics scrape
-    // refreshes the same gauge — see plugins/metrics.ts).
-    const { databaseOk, redisOk } = await refreshDependencyGauges();
-    // Redis backs rate limiting and the job queue, so it is required in
-    // production. In other environments we report its state without failing.
-    const redisRequired = env.NODE_ENV === 'production';
-    const proxyTrustOk = isIngressProxyConfigurationReady(env);
-    const ready = databaseOk && (!redisRequired || redisOk) && proxyTrustOk;
-    const body = {
-      status: ready ? 'ready' : 'not-ready',
-      checks: {
-        database: databaseOk ? 'ok' : 'down',
-        redis: redisOk ? 'ok' : redisRequired ? 'down' : 'degraded',
-        ingressProxy: proxyTrustOk ? 'ok' : 'trusted_proxy_cidrs_required',
-      },
-    };
-    return ready ? body : reply.code(503).send(body);
+  await registerReadinessRoute(app, {
+    ...options,
+    nodeEnv: env.NODE_ENV,
+    proxyTrustOk: isIngressProxyConfigurationReady(env),
+    // The probe also feeds dependency_up so readiness and /metrics publish the
+    // same operational truth.
+    refreshDependencies: refreshDependencyGauges,
   });
 
   // Human/uptime-monitor summary: one call that reports liveness, release, and
