@@ -95,8 +95,19 @@ describe('API rate-limit store', () => {
       nodeEnv: 'production',
       redisUrl: 'rediss://redis.example.test:6380',
       createClient: () => client,
-    })).rejects.toThrow('RateLimit: distributed store is required in production');
+    })).rejects.toThrow('RateLimit: distributed store is required in production (not_ready)');
     expect(disconnected).toBe(1);
+  });
+
+  it('allows a bounded managed-Redis cold connection and classifies a real timeout', async () => {
+    const client = fakeClient({ connect: () => new Promise<void>(() => {}) });
+
+    await expect(acquireApiRateLimitStore({
+      nodeEnv: 'production',
+      redisUrl: 'rediss://redis.example.test:6380',
+      connectTimeoutMs: 5,
+      createClient: () => client,
+    })).rejects.toThrow('RateLimit: distributed store is required in production (connect_timeout)');
   });
 
   it('recovers with a fresh client after a runtime command failure', async () => {

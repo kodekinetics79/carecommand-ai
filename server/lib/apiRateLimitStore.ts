@@ -1,8 +1,12 @@
 import Redis from 'ioredis';
 import { assertProductionRateLimitStore } from './rateLimitPolicy';
 
-const DEFAULT_CONNECT_TIMEOUT_MS = 1_500;
-const DEFAULT_COMMAND_TIMEOUT_MS = 1_000;
+// A serverless cold start may need a DNS lookup plus a full TLS handshake to a
+// regional managed Redis service. 1.5s was below the observed provider cold
+// connection time and made a healthy store look absent, taking the API down.
+// Keep the bounds finite, but allow enough room for that first connection.
+const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 2_000;
 const DEFAULT_CIRCUIT_COOLDOWN_MS = 1_000;
 
 type RateLimitCommandDefinition = {
@@ -228,8 +232,23 @@ export async function acquireApiRateLimitStore(input: {
   try {
     await manager.connect();
     return manager.store;
-  } catch {
+  } catch (error) {
     manager.close();
+    if (input.nodeEnv === 'production') {
+      const message = error instanceof Error ? error.message : '';
+      const reason = message.includes('connection timed out')
+        ? 'connect_timeout'
+        : message.includes('did not become ready')
+          ? 'not_ready'
+          : /WRONGPASS|NOAUTH|authentication/i.test(message)
+            ? 'authentication_failed'
+            : /ENOTFOUND|EAI_AGAIN/i.test(message)
+              ? 'dns_failed'
+              : /certificate|TLS|SSL/i.test(message)
+                ? 'tls_failed'
+                : 'connection_failed';
+      throw new Error(`RateLimit: distributed store is required in production (${reason})`, { cause: error });
+    }
     assertProductionRateLimitStore(input.nodeEnv, undefined);
     return undefined;
   }
