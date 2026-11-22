@@ -19,6 +19,7 @@ type RateLimitCallback = (error: Error | null, result?: RateLimitResult) => void
 
 export interface ApiRateLimitClient {
   status: string;
+  lastConnectionError?: Error;
   connect(): Promise<unknown>;
   disconnect(reconnect?: boolean): void;
   ping(): Promise<string>;
@@ -66,10 +67,16 @@ function createRedisClient(redisUrl: string): ApiRateLimitClient {
     retryStrategy: () => null,
     reconnectOnError: () => false,
   });
-  // Command/connect promises carry the operational error to the manager. This
-  // listener prevents an unhandled process-level EventEmitter error.
-  client.on('error', () => {});
-  return client as ApiRateLimitClient;
+  const apiClient = client as ApiRateLimitClient;
+  // ioredis can reject connect() with only "Connection is closed" after first
+  // emitting the useful socket/TLS/authentication error. Preserve that first
+  // error for diagnosis while still preventing an unhandled EventEmitter error.
+  client.on('error', error => {
+    apiClient.lastConnectionError = error instanceof Error
+      ? error
+      : new Error('Redis connection failed');
+  });
+  return apiClient;
 }
 
 async function within<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -146,8 +153,9 @@ export function createApiRateLimitStoreManager(input: {
         circuitOpenUntil = 0;
         return candidate;
       } catch (error) {
+        const operationalError = candidate.lastConnectionError ?? error;
         trip(candidate);
-        throw error;
+        throw operationalError;
       } finally {
         connecting = null;
         connectingClient = null;
@@ -238,8 +246,14 @@ export async function acquireApiRateLimitStore(input: {
       const message = error instanceof Error ? error.message : '';
       const reason = message.includes('connection timed out')
         ? 'connect_timeout'
+        : /ECONNREFUSED/i.test(message)
+          ? 'connection_refused'
+          : /ETIMEDOUT/i.test(message)
+            ? 'connect_timeout'
         : message.includes('did not become ready')
           ? 'not_ready'
+          : message.includes('Connection is closed')
+            ? 'connection_closed'
           : /WRONGPASS|NOAUTH|authentication/i.test(message)
             ? 'authentication_failed'
             : /ENOTFOUND|EAI_AGAIN/i.test(message)

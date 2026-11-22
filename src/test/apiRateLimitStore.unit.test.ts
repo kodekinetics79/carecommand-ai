@@ -110,6 +110,17 @@ describe('API rate-limit store', () => {
     })).rejects.toThrow('RateLimit: distributed store is required in production (connect_timeout)');
   });
 
+  it('preserves the provider socket error when ioredis reports only a closed connection', async () => {
+    const client = fakeClient({ connect: async () => { throw new Error('Connection is closed.'); } });
+    client.lastConnectionError = new Error('connect ECONNREFUSED');
+
+    await expect(acquireApiRateLimitStore({
+      nodeEnv: 'production',
+      redisUrl: 'redis://redis.example.test:6379',
+      createClient: () => client,
+    })).rejects.toThrow('RateLimit: distributed store is required in production (connection_refused)');
+  });
+
   it('recovers with a fresh client after a runtime command failure', async () => {
     let created = 0;
     let firstDisconnected = 0;
